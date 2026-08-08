@@ -3,9 +3,10 @@ In our case we mimic network traffic through a simple binary file.
 We send data by appending to the file and we receive data by reading the file periodically.
 */
 
-#include <assert.h>
 #include <arp.h>
+#include <assert.h>
 #include <ethernet.h>
+#include <icmp.h>
 #include <ipv4.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -78,6 +79,7 @@ typedef struct ipv4_packet_data {
   mac_address_t src_mac_addr;
   ipv4_address_t src_addr;
   ipv4_address_t dst_addr;
+  uint8_t protocol;
   const void* data;
   uint16_t data_length;
 } ipv4_packet_data_t;
@@ -94,7 +96,7 @@ static void write_ipv4_packet(FILE* f, const ipv4_packet_data_t* packet_data) {
       .fragment_id = 1,
       .dont_fragment = 1,
       .ttl = IPV4_DEFAULT_TTL,
-      .protocol = IPV4_PROTOCOL_TEST,
+      .protocol = packet_data->protocol,
       .src_addr = packet_data->src_addr,
       .dst_addr = packet_data->dst_addr,
   };
@@ -111,6 +113,45 @@ static void write_ipv4_packet(FILE* f, const ipv4_packet_data_t* packet_data) {
   memcpy(frame_data.dst_addr, packet_data->dst_mac_addr, sizeof(frame_data.dst_addr));
   memcpy(frame_data.src_addr, packet_data->src_mac_addr, sizeof(frame_data.src_addr));
   write_ethernet_frame(f, &frame_data);
+}
+
+typedef struct icmp_echo_request_data {
+  mac_address_t dst_mac_addr;
+  mac_address_t src_mac_addr;
+  ipv4_address_t src_addr;
+  ipv4_address_t dst_addr;
+  uint16_t identifier;
+  uint16_t sequence_number;
+  const void* data;
+  uint16_t data_length;
+} icmp_echo_request_data_t;
+
+static void write_icmp_echo_request(FILE* f, const icmp_echo_request_data_t* request_data) {
+  assert(request_data->data_length <= ETHERNET_MAX_DATA_LEN - sizeof(ipv4_header_t) - sizeof(icmp_echo_header_t));
+
+  uint8_t icmp_packet[sizeof(icmp_echo_header_t) + ETHERNET_MAX_DATA_LEN] = {0};
+  icmp_echo_header_t icmp_header = {
+      .type = ICMP_TYPE_ECHO_REQUEST,
+      .code = ICMP_CODE_ECHO,
+      .identifier = request_data->identifier,
+      .sequence_number = request_data->sequence_number,
+  };
+  memcpy(icmp_packet, &icmp_header, sizeof(icmp_header));
+  if (request_data->data_length > 0) {
+    memcpy(icmp_packet + sizeof(icmp_header), request_data->data, request_data->data_length);
+  }
+  ((icmp_echo_header_t*)icmp_packet)->checksum = icmp_checksum(icmp_packet, sizeof(icmp_header) + request_data->data_length);
+
+  ipv4_packet_data_t ipv4_data = {
+      .src_addr = request_data->src_addr,
+      .dst_addr = request_data->dst_addr,
+      .protocol = ICMP_IPV4_PROTOCOL,
+      .data = icmp_packet,
+      .data_length = sizeof(icmp_header) + request_data->data_length,
+  };
+  memcpy(ipv4_data.dst_mac_addr, request_data->dst_mac_addr, sizeof(ipv4_data.dst_mac_addr));
+  memcpy(ipv4_data.src_mac_addr, request_data->src_mac_addr, sizeof(ipv4_data.src_mac_addr));
+  write_ipv4_packet(f, &ipv4_data);
 }
 
 typedef struct arp_packet_data {
@@ -162,6 +203,7 @@ int main(int argc, char** argv) {
         .src_mac_addr = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01},
         .src_addr = IPV4_ADDRESS(192, 168, 1, 1),
         .dst_addr = IPV4_ADDRESS(192, 168, 1, 2),
+        .protocol = IPV4_PROTOCOL_TEST,
         .data = data,
         .data_length = sizeof(data),
     };
@@ -173,6 +215,16 @@ int main(int argc, char** argv) {
         .target_protocol_address = IPV4_ADDRESS(192, 168, 1, 2),
     };
     write_arp_packet(f, &arp_data);
+
+    icmp_echo_request_data_t icmp_data = {
+        .dst_mac_addr = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
+        .src_mac_addr = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01},
+        .src_addr = IPV4_ADDRESS(192, 168, 1, 1),
+        .dst_addr = IPV4_ADDRESS(192, 168, 1, 2),
+        .identifier = 1,
+        .sequence_number = 1,
+    };
+    write_icmp_echo_request(f, &icmp_data);
   }
 
   fclose(f);
