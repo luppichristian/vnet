@@ -4,6 +4,7 @@ We send data by appending to the file and we receive data by reading the file pe
 */
 
 #include <ethernet.h>
+#include <ipv4.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -12,6 +13,22 @@ We send data by appending to the file and we receive data by reading the file pe
 
 /* Max amount of bytes that can be read at each iteration*/
 #define MAX_READ 1024
+
+static void print_ipv4_packet(const uint8_t* bytes, uint16_t data_field_length) {
+  ipv4_header_t ipv4_header = {0};
+  memcpy(&ipv4_header, bytes, sizeof(ipv4_header));
+  const uint8_t ipv4_version = ipv4_header.version_ihl >> 4;
+  const uint8_t ipv4_header_length = (ipv4_header.version_ihl & 0x0F) * 4;
+  if (data_field_length < sizeof(ipv4_header) || ipv4_version != 4 || ipv4_header_length != sizeof(ipv4_header) || ipv4_header.total_length < sizeof(ipv4_header) || ipv4_header.total_length > data_field_length || ipv4_checksum(&ipv4_header, sizeof(ipv4_header)) != 0) {
+    fprintf(stdout, "  IPv4:            invalid header\n");
+    return;
+  }
+
+  fprintf(stdout, "  Valid IPv4 packet (%u bytes):\n", ipv4_header.total_length);
+  fprintf(stdout, "    IPv4 source:     %u.%u.%u.%u\n", ipv4_header.source_address & 0xFF, (ipv4_header.source_address >> 8) & 0xFF, (ipv4_header.source_address >> 16) & 0xFF, ipv4_header.source_address >> 24);
+  fprintf(stdout, "    IPv4 destination:%u.%u.%u.%u\n", ipv4_header.destination_address & 0xFF, (ipv4_header.destination_address >> 8) & 0xFF, (ipv4_header.destination_address >> 16) & 0xFF, ipv4_header.destination_address >> 24);
+  fprintf(stdout, "    IPv4 total length: %u bytes, TTL: %u, protocol: %u\n", ipv4_header.total_length, ipv4_header.ttl, ipv4_header.protocol);
+}
 
 static bool print_ethernet_frame(const uint8_t* bytes, size_t byte_count) {
   if (byte_count < sizeof(ethernet_header_t) + sizeof(ethernet_footer_t)) {
@@ -61,12 +78,13 @@ static bool print_ethernet_frame(const uint8_t* bytes, size_t byte_count) {
     return false;
   }
 
-  fprintf(stdout, "Valid %s frame (%zu bytes):\n", format == ETHERNET_FRAME_FORMAT_IEEE_802_3 ? "IEEE 802.3 Ethernet" : "Ethernet II", expected_frame_length);
-  fprintf(stdout, "  Destination MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", header.dst_mac[0], header.dst_mac[1], header.dst_mac[2], header.dst_mac[3], header.dst_mac[4], header.dst_mac[5]);
-  fprintf(stdout, "  Source MAC:      %02X:%02X:%02X:%02X:%02X:%02X\n", header.src_mac[0], header.src_mac[1], header.src_mac[2], header.src_mac[3], header.src_mac[4], header.src_mac[5]);
+  fprintf(stdout, "Received %li bytes (%li bits):\n", (long)byte_count, (long)byte_count * 8);
+  fprintf(stdout, "  Valid %s frame (%zu bytes):\n", format == ETHERNET_FRAME_FORMAT_IEEE_802_3 ? "IEEE 802.3 Ethernet" : "Ethernet II", expected_frame_length);
+  fprintf(stdout, "    Destination MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", header.dst_mac[0], header.dst_mac[1], header.dst_mac[2], header.dst_mac[3], header.dst_mac[4], header.dst_mac[5]);
+  fprintf(stdout, "    Source MAC:      %02X:%02X:%02X:%02X:%02X:%02X\n", header.src_mac[0], header.src_mac[1], header.src_mac[2], header.src_mac[3], header.src_mac[4], header.src_mac[5]);
   if (format == ETHERNET_FRAME_FORMAT_IEEE_802_3) {
-    fprintf(stdout, "  Client data:     %u bytes\n", client_data_length);
-    fprintf(stdout, "  Padding:         %u bytes\n", data_field_length - client_data_length);
+    fprintf(stdout, "    Client data:     %u bytes\n", client_data_length);
+    fprintf(stdout, "    Padding:         %u bytes\n", data_field_length - client_data_length);
   } else {
     const char* ether_type_name = "unknown";
     if (header.type_or_length == ETHERNET_ETHERTYPE_IPV4) {
@@ -76,10 +94,13 @@ static bool print_ethernet_frame(const uint8_t* bytes, size_t byte_count) {
     } else if (header.type_or_length == ETHERNET_ETHERTYPE_IPV6) {
       ether_type_name = "IPv6";
     }
-    fprintf(stdout, "  EtherType:       0x%04X (%s)\n", header.type_or_length, ether_type_name);
-    fprintf(stdout, "  Data field:      %u bytes (may include padding)\n", data_field_length);
+    fprintf(stdout, "    EtherType:       0x%04X (%s)\n", header.type_or_length, ether_type_name);
+    fprintf(stdout, "    Data field:      %u bytes (may include padding)\n", data_field_length);
   }
-  fprintf(stdout, "  FCS:             %08X (valid)\n", footer.crc);
+  fprintf(stdout, "    FCS:             %08X (valid)\n", footer.crc);
+  if (format == ETHERNET_FRAME_FORMAT_II && header.type_or_length == ETHERNET_ETHERTYPE_IPV4) {
+    print_ipv4_packet(bytes + sizeof(header), data_field_length);
+  }
   return true;
 }
 

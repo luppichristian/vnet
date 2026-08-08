@@ -5,6 +5,7 @@ We send data by appending to the file and we receive data by reading the file pe
 
 #include <assert.h>
 #include <ethernet.h>
+#include <ipv4.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -71,6 +72,45 @@ static void write_ethernet_frame(FILE* f, const ethernet_frame_data_t* frame_dat
   fwrite(&footer, sizeof(ethernet_footer_t), 1, f);
 }
 
+typedef struct ipv4_packet_data {
+  mac_address_t dst_mac_addr;
+  mac_address_t src_mac_addr;
+  ipv4_address_t src_addr;
+  ipv4_address_t dst_addr;
+  const void* data;
+  uint16_t data_length;
+} ipv4_packet_data_t;
+
+static void write_ipv4_packet(FILE* f, const ipv4_packet_data_t* packet_data) {
+  assert(packet_data->data_length <= ETHERNET_MAX_DATA_LEN - sizeof(ipv4_header_t));
+
+  /* Prepare data for the actual ipv4 packet */
+  uint8_t ipv4_packet[sizeof(ipv4_header_t) + ETHERNET_MAX_DATA_LEN] = {0};
+  ipv4_header_t ipv4_header = {
+      .version_ihl = IPV4_VERSION_IHL,
+      .total_length = sizeof(ipv4_header) + packet_data->data_length,
+      .identification = 1,
+      .flags_fragment_offset = IPV4_DONT_FRAGMENT,
+      .ttl = IPV4_DEFAULT_TTL,
+      .protocol = IPV4_PROTOCOL_TEST,
+      .source_address = packet_data->src_addr,
+      .destination_address = packet_data->dst_addr,
+  };
+  ipv4_header.header_checksum = ipv4_checksum(&ipv4_header, sizeof(ipv4_header));
+  memcpy(ipv4_packet, &ipv4_header, sizeof(ipv4_header));
+  memcpy(ipv4_packet + sizeof(ipv4_header), packet_data->data, packet_data->data_length);
+
+  /* Write the ethernet frame */
+  ethernet_frame_data_t frame_data = {
+      .type_or_length = ETHERNET_ETHERTYPE_IPV4,
+      .data_length = sizeof(ipv4_header) + packet_data->data_length,
+      .data = ipv4_packet,
+  };
+  memcpy(frame_data.dst_addr, packet_data->dst_mac_addr, sizeof(frame_data.dst_addr));
+  memcpy(frame_data.src_addr, packet_data->src_mac_addr, sizeof(frame_data.src_addr));
+  write_ethernet_frame(f, &frame_data);
+}
+
 int main(int argc, char** argv) {
   if (argc == 1) {
     fprintf(stderr, "Expected at least 1 argument (the name of the network file).\n");
@@ -85,17 +125,17 @@ int main(int argc, char** argv) {
   }
 
   {
-    /* Construct data for an ethernet frame */
+    /* Construct an IPv4 packet carried by an Ethernet II frame. */
     uint8_t data[] = {0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03};
-    ethernet_frame_data_t frame_data = {
-        .dst_addr = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
-        .src_addr = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01},
-        .type_or_length = ETHERNET_ETHERTYPE_IPV4,
-        .data_length = sizeof(data),
+    ipv4_packet_data_t packet_data = {
+        .dst_mac_addr = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
+        .src_mac_addr = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01},
+        .src_addr = IPV4_ADDRESS(192, 168, 1, 1),
+        .dst_addr = IPV4_ADDRESS(192, 168, 1, 2),
         .data = data,
+        .data_length = sizeof(data),
     };
-
-    write_ethernet_frame(f, &frame_data);
+    write_ipv4_packet(f, &packet_data);
   }
 
   fclose(f);

@@ -2,6 +2,9 @@ build/
 dist/
 gen/
 
+# Network files
+*.net
+
 # bbs local overrides
 config.bbs
 toolchain.bbs
