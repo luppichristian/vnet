@@ -14,6 +14,22 @@ transport-layer payload:
 
   Ethernet II data field: IPv4 header | IPv4 payload | Ethernet padding
 
+OSI/ISO layer: IPv4 is a Layer 3 (network-layer) protocol. It supplies logical
+addresses and enables routers to forward packets between different networks.
+
+IPv4 delivery modes are selected by the destination IPv4 address:
+
+  Unicast:   one host address; routers forward it towards that one destination.
+  Broadcast: every host on one IPv4 network. 255.255.255.255 is the limited
+             broadcast address; a subnet's all-host-bits-one address is a
+             directed broadcast. Routers do not forward limited broadcasts.
+  Multicast: 224.0.0.0 through 239.255.255.255 identify receiver groups rather
+             than one host. Hosts join a group to receive its packets.
+
+On Ethernet, an IPv4 unicast normally uses a unicast MAC address; IPv4
+broadcast uses the Ethernet broadcast MAC address; IPv4 multicast maps to an
+Ethernet multicast MAC address.
+
 The header begins with a version and a header length. IPv4 permits optional
 header fields, so IHL is measured in four-octet words rather than bytes. This
 first simulator version deliberately supports only the ordinary 20-octet base

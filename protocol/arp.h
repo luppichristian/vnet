@@ -15,6 +15,21 @@ host's Ethernet MAC address. It broadcasts an ARP request asking "who has this
 IPv4 address?" The owner replies with its MAC address, which the sender may
 cache for subsequent Ethernet frames.
 
+OSI/ISO layer: ARP sits at the boundary between Layer 2 (data link) and Layer 3
+(network). It is often informally called a "Layer 2.5" protocol because it uses
+Ethernet delivery to resolve an IPv4 address; it is not routed beyond the local
+link.
+
+ARP delivery modes on Ethernet are normally:
+
+  Broadcast: an ARP request uses FF:FF:FF:FF:FF:FF because the requester does
+             not yet know the target MAC address. Its target-hardware field is
+             all zeroes.
+  Unicast:   the owner generally sends the ARP reply directly to the requester's
+             MAC address. A host may also issue a unicast ARP request when it
+             already has a possible mapping to verify.
+  Multicast: ordinary Ethernet/IPv4 ARP does not use multicast groups.
+
 This header models the Ethernet/IPv4 ARP variant carried by an Ethernet II
 frame whose EtherType is 0x0806:
 

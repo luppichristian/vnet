@@ -14,6 +14,21 @@ error reporting, including destination unreachable, time exceeded, redirect,
 and echo messages. It is not an Ethernet protocol, so Ethernet II still uses
 EtherType 0x0800 for the enclosing IPv4 packet.
 
+OSI/ISO layer: ICMP is a Layer 3 (network-layer) control protocol carried by
+IPv4. It reports conditions encountered while forwarding IPv4 packets and is
+not a transport-layer protocol such as TCP or UDP.
+
+ICMP follows the delivery mode of its enclosing IPv4 packet:
+
+  Unicast:   the ordinary case, including this simulator's echo request to one
+             destination.
+  Broadcast: an ICMP Echo Request may be addressed to a broadcast address, but
+             hosts must not send Echo Replies to broadcast requests because that
+             could amplify traffic.
+  Multicast: ICMP can be sent to an IPv4 multicast group, but ICMP error
+             messages are not generated in response to multicast traffic; this
+             also avoids unwanted reply/error amplification.
+
 This header models an ICMP Echo message, used by ping-like reachability tests:
 
   Ethernet II data: IPv4 header | ICMP Echo header | optional ICMP data |

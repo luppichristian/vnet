@@ -13,6 +13,21 @@ this common order:
   Physical synchronization: preamble (7 octets), SFD (1 octet)
   MAC frame: destination MAC (6), source MAC (6), type/length (2), data + padding (46-1500), FCS (4)
 
+OSI/ISO layer: the Ethernet MAC frame is a Layer 2 (data-link-layer) protocol.
+The preamble and SFD assist Layer 1 (physical-layer) synchronization before the
+Layer 2 frame begins.
+
+Ethernet delivery is selected by destination MAC address:
+
+  Unicast:   one station's individual MAC address; its first-octet I/G bit is 0.
+  Broadcast: FF:FF:FF:FF:FF:FF; every station on the local Ethernet receives it.
+  Multicast: a group MAC address; its first-octet I/G bit is 1 but it is not the
+             all-FF broadcast address. Only stations subscribed to that group
+             should accept it.
+
+Ethernet broadcast and multicast remain on the local Layer 2 network; routers
+do not forward them as Ethernet frames to another LAN.
+
 The preamble and SFD are physical-layer synchronization fields, so they are
 not counted in the 64-1518-byte MAC-frame size. Each uint8_t in this simulator
 stores one complete octet, exactly as hardware does before serializing it onto
