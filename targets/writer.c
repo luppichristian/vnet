@@ -5,17 +5,22 @@ We send data by appending to the file and we receive data by reading the file pe
 
 #include <assert.h>
 #include <ethernet.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static void write_ethernet_frame(
-    FILE* f,
-    mac_address_t dst_addr,
-    mac_address_t src_addr,
-    uint16_t data_length,
-    void* data) {
+typedef struct ethernet_frame_data {
+  mac_address_t dst_addr;
+  mac_address_t src_addr;
+  uint16_t type_or_length;
+  uint16_t data_length;
+  void* data;
+} ethernet_frame_data_t;
+
+static void write_ethernet_frame(FILE* f, const ethernet_frame_data_t* frame_data) {
+  const uint16_t data_length = frame_data->data_length;
   assert(data_length <= ETHERNET_MAX_DATA_LEN);
 
   const uint16_t padded_data_length = data_length < ETHERNET_MIN_DATA_LEN ? ETHERNET_MIN_DATA_LEN : data_length;
@@ -33,27 +38,26 @@ static void write_ethernet_frame(
     /* Set the SFD */
     header.sfd = ETHERNET_SFD;
 
-    /* The IEEE 802.3 length field contains the client data, excluding padding. */
-    header.length = data_length;
+    header.type_or_length = frame_data->type_or_length;
 
     /* Set the mac addresses */
-    memcpy(header.dst_mac, dst_addr, sizeof(mac_address_t));
-    memcpy(header.src_mac, src_addr, sizeof(mac_address_t));
+    memcpy(header.dst_mac, frame_data->dst_addr, sizeof(mac_address_t));
+    memcpy(header.src_mac, frame_data->src_addr, sizeof(mac_address_t));
   }
 
   /* Build the footer */
   ethernet_footer_t footer = {0};
   {
     /* FCS covers destination, source, length, data, and padding; not preamble/SFD. */
-    uint8_t crc_buf[sizeof(mac_address_t) * 2 + sizeof(header.length) + ETHERNET_MAX_DATA_LEN];
+    uint8_t crc_buf[sizeof(mac_address_t) * 2 + sizeof(header.type_or_length) + ETHERNET_MAX_DATA_LEN];
     size_t offset = 0;
     memcpy(crc_buf + offset, header.dst_mac, sizeof(header.dst_mac));
     offset += sizeof(mac_address_t);
     memcpy(crc_buf + offset, header.src_mac, sizeof(header.src_mac));
     offset += sizeof(mac_address_t);
-    memcpy(crc_buf + offset, &header.length, sizeof(header.length));
-    offset += sizeof(header.length);
-    memcpy(crc_buf + offset, data, data_length);
+    memcpy(crc_buf + offset, &header.type_or_length, sizeof(header.type_or_length));
+    offset += sizeof(header.type_or_length);
+    memcpy(crc_buf + offset, frame_data->data, data_length);
     offset += data_length;
     memcpy(crc_buf + offset, padding, padding_length);
     offset += padding_length;
@@ -62,7 +66,7 @@ static void write_ethernet_frame(
 
   /* Write the entire frame: header + payload + footer*/
   fwrite(&header, sizeof(ethernet_header_t), 1, f);
-  fwrite(data, data_length, 1, f);
+  fwrite(frame_data->data, data_length, 1, f);
   fwrite(padding, padding_length, 1, f);
   fwrite(&footer, sizeof(ethernet_footer_t), 1, f);
 }
@@ -82,13 +86,16 @@ int main(int argc, char** argv) {
 
   {
     /* Construct data for an ethernet frame */
-    mac_address_t dst_addr = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; /* broadcast */
-    mac_address_t src_addr = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01}; /* locally-administered stub */
-
     uint8_t data[] = {0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03};
-    uint16_t data_length = sizeof(data);
+    ethernet_frame_data_t frame_data = {
+        .dst_addr = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
+        .src_addr = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01},
+        .type_or_length = ETHERNET_ETHERTYPE_IPV4,
+        .data_length = sizeof(data),
+        .data = data,
+    };
 
-    write_ethernet_frame(f, dst_addr, src_addr, data_length, data);
+    write_ethernet_frame(f, &frame_data);
   }
 
   fclose(f);

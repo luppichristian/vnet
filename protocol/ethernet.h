@@ -4,13 +4,14 @@
 
 /*
 ==================================
-Ethernet (IEEE 802.3) Frame Format
-==================================
+Ethernet Frame Formats
+======================
 
-This header models the bits emitted by an IEEE 802.3 sender in this order:
+This header models the bits emitted by IEEE 802.3 and Ethernet II senders in
+this common order:
 
   Physical synchronization: preamble (7 octets), SFD (1 octet)
-  MAC frame: destination MAC (6), source MAC (6), length (2), data + padding (46-1500), FCS (4)
+  MAC frame: destination MAC (6), source MAC (6), type/length (2), data + padding (46-1500), FCS (4)
 
 The preamble and SFD are physical-layer synchronization fields, so they are
 not counted in the 64-1518-byte MAC-frame size. Each uint8_t in this simulator
@@ -33,12 +34,20 @@ instead prints every stored octet bit-by-bit in real transmission order.
 /* A six-octet Ethernet MAC address. Destination is emitted before source. */
 typedef uint8_t mac_address_t[6];
 
-/*
-The length field names only the client data length, excluding padding. Padding
-makes short frames reach the 46-octet minimum and is included in the FCS.
-*/
+/* The IEEE 802.3 length field excludes padding, which reaches the 46-octet minimum. */
 #define ETHERNET_MIN_DATA_LEN 46
 #define ETHERNET_MAX_DATA_LEN 1500
+
+/* Values through 1500 identify IEEE 802.3; 1501-1535 are reserved. */
+#define ETHERNET_ETHERTYPE_MIN  1536
+#define ETHERNET_ETHERTYPE_IPV4 0x0800
+#define ETHERNET_ETHERTYPE_ARP  0x0806
+#define ETHERNET_ETHERTYPE_IPV6 0x86DD
+
+typedef enum ethernet_frame_format {
+  ETHERNET_FRAME_FORMAT_IEEE_802_3,
+  ETHERNET_FRAME_FORMAT_II,
+} ethernet_frame_format_t;
 
 #pragma pack(push, 1)
 
@@ -48,7 +57,7 @@ typedef struct ethernet_header {
   uint8_t sfd;                             /* One 0xD5 octet. */
   mac_address_t dst_mac;                   /* Receiving station(s). */
   mac_address_t src_mac;                   /* Sending station. */
-  uint16_t length;                         /* Real Ethernet transmits this field big-endian. */
+  uint16_t type_or_length;                 /* Length for IEEE 802.3, EtherType for Ethernet II. */
 } ethernet_header_t;
 
 /* FCS follows the MAC frame and protects everything from dst_mac through padding. */
