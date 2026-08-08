@@ -57,7 +57,7 @@ typedef struct ethernet_header {
   uint8_t sfd;                             /* One 0xD5 octet. */
   mac_address_t dst_mac;                   /* Receiving station(s). */
   mac_address_t src_mac;                   /* Sending station. */
-  uint16_t type_or_length;                 /* Length for IEEE 802.3, EtherType for Ethernet II. */
+  uint16_t type_or_length;                 /* Entire 16-bit field: length for IEEE 802.3 or EtherType for Ethernet II, not bit-packed subfields. */
 } ethernet_header_t;
 
 /* FCS follows the MAC frame and protects everything from dst_mac through padding. */

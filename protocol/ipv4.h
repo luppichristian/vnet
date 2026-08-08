@@ -25,28 +25,76 @@ zero-padding that Ethernet added to reach its 46-octet minimum data field.
 
 Real IPv4 transmits multi-octet fields in network byte order. As with the
 Ethernet model, this file simulation keeps the native representation shared by
-its writer and reader instead of adding an endianness layer.
+its writer and reader instead of adding an endianness layer. C bit-field layout
+is implementation-defined, so this simulator requires its writer and reader to
+use the same compiler and platform.
 */
-#define IPV4_VERSION_IHL         0x45
-#define IPV4_DEFAULT_TTL         64
-#define IPV4_PROTOCOL_TEST       253
-#define IPV4_DONT_FRAGMENT       0x4000
-#define IPV4_ADDRESS(a, b, c, d) ((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
+#define IPV4_DEFAULT_TTL   64
+#define IPV4_PROTOCOL_TEST 253
 
 typedef uint32_t ipv4_address_t;
+
+/* Construct an ipv4 */
+#define IPV4_ADDRESS(a, b, c, d) \
+  ((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
 
 #pragma pack(push, 1)
 
 typedef struct ipv4_header {
-  uint8_t version_ihl;                /* High nibble: version 4. Low nibble: header length in four-octet words. */
-  uint8_t dscp_ecn;                   /* Service class and congestion notification; zero in this simulation. */
-  uint16_t total_length;              /* Header plus IPv4 payload, in octets. */
-  uint16_t identification;            /* Sender-selected datagram identifier for fragment reassembly. */
-  uint16_t flags_fragment_offset;     /* DF/MF flags and fragment position; DF is set and fragmentation is unsupported. */
-  uint8_t ttl;                        /* Hop limit, decremented by every router. */
-  uint8_t protocol;                   /* Identifier for the encapsulated upper-layer protocol. */
-  uint16_t header_checksum;           /* One's-complement checksum of this header only, with this field initially zero. */
-  ipv4_address_t source_address;      /* Sender IPv4 address. */
+  /* IPv4 is the only version implemented by this simulator. */
+  uint8_t version : 4; /* IPv4 version: 4. */
+
+  /* IHL counts 32-bit words, so 5 means this fixed header occupies 20 octets. */
+  uint8_t ihl : 4; /* Header length in four-octet words: 5 for this base header. */
+
+  /*
+  Differentiated Services Code Point selects a per-hop forwarding treatment.
+  Routers may use it for quality-of-service policies such as prioritising
+  latency-sensitive traffic or reserving bandwidth. Zero is default best effort.
+  */
+  uint8_t dscp : 6;
+
+  /*
+  Explicit Congestion Notification lets routers signal congestion by marking a
+  packet instead of dropping it. A transport protocol such as TCP can then slow
+  down. Zero means this simulator's packets do not negotiate ECN.
+  */
+  uint8_t ecn : 2;
+
+  /* Header plus IPv4 payload, in octets; it excludes Ethernet fields and padding. */
+  uint16_t total_length; /* Header plus IPv4 payload, in octets. */
+
+  /*
+  All fragments from the same original datagram share this sender-chosen value.
+  A receiver uses it with source, destination, and protocol to reassemble them.
+  */
+  uint16_t identification; /* Sender-selected datagram identifier for fragment reassembly. */
+
+  /* Reserved for future use and required to remain zero. */
+  uint16_t reserved : 1;
+
+  /* When set, routers must drop rather than fragment an oversized datagram. */
+  uint16_t dont_fragment : 1;
+
+  /* Set on every fragment except the last; always zero while fragmentation is unsupported. */
+  uint16_t more_fragments : 1;
+
+  /* Fragment position in units of eight octets; zero for an unfragmented datagram. */
+  uint16_t fragment_offset : 13;
+
+  /* Limits how many routers may forward this packet and prevents routing loops. */
+  uint8_t ttl; /* Hop limit, decremented by every router. */
+
+  /* Identifies the next-layer payload, for example ICMP, TCP, UDP, or this test protocol. */
+  uint8_t protocol; /* Identifier for the encapsulated upper-layer protocol. */
+
+  /* Recomputed whenever a router decrements TTL; it protects only this IPv4 header. */
+  uint16_t header_checksum; /* One's-complement checksum of this header only, with this field initially zero. */
+
+  /* The logical network-layer sender; routers normally leave this unchanged. */
+  ipv4_address_t source_address; /* Sender IPv4 address. */
+
+  /* The final intended host; routers use it to choose the next hop. */
   ipv4_address_t destination_address; /* Intended receiver IPv4 address. */
 } ipv4_header_t;
 

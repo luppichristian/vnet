@@ -17,8 +17,8 @@ We send data by appending to the file and we receive data by reading the file pe
 static void print_ipv4_packet(const uint8_t* bytes, uint16_t data_field_length) {
   ipv4_header_t ipv4_header = {0};
   memcpy(&ipv4_header, bytes, sizeof(ipv4_header));
-  const uint8_t ipv4_version = ipv4_header.version_ihl >> 4;
-  const uint8_t ipv4_header_length = (ipv4_header.version_ihl & 0x0F) * 4;
+  const uint8_t ipv4_version = ipv4_header.version;
+  const uint8_t ipv4_header_length = ipv4_header.ihl * 4;
   if (data_field_length < sizeof(ipv4_header) || ipv4_version != 4 || ipv4_header_length != sizeof(ipv4_header) || ipv4_header.total_length < sizeof(ipv4_header) || ipv4_header.total_length > data_field_length || ipv4_checksum(&ipv4_header, sizeof(ipv4_header)) != 0) {
     fprintf(stdout, "  IPv4:            invalid header\n");
     return;

@@ -87,10 +87,11 @@ static void write_ipv4_packet(FILE* f, const ipv4_packet_data_t* packet_data) {
   /* Prepare data for the actual ipv4 packet */
   uint8_t ipv4_packet[sizeof(ipv4_header_t) + ETHERNET_MAX_DATA_LEN] = {0};
   ipv4_header_t ipv4_header = {
-      .version_ihl = IPV4_VERSION_IHL,
+      .version = 4,
+      .ihl = 5,
       .total_length = sizeof(ipv4_header) + packet_data->data_length,
       .identification = 1,
-      .flags_fragment_offset = IPV4_DONT_FRAGMENT,
+      .dont_fragment = 1,
       .ttl = IPV4_DEFAULT_TTL,
       .protocol = IPV4_PROTOCOL_TEST,
       .source_address = packet_data->src_addr,
