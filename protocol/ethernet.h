@@ -1,0 +1,75 @@
+#pragma once
+
+#include <stdint.h>
+
+/*
+==================================
+Ethernet (IEEE 802.3) Frame Format
+==================================
+
+This header models the bits emitted by an IEEE 802.3 sender in this order:
+
+  Physical synchronization: preamble (7 octets), SFD (1 octet)
+  MAC frame: destination MAC (6), source MAC (6), length (2), data + padding (46-1500), FCS (4)
+
+The preamble and SFD are physical-layer synchronization fields, so they are
+not counted in the 64-1518-byte MAC-frame size. Each uint8_t in this simulator
+stores one complete octet, exactly as hardware does before serializing it onto
+the medium. Ethernet transmits the least-significant bit of every octet first:
+0x55 is therefore transmitted as 10101010 and 0xD5 as 10101011.
+
+Writing one uint8_t value of 0 or 1 for every bit would make the file eight
+times larger and would not be Ethernet's packed wire representation. The reader
+instead prints every stored octet bit-by-bit in real transmission order.
+*/
+
+/* Seven alternating-bit synchronization octets; emitted as 10101010 each. */
+#define ETHERNET_PREAMBLE_LEN  7
+#define ETHERNET_PREAMBLE_BYTE (uint8_t)(0x55)
+
+/* Marks the end of synchronization; emitted as 10101011. */
+#define ETHERNET_SFD (uint8_t)(0xD5)
+
+/* A six-octet Ethernet MAC address. Destination is emitted before source. */
+typedef uint8_t mac_address_t[6];
+
+/*
+The length field names only the client data length, excluding padding. Padding
+makes short frames reach the 46-octet minimum and is included in the FCS.
+*/
+#define ETHERNET_MIN_DATA_LEN 46
+#define ETHERNET_MAX_DATA_LEN 1500
+
+#pragma pack(push, 1)
+
+/* Wire representation: physical synchronization followed by the MAC header. */
+typedef struct ethernet_header {
+  uint8_t preamble[ETHERNET_PREAMBLE_LEN]; /* Seven 0x55 octets. */
+  uint8_t sfd;                             /* One 0xD5 octet. */
+  mac_address_t dst_mac;                   /* Receiving station(s). */
+  mac_address_t src_mac;                   /* Sending station. */
+  uint16_t length;                         /* Real Ethernet transmits this field big-endian. */
+} ethernet_header_t;
+
+/* FCS follows the MAC frame and protects everything from dst_mac through padding. */
+typedef struct ethernet_footer {
+  uint32_t crc; /* Real Ethernet transmits the FCS least-significant byte first. */
+} ethernet_footer_t;
+
+#pragma pack(pop)
+
+/* Standard CRC-32 (IEEE 802.3), reflected, poly 0xEDB88320 */
+static inline uint32_t crc32(const void* data, size_t data_size) {
+  const uint8_t* bytes = (const uint8_t*)data;
+  uint32_t crc = 0xFFFFFFFFu;
+
+  for (size_t i = 0; i < data_size; ++i) {
+    crc ^= bytes[i];
+    for (int bit = 0; bit < 8; ++bit) {
+      uint32_t mask = -(crc & 1u);
+      crc = (crc >> 1) ^ (0xEDB88320u & mask);
+    }
+  }
+
+  return ~crc;
+}
