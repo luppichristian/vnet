@@ -25,9 +25,22 @@ static void print_ipv4_packet(const uint8_t* bytes, uint16_t data_field_length) 
   }
 
   fprintf(stdout, "  Valid IPv4 packet (%u bytes):\n", ipv4_header.total_length);
-  fprintf(stdout, "    IPv4 source:     %u.%u.%u.%u\n", ipv4_header.source_address & 0xFF, (ipv4_header.source_address >> 8) & 0xFF, (ipv4_header.source_address >> 16) & 0xFF, ipv4_header.source_address >> 24);
-  fprintf(stdout, "    IPv4 destination:%u.%u.%u.%u\n", ipv4_header.destination_address & 0xFF, (ipv4_header.destination_address >> 8) & 0xFF, (ipv4_header.destination_address >> 16) & 0xFF, ipv4_header.destination_address >> 24);
+  fprintf(stdout, "    IPv4 source:     %u.%u.%u.%u\n", ipv4_header.src_addr & 0xFF, (ipv4_header.src_addr >> 8) & 0xFF, (ipv4_header.src_addr >> 16) & 0xFF, ipv4_header.src_addr >> 24);
+  fprintf(stdout, "    IPv4 destination:%u.%u.%u.%u\n", ipv4_header.dst_addr & 0xFF, (ipv4_header.dst_addr >> 8) & 0xFF, (ipv4_header.dst_addr >> 16) & 0xFF, ipv4_header.dst_addr >> 24);
   fprintf(stdout, "    IPv4 total length: %u bytes, TTL: %u, protocol: %u\n", ipv4_header.total_length, ipv4_header.ttl, ipv4_header.protocol);
+}
+
+static bool is_ethernet_frame_start(const uint8_t* bytes, size_t byte_count) {
+  if (byte_count < ETHERNET_PREAMBLE_LEN + sizeof(uint8_t)) {
+    return false;
+  }
+
+  for (size_t i = 0; i < ETHERNET_PREAMBLE_LEN; ++i) {
+    if (bytes[i] != ETHERNET_PREAMBLE_BYTE) {
+      return false;
+    }
+  }
+  return bytes[ETHERNET_PREAMBLE_LEN] == ETHERNET_SFD;
 }
 
 static bool print_ethernet_frame(const uint8_t* bytes, size_t byte_count) {
@@ -169,13 +182,24 @@ int main(int argc, char** argv) {
     /* Advance offset by what we actually consumed */
     offset += actually_read;
 
-    /* Attempt to print an ethernet frame */
-    if (print_ethernet_frame(buff, actually_read)) {
-      continue;
+    /* Split consecutive Ethernet frames at their preamble/SFD synchronization sequence. */
+    size_t frame_start = 0;
+    for (size_t frame_end = 1; frame_end < (size_t)actually_read; ++frame_end) {
+      if (!is_ethernet_frame_start(buff + frame_end, (size_t)actually_read - frame_end)) {
+        continue;
+      }
+
+      const size_t frame_length = frame_end - frame_start;
+      if (!print_ethernet_frame(buff + frame_start, frame_length)) {
+        print_raw_bytes(buff + frame_start, (long)frame_length);
+      }
+      frame_start = frame_end;
     }
 
-    /* Print raw bytes otherwise */
-    print_raw_bytes(buff, actually_read);
+    const size_t frame_length = (size_t)actually_read - frame_start;
+    if (!print_ethernet_frame(buff + frame_start, frame_length)) {
+      print_raw_bytes(buff + frame_start, (long)frame_length);
+    }
   }
 
   fclose(f);

@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 /*
+====================
 IPv4 Datagram Format
 ====================
 
@@ -68,7 +69,7 @@ typedef struct ipv4_header {
   All fragments from the same original datagram share this sender-chosen value.
   A receiver uses it with source, destination, and protocol to reassemble them.
   */
-  uint16_t identification; /* Sender-selected datagram identifier for fragment reassembly. */
+  uint16_t fragment_id; /* Sender-selected datagram identifier for fragment reassembly. */
 
   /* Reserved for future use and required to remain zero. */
   uint16_t reserved : 1;
@@ -92,10 +93,10 @@ typedef struct ipv4_header {
   uint16_t header_checksum; /* One's-complement checksum of this header only, with this field initially zero. */
 
   /* The logical network-layer sender; routers normally leave this unchanged. */
-  ipv4_address_t source_address; /* Sender IPv4 address. */
+  ipv4_address_t src_addr; /* Sender IPv4 address. */
 
   /* The final intended host; routers use it to choose the next hop. */
-  ipv4_address_t destination_address; /* Intended receiver IPv4 address. */
+  ipv4_address_t dst_addr; /* Intended receiver IPv4 address. */
 } ipv4_header_t;
 
 #pragma pack(pop)

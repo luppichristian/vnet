@@ -4,6 +4,7 @@ We send data by appending to the file and we receive data by reading the file pe
 */
 
 #include <assert.h>
+#include <arp.h>
 #include <ethernet.h>
 #include <ipv4.h>
 #include <stdbool.h>
@@ -90,12 +91,12 @@ static void write_ipv4_packet(FILE* f, const ipv4_packet_data_t* packet_data) {
       .version = 4,
       .ihl = 5,
       .total_length = sizeof(ipv4_header) + packet_data->data_length,
-      .identification = 1,
+      .fragment_id = 1,
       .dont_fragment = 1,
       .ttl = IPV4_DEFAULT_TTL,
       .protocol = IPV4_PROTOCOL_TEST,
-      .source_address = packet_data->src_addr,
-      .destination_address = packet_data->dst_addr,
+      .src_addr = packet_data->src_addr,
+      .dst_addr = packet_data->dst_addr,
   };
   ipv4_header.header_checksum = ipv4_checksum(&ipv4_header, sizeof(ipv4_header));
   memcpy(ipv4_packet, &ipv4_header, sizeof(ipv4_header));
@@ -109,6 +110,34 @@ static void write_ipv4_packet(FILE* f, const ipv4_packet_data_t* packet_data) {
   };
   memcpy(frame_data.dst_addr, packet_data->dst_mac_addr, sizeof(frame_data.dst_addr));
   memcpy(frame_data.src_addr, packet_data->src_mac_addr, sizeof(frame_data.src_addr));
+  write_ethernet_frame(f, &frame_data);
+}
+
+typedef struct arp_packet_data {
+  mac_address_t sender_hardware_address;
+  ipv4_address_t sender_protocol_address;
+  ipv4_address_t target_protocol_address;
+} arp_packet_data_t;
+
+static void write_arp_packet(FILE* f, const arp_packet_data_t* packet_data) {
+  arp_packet_t arp_packet = {
+      .hardware_type = ARP_HARDWARE_TYPE_ETHERNET,
+      .protocol_type = ETHERNET_ETHERTYPE_IPV4,
+      .hardware_address_length = sizeof(mac_address_t),
+      .protocol_address_length = sizeof(ipv4_address_t),
+      .operation = ARP_OPERATION_REQUEST,
+      .sender_protocol_address = packet_data->sender_protocol_address,
+      .target_protocol_address = packet_data->target_protocol_address,
+  };
+  memcpy(arp_packet.sender_hardware_address, packet_data->sender_hardware_address, sizeof(arp_packet.sender_hardware_address));
+
+  ethernet_frame_data_t frame_data = {
+      .dst_addr = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
+      .type_or_length = ETHERNET_ETHERTYPE_ARP,
+      .data_length = sizeof(arp_packet),
+      .data = &arp_packet,
+  };
+  memcpy(frame_data.src_addr, packet_data->sender_hardware_address, sizeof(frame_data.src_addr));
   write_ethernet_frame(f, &frame_data);
 }
 
@@ -137,6 +166,13 @@ int main(int argc, char** argv) {
         .data_length = sizeof(data),
     };
     write_ipv4_packet(f, &packet_data);
+
+    arp_packet_data_t arp_data = {
+        .sender_hardware_address = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01},
+        .sender_protocol_address = IPV4_ADDRESS(192, 168, 1, 1),
+        .target_protocol_address = IPV4_ADDRESS(192, 168, 1, 2),
+    };
+    write_arp_packet(f, &arp_data);
   }
 
   fclose(f);
