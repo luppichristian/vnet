@@ -1,6 +1,8 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 
 /*
 ====================================
@@ -66,3 +68,16 @@ typedef struct vnet_frame_header {
 #pragma pack(pop)
 
 _Static_assert(sizeof(vnet_frame_header_t) == 1030, "VNet frame size must remain fixed");
+
+/* Returns true when frame has this simulator's magic, version, type, and terminated paths. */
+bool vnet_frame_is_valid(const vnet_frame_header_t* frame);
+
+/* Appends one connection lifecycle frame to destination and flushes it for other targets. */
+bool vnet_frame_write(FILE* destination, vnet_frame_type_t type, const char* source_path, const char* destination_path);
+
+/*
+Forwards raw bytes through an append-mode destination until source_end. Complete
+VNet frames addressed to source_path are consumed locally and excluded from
+forwarded_bytes.
+*/
+bool vnet_forward_bytes(FILE* source, FILE* destination, const char* source_path, long source_end, size_t* forwarded_bytes);

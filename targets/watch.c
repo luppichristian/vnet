@@ -5,12 +5,12 @@ We send data by appending to the file and we receive data by reading the file pe
 
 #include <ethernet.h>
 #include <ipv4.h>
-#include <vnet.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <vnet.h>
 
 /* Max amount of bytes that can be read at each iteration*/
 #define MAX_READ 4096
@@ -51,7 +51,7 @@ static bool is_vnet_frame_start(const uint8_t* bytes, size_t byte_count) {
 
   vnet_frame_header_t header = {0};
   memcpy(&header, bytes, sizeof(header));
-  return header.magic == VNET_FRAME_MAGIC && header.version == VNET_PROTOCOL_VERSION && (header.type == VNET_FRAME_CONNECTION_START || header.type == VNET_FRAME_CONNECTION_END) && memchr(header.source_path, '\0', sizeof(header.source_path)) && memchr(header.destination_path, '\0', sizeof(header.destination_path));
+  return vnet_frame_is_valid(&header);
 }
 
 static bool is_vnet_frame_prefix(const uint8_t* bytes, size_t byte_count) {
@@ -103,7 +103,7 @@ static bool print_ethernet_frame(const uint8_t* bytes, size_t byte_count) {
   memcpy(&footer, bytes + expected_frame_length - sizeof(footer), sizeof(footer));
   const uint8_t* crc_data = bytes + ETHERNET_PREAMBLE_LEN + sizeof(header.sfd);
   const size_t crc_data_length = sizeof(header.dst_mac) + sizeof(header.src_mac) + sizeof(header.type_or_length) + data_field_length;
-  if (crc32(crc_data, crc_data_length) != footer.crc) {
+  if (ethernet_crc32(crc_data, crc_data_length) != footer.crc) {
     return false;
   }
 

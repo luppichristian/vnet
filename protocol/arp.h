@@ -2,7 +2,9 @@
 
 #include <ethernet.h>
 #include <ipv4.h>
+#include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 
 /*
 =========================================
@@ -78,3 +80,13 @@ typedef struct arp_packet {
 } arp_packet_t;
 
 #pragma pack(pop)
+
+/* Data needed to write one Ethernet/IPv4 ARP request. */
+typedef struct arp_packet_data {
+  mac_address_t sender_hardware_address;
+  ipv4_address_t sender_protocol_address;
+  ipv4_address_t target_protocol_address;
+} arp_packet_data_t;
+
+/* Writes one broadcast Ethernet II ARP request. */
+bool arp_write_ethernet_request(FILE* destination, const arp_packet_data_t* packet_data);

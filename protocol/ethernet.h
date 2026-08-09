@@ -1,6 +1,9 @@
 #pragma once
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 /*
 ======================
@@ -82,18 +85,17 @@ typedef struct ethernet_footer {
 
 #pragma pack(pop)
 
-/* Standard CRC-32 (IEEE 802.3), reflected, poly 0xEDB88320 */
-static inline uint32_t crc32(const void* data, size_t data_size) {
-  const uint8_t* bytes = (const uint8_t*)data;
-  uint32_t crc = 0xFFFFFFFFu;
+/* Data needed to serialize one complete Ethernet frame into a network file. */
+typedef struct ethernet_frame_data {
+  mac_address_t dst_addr;
+  mac_address_t src_addr;
+  uint16_t type_or_length;
+  uint16_t data_length;
+  const void* data;
+} ethernet_frame_data_t;
 
-  for (size_t i = 0; i < data_size; ++i) {
-    crc ^= bytes[i];
-    for (int bit = 0; bit < 8; ++bit) {
-      uint32_t mask = -(crc & 1u);
-      crc = (crc >> 1) ^ (0xEDB88320u & mask);
-    }
-  }
+/* Standard CRC-32 (IEEE 802.3), reflected, poly 0xEDB88320. */
+uint32_t ethernet_crc32(const void* data, size_t data_size);
 
-  return ~crc;
-}
+/* Writes one complete Ethernet frame, including preamble, SFD, padding, and FCS. */
+bool ethernet_write_frame(FILE* destination, const ethernet_frame_data_t* frame_data);

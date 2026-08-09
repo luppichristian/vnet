@@ -1,7 +1,11 @@
 #pragma once
 
+#include <stdbool.h>
+#include <ethernet.h>
+#include <ipv4.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 /*
 ==================================
@@ -75,15 +79,19 @@ The sender clears checksum, computes this value over the entire ICMP message,
 and stores it in checksum. A receiver recomputes it over the received message;
 a valid message returns zero.
 */
-static inline uint16_t icmp_checksum(const void* data, size_t data_size) {
-  const uint8_t* bytes = (const uint8_t*)data;
-  uint32_t sum = 0;
+uint16_t icmp_checksum(const void* data, size_t data_size);
 
-  for (size_t i = 0; i < data_size; i += 2) {
-    const uint16_t word = bytes[i] | (uint16_t)(i + 1 < data_size ? bytes[i + 1] << 8 : 0);
-    sum += word;
-    sum = (sum & 0xFFFFu) + (sum >> 16);
-  }
+/* Data needed to write one ICMP Echo Request inside an IPv4 Ethernet II frame. */
+typedef struct icmp_echo_request_data {
+  mac_address_t dst_mac_addr;
+  mac_address_t src_mac_addr;
+  ipv4_address_t src_addr;
+  ipv4_address_t dst_addr;
+  uint16_t identifier;
+  uint16_t sequence_number;
+  const void* data;
+  uint16_t data_length;
+} icmp_echo_request_data_t;
 
-  return (uint16_t)~sum;
-}
+/* Writes one ICMP Echo Request in an IPv4 Ethernet II frame. */
+bool icmp_write_ethernet_echo_request(FILE* destination, const icmp_echo_request_data_t* request_data);

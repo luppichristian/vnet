@@ -1,7 +1,10 @@
 #pragma once
 
+#include <ethernet.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 /*
 ====================
@@ -125,15 +128,18 @@ the complete received header, including header_checksum; a valid header returns
 zero. Payload integrity is handled by upper protocols and Ethernet FCS covers
 the complete local frame.
 */
-static inline uint16_t ipv4_checksum(const void* data, size_t data_size) {
-  const uint8_t* bytes = (const uint8_t*)data;
-  uint32_t sum = 0;
+uint16_t ipv4_checksum(const void* data, size_t data_size);
 
-  for (size_t i = 0; i < data_size; i += 2) {
-    const uint16_t word = bytes[i] | (uint16_t)(i + 1 < data_size ? bytes[i + 1] << 8 : 0);
-    sum += word;
-    sum = (sum & 0xFFFFu) + (sum >> 16);
-  }
+/* Data needed to write one IPv4 datagram inside an Ethernet II frame. */
+typedef struct ipv4_packet_data {
+  mac_address_t dst_mac_addr;
+  mac_address_t src_mac_addr;
+  ipv4_address_t src_addr;
+  ipv4_address_t dst_addr;
+  uint8_t protocol;
+  const void* data;
+  uint16_t data_length;
+} ipv4_packet_data_t;
 
-  return (uint16_t)~sum;
-}
+/* Writes an Ethernet II frame carrying one base-header IPv4 datagram. */
+bool ipv4_write_ethernet_packet(FILE* destination, const ipv4_packet_data_t* packet_data);
