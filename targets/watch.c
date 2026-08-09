@@ -13,7 +13,7 @@ We send data by appending to the file and we receive data by reading the file pe
 #include <string.h>
 
 /* Max amount of bytes that can be read at each iteration*/
-#define MAX_READ 1024
+#define MAX_READ 4096
 
 static void print_ipv4_packet(const uint8_t* bytes, uint16_t data_field_length) {
   ipv4_header_t ipv4_header = {0};
@@ -51,7 +51,12 @@ static bool is_vnet_frame_start(const uint8_t* bytes, size_t byte_count) {
 
   vnet_frame_header_t header = {0};
   memcpy(&header, bytes, sizeof(header));
-  return header.magic == VNET_FRAME_MAGIC && header.version == VNET_PROTOCOL_VERSION && (header.type == VNET_FRAME_CONNECTION_START || header.type == VNET_FRAME_CONNECTION_END);
+  return header.magic == VNET_FRAME_MAGIC && header.version == VNET_PROTOCOL_VERSION && (header.type == VNET_FRAME_CONNECTION_START || header.type == VNET_FRAME_CONNECTION_END) && memchr(header.source_path, '\0', sizeof(header.source_path)) && memchr(header.destination_path, '\0', sizeof(header.destination_path));
+}
+
+static bool is_vnet_frame_prefix(const uint8_t* bytes, size_t byte_count) {
+  uint32_t magic = 0;
+  return byte_count >= sizeof(magic) && memcpy(&magic, bytes, sizeof(magic)) && magic == VNET_FRAME_MAGIC;
 }
 
 static bool print_ethernet_frame(const uint8_t* bytes, size_t byte_count) {
@@ -135,16 +140,16 @@ static bool print_vnet_frame(const uint8_t* bytes, size_t byte_count) {
 
   vnet_frame_header_t header = {0};
   memcpy(&header, bytes, sizeof(header));
-  const size_t expected_frame_length = sizeof(header) + header.payload_length;
-  if (byte_count != expected_frame_length) {
+  if (byte_count != sizeof(header)) {
     return false;
   }
 
   const char* event = header.type == VNET_FRAME_CONNECTION_START ? "connection start" : "connection end";
   fprintf(stdout, "Received %li bytes (%li bits):\n", (long)byte_count, (long)byte_count * 8);
-  fprintf(stdout, "  Valid VNet control frame (%zu bytes):\n", expected_frame_length);
+  fprintf(stdout, "  Valid VNet control frame (%zu bytes):\n", sizeof(header));
   fprintf(stdout, "    Event:           %s\n", event);
-  fprintf(stdout, "    Source file:     %.*s\n", (int)header.payload_length, (const char*)(bytes + sizeof(header)));
+  fprintf(stdout, "    Source file:     %s\n", header.source_path);
+  fprintf(stdout, "    Destination file:%s\n", header.destination_path);
   return true;
 }
 
@@ -179,7 +184,8 @@ int main(int argc, char** argv) {
   long offset = ftell(f);
 
   /* Byte buffer */
-  uint8_t buff[MAX_READ];
+  uint8_t buff[MAX_READ + sizeof(vnet_frame_header_t)];
+  size_t buffered_bytes = 0;
 
   /* Loop*/
   while (1) {
@@ -203,7 +209,7 @@ int main(int argc, char** argv) {
     fseek(f, offset, SEEK_SET);
 
     /* Read the actual bytes */
-    const long actually_read = fread(buff, 1, to_read, f);
+    const long actually_read = fread(buff + buffered_bytes, 1, to_read, f);
     if (actually_read != to_read) {
       fclose(f);
       fprintf(stderr, "Unexpected file op fail while reading the file \'%s\'.", fpath);
@@ -214,22 +220,44 @@ int main(int argc, char** argv) {
     offset += actually_read;
 
     /* Split consecutive Ethernet and VNet frames at their start sequences. */
+    const size_t byte_count = buffered_bytes + (size_t)actually_read;
     size_t frame_start = 0;
-    for (size_t frame_end = 1; frame_end < (size_t)actually_read; ++frame_end) {
-      if (!is_ethernet_frame_start(buff + frame_end, (size_t)actually_read - frame_end) && !is_vnet_frame_start(buff + frame_end, (size_t)actually_read - frame_end)) {
+    while (frame_start < byte_count) {
+      if (is_vnet_frame_start(buff + frame_start, byte_count - frame_start)) {
+        print_vnet_frame(buff + frame_start, sizeof(vnet_frame_header_t));
+        frame_start += sizeof(vnet_frame_header_t);
         continue;
       }
 
-      const size_t frame_length = frame_end - frame_start;
-      if (!print_vnet_frame(buff + frame_start, frame_length) && !print_ethernet_frame(buff + frame_start, frame_length)) {
-        print_raw_bytes(buff + frame_start, (long)frame_length);
+      size_t frame_end = frame_start + 1;
+      for (; frame_end < byte_count; ++frame_end) {
+        if (is_ethernet_frame_start(buff + frame_end, byte_count - frame_end) || is_vnet_frame_prefix(buff + frame_end, byte_count - frame_end)) {
+          break;
+        }
       }
-      frame_start = frame_end;
-    }
+      if (frame_end < byte_count) {
+        const size_t frame_length = frame_end - frame_start;
+        if (!print_ethernet_frame(buff + frame_start, frame_length)) {
+          print_raw_bytes(buff + frame_start, (long)frame_length);
+        }
+        frame_start = frame_end;
+        continue;
+      }
 
-    const size_t frame_length = (size_t)actually_read - frame_start;
-    if (!print_vnet_frame(buff + frame_start, frame_length) && !print_ethernet_frame(buff + frame_start, frame_length)) {
-      print_raw_bytes(buff + frame_start, (long)frame_length);
+      const size_t frame_length = byte_count - frame_start;
+      if (is_vnet_frame_prefix(buff + frame_start, frame_length) && frame_length < sizeof(vnet_frame_header_t)) {
+        memmove(buff, buff + frame_start, frame_length);
+        buffered_bytes = frame_length;
+      } else {
+        if (!print_ethernet_frame(buff + frame_start, frame_length)) {
+          print_raw_bytes(buff + frame_start, (long)frame_length);
+        }
+        buffered_bytes = 0;
+      }
+      break;
+    }
+    if (frame_start == byte_count) {
+      buffered_bytes = 0;
     }
   }
 

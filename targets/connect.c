@@ -41,10 +41,26 @@ static bool get_file_end(FILE* file, long* end) {
   return *end >= 0 && fseek(file, current < *end ? current : *end, SEEK_SET) == 0;
 }
 
+static bool is_vnet_frame(FILE* source, long source_end, vnet_frame_header_t* header) {
+  const long source_position = ftell(source);
+  if (source_position < 0 || source_end - source_position < (long)sizeof(*header)) {
+    return false;
+  }
+  if (fread(header, sizeof(*header), 1, source) != 1 || fseek(source, source_position, SEEK_SET) != 0) {
+    return false;
+  }
+  return header->magic == VNET_FRAME_MAGIC && header->version == VNET_PROTOCOL_VERSION && (header->type == VNET_FRAME_CONNECTION_START || header->type == VNET_FRAME_CONNECTION_END) && memchr(header->source_path, '\0', sizeof(header->source_path)) && memchr(header->destination_path, '\0', sizeof(header->destination_path));
+}
+
+static bool write_available(FILE* destination, const uint8_t* bytes, size_t byte_count) {
+  return fseek(destination, 0, SEEK_END) == 0 && fwrite(bytes, 1, byte_count, destination) == byte_count && fflush(destination) == 0;
+}
+
 /* Forward unread data up to the current file end */
-static bool forward_available(FILE* source, FILE* destination, long source_end, size_t* forwarded_bytes) {
+static bool forward_available(FILE* source, FILE* destination, const char* source_path, long source_end, size_t* forwarded_bytes) {
   uint8_t buffer[CONNECTION_BUFFER_SIZE];
   long source_position = ftell(source);
+  size_t buffer_length = 0;
 
   if (source_position < 0) {
     return false;
@@ -55,41 +71,68 @@ static bool forward_available(FILE* source, FILE* destination, long source_end, 
 
   *forwarded_bytes = 0;
   while (source_position < source_end) {
-    const size_t bytes_to_copy = (size_t)(source_end - source_position) < sizeof(buffer) ? (size_t)(source_end - source_position) : sizeof(buffer);
-    if (fread(buffer, 1, bytes_to_copy, source) != bytes_to_copy || fseek(destination, 0, SEEK_END) != 0 || fwrite(buffer, 1, bytes_to_copy, destination) != bytes_to_copy || fflush(destination) != 0) {
+    vnet_frame_header_t header = {0};
+    if (is_vnet_frame(source, source_end, &header) && strcmpi(header.destination_path, source_path) == 0) {
+      if (buffer_length > 0 && !write_available(destination, buffer, buffer_length)) {
+        return false;
+      }
+      *forwarded_bytes += buffer_length;
+      buffer_length = 0;
+      if (fseek(source, (long)sizeof(header), SEEK_CUR) != 0) {
+        return false;
+      }
+      source_position += sizeof(header);
+      continue;
+    }
+
+    if (fread(buffer + buffer_length, 1, 1, source) != 1) {
       return false;
     }
-    source_position += (long)bytes_to_copy;
-    *forwarded_bytes += bytes_to_copy;
+    ++buffer_length;
+    ++source_position;
+    if (buffer_length == sizeof(buffer)) {
+      if (!write_available(destination, buffer, buffer_length)) {
+        return false;
+      }
+      *forwarded_bytes += buffer_length;
+      buffer_length = 0;
+    }
   }
+  if (buffer_length > 0 && !write_available(destination, buffer, buffer_length)) {
+    return false;
+  }
+  *forwarded_bytes += buffer_length;
   return true;
 }
 
 /* Write a VNet control frame for one forwarding direction */
-static bool write_vnet_frame(FILE* destination, vnet_frame_type_t type, const char* source_path, size_t* written_bytes) {
+static bool write_vnet_frame(FILE* destination, vnet_frame_type_t type, const char* source_path, const char* destination_path, size_t* written_bytes) {
   const size_t source_path_length = strlen(source_path);
-  if (source_path_length > VNET_MAX_SOURCE_PATH_LEN) {
-    fprintf(stderr, "Source path is too long for a VNet frame: '%s'.\n", source_path);
+  const size_t destination_path_length = strlen(destination_path);
+  if (source_path_length >= VNET_PATH_LEN || destination_path_length >= VNET_PATH_LEN) {
+    fprintf(stderr, "Source or destination path is too long for a VNet frame.\n");
     return false;
   }
 
-  const vnet_frame_header_t header = {
+  vnet_frame_header_t header = {
       .magic = VNET_FRAME_MAGIC,
       .version = VNET_PROTOCOL_VERSION,
       .type = type,
-      .payload_length = (uint16_t)source_path_length,
   };
-  if (fseek(destination, 0, SEEK_END) != 0 || fwrite(&header, sizeof(header), 1, destination) != 1 || fwrite(source_path, 1, source_path_length, destination) != source_path_length || fflush(destination) != 0) {
+  memcpy(header.source_path, source_path, source_path_length);
+  memcpy(header.destination_path, destination_path, destination_path_length);
+  if (fseek(destination, 0, SEEK_END) != 0 || fwrite(&header, sizeof(header), 1, destination) != 1 || fflush(destination) != 0) {
     return false;
   }
 
-  *written_bytes = sizeof(header) + source_path_length;
+  *written_bytes = sizeof(header);
   return true;
 }
 
 int main(int argc, char** argv) {
   if (argc < 3) {
     fprintf(stderr, "Expected at least 2 arguments: source and destination file.\n");
+    fprintf(stderr, "Usage: <source> <dest> (optional -b)\n");
     return (EXIT_FAILURE);
   }
 
@@ -160,13 +203,13 @@ int main(int argc, char** argv) {
   /* Notify each destination that forwarding from its source has started */
   size_t start_a_bytes = 0;
   size_t start_b_bytes = 0;
-  if (!write_vnet_frame(destination_a, VNET_FRAME_CONNECTION_START, src_f, &start_a_bytes)) {
+  if (!write_vnet_frame(destination_a, VNET_FRAME_CONNECTION_START, src_f, dst_f, &start_a_bytes)) {
     status = EXIT_FAILURE;
     goto cleanup;
   }
   started_a = true;
   fprintf(stdout, "Opened connection from '%s' to '%s'.\n", src_f, dst_f);
-  if (bidirectional && (fseek(source_b, (long)start_a_bytes, SEEK_CUR) != 0 || !write_vnet_frame(destination_b, VNET_FRAME_CONNECTION_START, dst_f, &start_b_bytes) || fseek(source_a, (long)start_b_bytes, SEEK_CUR) != 0)) {
+  if (bidirectional && (fseek(source_b, (long)start_a_bytes, SEEK_CUR) != 0 || !write_vnet_frame(destination_b, VNET_FRAME_CONNECTION_START, dst_f, src_f, &start_b_bytes) || fseek(source_a, (long)start_b_bytes, SEEK_CUR) != 0)) {
     status = EXIT_FAILURE;
     goto cleanup;
   }
@@ -186,7 +229,7 @@ int main(int argc, char** argv) {
     size_t forwarded_a = 0;
     size_t forwarded_b = 0;
 
-    if (!get_file_end(source_a, &source_a_end) || (bidirectional && !get_file_end(source_b, &source_b_end)) || !forward_available(source_a, destination_a, source_a_end, &forwarded_a) || (bidirectional && !forward_available(source_b, destination_b, source_b_end, &forwarded_b))) {
+    if (!get_file_end(source_a, &source_a_end) || (bidirectional && !get_file_end(source_b, &source_b_end)) || !forward_available(source_a, destination_a, src_f, source_a_end, &forwarded_a) || (bidirectional && !forward_available(source_b, destination_b, dst_f, source_b_end, &forwarded_b))) {
       status = EXIT_FAILURE;
       break;
     }
@@ -211,12 +254,12 @@ int main(int argc, char** argv) {
 cleanup:
   /* Notify each destination that forwarding from its source has stopped */
   size_t end_bytes = 0;
-  if (started_a && !write_vnet_frame(destination_a, VNET_FRAME_CONNECTION_END, src_f, &end_bytes)) {
+  if (started_a && !write_vnet_frame(destination_a, VNET_FRAME_CONNECTION_END, src_f, dst_f, &end_bytes)) {
     status = EXIT_FAILURE;
   } else if (started_a) {
     fprintf(stdout, "Closed connection from '%s' to '%s'.\n", src_f, dst_f);
   }
-  if (started_b && !write_vnet_frame(destination_b, VNET_FRAME_CONNECTION_END, dst_f, &end_bytes)) {
+  if (started_b && !write_vnet_frame(destination_b, VNET_FRAME_CONNECTION_END, dst_f, src_f, &end_bytes)) {
     status = EXIT_FAILURE;
   } else if (started_b) {
     fprintf(stdout, "Closed connection from '%s' to '%s'.\n", dst_f, src_f);
