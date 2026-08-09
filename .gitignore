@@ -4,6 +4,7 @@ gen/
 
 # Network files
 *.net
+*.n
 
 # bbs local overrides
 config.bbs
