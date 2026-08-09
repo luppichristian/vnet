@@ -46,3 +46,46 @@ bool ethernet_write_frame(FILE* destination, const ethernet_frame_data_t* frame_
 
   return fwrite(&header, sizeof(header), 1, destination) == 1 && fwrite(frame_data->data, 1, data_length, destination) == data_length && fwrite(padding, 1, padding_length, destination) == padding_length && fwrite(&footer, sizeof(footer), 1, destination) == 1;
 }
+
+bool ethernet_frame_is_start(const uint8_t* bytes, size_t byte_count) {
+  if (byte_count < ETHERNET_PREAMBLE_LEN + sizeof(uint8_t)) {
+    return false;
+  }
+  for (size_t i = 0; i < ETHERNET_PREAMBLE_LEN; ++i) {
+    if (bytes[i] != ETHERNET_PREAMBLE_BYTE) {
+      return false;
+    }
+  }
+  return bytes[ETHERNET_PREAMBLE_LEN] == ETHERNET_SFD;
+}
+
+bool ethernet_parse_frame(const uint8_t* bytes, size_t byte_count, ethernet_frame_view_t* frame) {
+  if (byte_count < sizeof(frame->header) + sizeof(frame->footer)) {
+    return false;
+  }
+  memcpy(&frame->header, bytes, sizeof(frame->header));
+  if (!ethernet_frame_is_start(bytes, byte_count)) {
+    return false;
+  }
+  frame->format = ETHERNET_FRAME_FORMAT_IEEE_802_3;
+  if (frame->header.type_or_length <= ETHERNET_MAX_DATA_LEN) {
+    frame->client_data_length = frame->header.type_or_length;
+    frame->data_length = frame->client_data_length < ETHERNET_MIN_DATA_LEN ? ETHERNET_MIN_DATA_LEN : frame->client_data_length;
+    if (byte_count != sizeof(frame->header) + frame->data_length + sizeof(frame->footer)) {
+      return false;
+    }
+  } else {
+    if (frame->header.type_or_length < ETHERNET_ETHERTYPE_MIN || byte_count < sizeof(frame->header) + ETHERNET_MIN_DATA_LEN + sizeof(frame->footer)) {
+      return false;
+    }
+    frame->format = ETHERNET_FRAME_FORMAT_II;
+    frame->data_length = (uint16_t)(byte_count - sizeof(frame->header) - sizeof(frame->footer));
+    frame->client_data_length = frame->data_length;
+    if (frame->data_length > ETHERNET_MAX_DATA_LEN) {
+      return false;
+    }
+  }
+  frame->data = bytes + sizeof(frame->header);
+  memcpy(&frame->footer, frame->data + frame->data_length, sizeof(frame->footer));
+  return ethernet_crc32(bytes + ETHERNET_PREAMBLE_LEN + sizeof(frame->header.sfd), sizeof(frame->header.dst_mac) + sizeof(frame->header.src_mac) + sizeof(frame->header.type_or_length) + frame->data_length) == frame->footer.crc;
+}

@@ -141,5 +141,15 @@ typedef struct ipv4_packet_data {
   uint16_t data_length;
 } ipv4_packet_data_t;
 
+/* Parsed IPv4 packet whose payload pointer refers into the caller-owned byte buffer. */
+typedef struct ipv4_packet_view {
+  ipv4_header_t header;
+  const uint8_t* payload;
+  uint16_t payload_length;
+} ipv4_packet_view_t;
+
 /* Writes an Ethernet II frame carrying one base-header IPv4 datagram. */
 bool ipv4_write_ethernet_packet(FILE* destination, const ipv4_packet_data_t* packet_data);
+
+/* Validates and decodes one supported base-header IPv4 packet from a byte buffer. */
+bool ipv4_parse_packet(const uint8_t* bytes, size_t byte_count, ipv4_packet_view_t* packet);

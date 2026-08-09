@@ -1,6 +1,5 @@
-/* This program will write data to the network traffic file.
-In our case we mimic network traffic through a simple binary file.
-We send data by appending to the file and we receive data by reading the file periodically.
+/*
+This program writes Ethernet traffic to the network file.
 */
 
 #include <arp.h>

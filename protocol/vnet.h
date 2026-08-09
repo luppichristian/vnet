@@ -72,6 +72,12 @@ _Static_assert(sizeof(vnet_frame_header_t) == 1030, "VNet frame size must remain
 /* Returns true when frame has this simulator's magic, version, type, and terminated paths. */
 bool vnet_frame_is_valid(const vnet_frame_header_t* frame);
 
+/* Returns true when bytes contain the VNet magic prefix. */
+bool vnet_frame_has_prefix(const uint8_t* bytes, size_t byte_count);
+
+/* Validates and decodes one complete VNet frame from a byte buffer. */
+bool vnet_parse_frame(const uint8_t* bytes, size_t byte_count, vnet_frame_header_t* frame);
+
 /* Appends one connection lifecycle frame to destination and flushes it for other targets. */
 bool vnet_frame_write(FILE* destination, vnet_frame_type_t type, const char* source_path, const char* destination_path);
 

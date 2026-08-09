@@ -95,3 +95,6 @@ typedef struct icmp_echo_request_data {
 
 /* Writes one ICMP Echo Request in an IPv4 Ethernet II frame. */
 bool icmp_write_ethernet_echo_request(FILE* destination, const icmp_echo_request_data_t* request_data);
+
+/* Validates and decodes one ICMP Echo Request or Echo Reply from a byte buffer. */
+bool icmp_parse_echo_packet(const uint8_t* bytes, size_t byte_count, icmp_echo_header_t* header, const uint8_t** data, size_t* data_length);

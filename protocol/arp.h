@@ -90,3 +90,6 @@ typedef struct arp_packet_data {
 
 /* Writes one broadcast Ethernet II ARP request. */
 bool arp_write_ethernet_request(FILE* destination, const arp_packet_data_t* packet_data);
+
+/* Validates and decodes one Ethernet/IPv4 ARP request or reply from a byte buffer. */
+bool arp_parse_packet(const uint8_t* bytes, size_t byte_count, arp_packet_t* packet);

@@ -7,6 +7,19 @@ bool vnet_frame_is_valid(const vnet_frame_header_t* frame) {
   return frame->magic == VNET_FRAME_MAGIC && frame->version == VNET_PROTOCOL_VERSION && (frame->type == VNET_FRAME_CONNECTION_START || frame->type == VNET_FRAME_CONNECTION_END) && memchr(frame->source_path, '\0', sizeof(frame->source_path)) && memchr(frame->destination_path, '\0', sizeof(frame->destination_path));
 }
 
+bool vnet_frame_has_prefix(const uint8_t* bytes, size_t byte_count) {
+  uint32_t magic = 0;
+  return byte_count >= sizeof(magic) && memcpy(&magic, bytes, sizeof(magic)) && magic == VNET_FRAME_MAGIC;
+}
+
+bool vnet_parse_frame(const uint8_t* bytes, size_t byte_count, vnet_frame_header_t* frame) {
+  if (byte_count != sizeof(*frame)) {
+    return false;
+  }
+  memcpy(frame, bytes, sizeof(*frame));
+  return vnet_frame_is_valid(frame);
+}
+
 bool vnet_frame_write(FILE* destination, vnet_frame_type_t type, const char* source_path, const char* destination_path) {
   const size_t source_path_length = strlen(source_path);
   const size_t destination_path_length = strlen(destination_path);

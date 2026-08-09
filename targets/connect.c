@@ -1,6 +1,8 @@
-/* Utility program to establish a "connection" between 2 network files.
+/*
+Utility program to establish a "connection" between 2 network files.
 Only data written after the connection opens is forwarded to the other file.
-This supports both uni-directional and bi-directional connections. */
+This supports both uni-directional and bi-directional connections.
+*/
 
 #include <signal.h>
 #include <stdbool.h>

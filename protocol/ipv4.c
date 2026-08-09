@@ -42,3 +42,16 @@ bool ipv4_write_ethernet_packet(FILE* destination, const ipv4_packet_data_t* pac
   memcpy(frame.src_addr, packet_data->src_mac_addr, sizeof(frame.src_addr));
   return ethernet_write_frame(destination, &frame);
 }
+
+bool ipv4_parse_packet(const uint8_t* bytes, size_t byte_count, ipv4_packet_view_t* packet) {
+  if (byte_count < sizeof(packet->header)) {
+    return false;
+  }
+  memcpy(&packet->header, bytes, sizeof(packet->header));
+  if (packet->header.version != 4 || packet->header.ihl != 5 || packet->header.total_length < sizeof(packet->header) || packet->header.total_length > byte_count || ipv4_checksum(&packet->header, sizeof(packet->header)) != 0) {
+    return false;
+  }
+  packet->payload = bytes + sizeof(packet->header);
+  packet->payload_length = packet->header.total_length - sizeof(packet->header);
+  return true;
+}

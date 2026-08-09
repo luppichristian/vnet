@@ -1,5 +1,8 @@
-/* Utility program to simulate a shared hub medium for multiple network files.
-Only data written after the hub opens is repeated to every other port. */
+/*
+Utility program to simulate a shared hub medium for multiple network files.
+OSI/ISO layer: Layer 1 (physical); it repeats opaque bytes without inspecting MAC addresses.
+Only data written after the hub opens is repeated to every other port.
+*/
 
 #include <signal.h>
 #include <stdbool.h>

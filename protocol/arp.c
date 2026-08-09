@@ -22,3 +22,11 @@ bool arp_write_ethernet_request(FILE* destination, const arp_packet_data_t* pack
   memcpy(frame.src_addr, packet_data->sender_hardware_address, sizeof(frame.src_addr));
   return ethernet_write_frame(destination, &frame);
 }
+
+bool arp_parse_packet(const uint8_t* bytes, size_t byte_count, arp_packet_t* packet) {
+  if (byte_count != sizeof(*packet)) {
+    return false;
+  }
+  memcpy(packet, bytes, sizeof(*packet));
+  return packet->hardware_type == ARP_HARDWARE_TYPE_ETHERNET && packet->protocol_type == ETHERNET_ETHERTYPE_IPV4 && packet->hardware_address_length == sizeof(mac_address_t) && packet->protocol_address_length == sizeof(ipv4_address_t) && (packet->operation == ARP_OPERATION_REQUEST || packet->operation == ARP_OPERATION_REPLY);
+}

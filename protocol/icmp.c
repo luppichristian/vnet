@@ -39,3 +39,16 @@ bool icmp_write_ethernet_echo_request(FILE* destination, const icmp_echo_request
   memcpy(ipv4_packet.src_mac_addr, request_data->src_mac_addr, sizeof(ipv4_packet.src_mac_addr));
   return ipv4_write_ethernet_packet(destination, &ipv4_packet);
 }
+
+bool icmp_parse_echo_packet(const uint8_t* bytes, size_t byte_count, icmp_echo_header_t* header, const uint8_t** data, size_t* data_length) {
+  if (byte_count < sizeof(*header)) {
+    return false;
+  }
+  memcpy(header, bytes, sizeof(*header));
+  if ((header->type != ICMP_TYPE_ECHO_REQUEST && header->type != ICMP_TYPE_ECHO_REPLY) || header->code != ICMP_CODE_ECHO || icmp_checksum(bytes, byte_count) != 0) {
+    return false;
+  }
+  *data = bytes + sizeof(*header);
+  *data_length = byte_count - sizeof(*header);
+  return true;
+}

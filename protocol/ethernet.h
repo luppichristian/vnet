@@ -94,8 +94,24 @@ typedef struct ethernet_frame_data {
   const void* data;
 } ethernet_frame_data_t;
 
+/* Parsed Ethernet frame whose data pointer refers into the caller-owned byte buffer. */
+typedef struct ethernet_frame_view {
+  ethernet_header_t header;
+  ethernet_footer_t footer;
+  ethernet_frame_format_t format;
+  const uint8_t* data;
+  uint16_t data_length;
+  uint16_t client_data_length;
+} ethernet_frame_view_t;
+
 /* Standard CRC-32 (IEEE 802.3), reflected, poly 0xEDB88320. */
 uint32_t ethernet_crc32(const void* data, size_t data_size);
 
 /* Writes one complete Ethernet frame, including preamble, SFD, padding, and FCS. */
 bool ethernet_write_frame(FILE* destination, const ethernet_frame_data_t* frame_data);
+
+/* Returns true when bytes begin with Ethernet's preamble and start-frame delimiter. */
+bool ethernet_frame_is_start(const uint8_t* bytes, size_t byte_count);
+
+/* Validates and decodes one complete Ethernet frame from a caller-owned byte buffer. */
+bool ethernet_parse_frame(const uint8_t* bytes, size_t byte_count, ethernet_frame_view_t* frame);
