@@ -5,6 +5,7 @@ We send data by appending to the file and we receive data by reading the file pe
 
 #include <ethernet.h>
 #include <ipv4.h>
+#include <vnet.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -41,6 +42,16 @@ static bool is_ethernet_frame_start(const uint8_t* bytes, size_t byte_count) {
     }
   }
   return bytes[ETHERNET_PREAMBLE_LEN] == ETHERNET_SFD;
+}
+
+static bool is_vnet_frame_start(const uint8_t* bytes, size_t byte_count) {
+  if (byte_count < sizeof(vnet_frame_header_t)) {
+    return false;
+  }
+
+  vnet_frame_header_t header = {0};
+  memcpy(&header, bytes, sizeof(header));
+  return header.magic == VNET_FRAME_MAGIC && header.version == VNET_PROTOCOL_VERSION && (header.type == VNET_FRAME_CONNECTION_START || header.type == VNET_FRAME_CONNECTION_END);
 }
 
 static bool print_ethernet_frame(const uint8_t* bytes, size_t byte_count) {
@@ -117,6 +128,26 @@ static bool print_ethernet_frame(const uint8_t* bytes, size_t byte_count) {
   return true;
 }
 
+static bool print_vnet_frame(const uint8_t* bytes, size_t byte_count) {
+  if (!is_vnet_frame_start(bytes, byte_count)) {
+    return false;
+  }
+
+  vnet_frame_header_t header = {0};
+  memcpy(&header, bytes, sizeof(header));
+  const size_t expected_frame_length = sizeof(header) + header.payload_length;
+  if (byte_count != expected_frame_length) {
+    return false;
+  }
+
+  const char* event = header.type == VNET_FRAME_CONNECTION_START ? "connection start" : "connection end";
+  fprintf(stdout, "Received %li bytes (%li bits):\n", (long)byte_count, (long)byte_count * 8);
+  fprintf(stdout, "  Valid VNet control frame (%zu bytes):\n", expected_frame_length);
+  fprintf(stdout, "    Event:           %s\n", event);
+  fprintf(stdout, "    Source file:     %.*s\n", (int)header.payload_length, (const char*)(bytes + sizeof(header)));
+  return true;
+}
+
 static void print_raw_bytes(const uint8_t* bytes, long byte_count) {
   fprintf(stdout, "Received %li bytes (%li bits): ", byte_count, byte_count * 8);
   for (long i = 0; i < byte_count; ++i) {
@@ -182,22 +213,22 @@ int main(int argc, char** argv) {
     /* Advance offset by what we actually consumed */
     offset += actually_read;
 
-    /* Split consecutive Ethernet frames at their preamble/SFD synchronization sequence. */
+    /* Split consecutive Ethernet and VNet frames at their start sequences. */
     size_t frame_start = 0;
     for (size_t frame_end = 1; frame_end < (size_t)actually_read; ++frame_end) {
-      if (!is_ethernet_frame_start(buff + frame_end, (size_t)actually_read - frame_end)) {
+      if (!is_ethernet_frame_start(buff + frame_end, (size_t)actually_read - frame_end) && !is_vnet_frame_start(buff + frame_end, (size_t)actually_read - frame_end)) {
         continue;
       }
 
       const size_t frame_length = frame_end - frame_start;
-      if (!print_ethernet_frame(buff + frame_start, frame_length)) {
+      if (!print_vnet_frame(buff + frame_start, frame_length) && !print_ethernet_frame(buff + frame_start, frame_length)) {
         print_raw_bytes(buff + frame_start, (long)frame_length);
       }
       frame_start = frame_end;
     }
 
     const size_t frame_length = (size_t)actually_read - frame_start;
-    if (!print_ethernet_frame(buff + frame_start, frame_length)) {
+    if (!print_vnet_frame(buff + frame_start, frame_length) && !print_ethernet_frame(buff + frame_start, frame_length)) {
       print_raw_bytes(buff + frame_start, (long)frame_length);
     }
   }
