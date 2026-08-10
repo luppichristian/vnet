@@ -16,12 +16,15 @@ OSI/ISO layer: Layer 2 endpoint; optional IPv4 configuration supplies Layer 3 id
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <tcp.h>
 #include <thread.h>
+#include <udp.h>
 #include <vnet.h>
 
 #define HOST_DEVICE_CAPACITY 64
 #define HOST_ARP_CAPACITY    64
 #define HOST_BUFFER_SIZE     8192
+#define HOST_PENDING_DATA_MAX (ETHERNET_MAX_DATA_LEN - sizeof(ipv4_header_t) - sizeof(tcp_header_t))
 #define SLEEP_INTERVAL_MS    5
 
 typedef struct host_device {
@@ -35,11 +38,27 @@ typedef struct host_arp_entry {
   mac_address_t mac;
 } host_arp_entry_t;
 
-typedef struct host_pending_ping {
+typedef enum host_pending_type {
+  HOST_PENDING_NONE,
+  HOST_PENDING_PING,
+  HOST_PENDING_UDP,
+  HOST_PENDING_TCP,
+} host_pending_type_t;
+
+typedef struct host_pending_packet {
   ipv4_address_t destination;
   ipv4_address_t next_hop;
+  host_pending_type_t type;
+  uint16_t src_port;
+  uint16_t dst_port;
+  uint32_t sequence_number;
+  uint32_t acknowledgement_number;
+  uint16_t flags;
+  uint16_t window_size;
+  uint8_t data[HOST_PENDING_DATA_MAX];
+  uint16_t data_length;
   bool active;
-} host_pending_ping_t;
+} host_pending_packet_t;
 
 typedef struct host_context {
   const char* path;
@@ -57,7 +76,7 @@ typedef struct host_context {
   size_t device_count;
   host_arp_entry_t arp_entries[HOST_ARP_CAPACITY];
   size_t arp_count;
-  host_pending_ping_t pending_ping;
+  host_pending_packet_t pending_packet;
 } host_context_t;
 
 static bool ip4_is_local(const host_context_t* context, ipv4_address_t address) {
@@ -223,6 +242,65 @@ static bool write_ping_reply(host_context_t* context, const ethernet_frame_view_
   return written;
 }
 
+static bool write_udp(host_context_t* context, const host_pending_packet_t* pending, const mac_address_t destination_mac) {
+  FILE* destination = fopen(context->path, "ab");
+  if (!destination) {
+    fputs("Could not open the network file for UDP.\n", stderr);
+    return false;
+  }
+  udp_packet_data_t packet = {
+      .src_addr = context->ip4,
+      .dst_addr = pending->destination,
+      .src_port = pending->src_port,
+      .dst_port = pending->dst_port,
+      .data = pending->data,
+      .data_length = pending->data_length,
+  };
+  memcpy(packet.dst_mac_addr, destination_mac, sizeof(packet.dst_mac_addr));
+  memcpy(packet.src_mac_addr, context->mac, sizeof(packet.src_mac_addr));
+  const bool written = udp_write_ethernet_packet(destination, &packet);
+  fclose(destination);
+  return written;
+}
+
+static bool write_tcp(host_context_t* context, const host_pending_packet_t* pending, const mac_address_t destination_mac) {
+  FILE* destination = fopen(context->path, "ab");
+  if (!destination) {
+    fputs("Could not open the network file for TCP.\n", stderr);
+    return false;
+  }
+  tcp_packet_data_t packet = {
+      .src_addr = context->ip4,
+      .dst_addr = pending->destination,
+      .src_port = pending->src_port,
+      .dst_port = pending->dst_port,
+      .sequence_number = pending->sequence_number,
+      .acknowledgement_number = pending->acknowledgement_number,
+      .flags = pending->flags,
+      .window_size = pending->window_size,
+      .data = pending->data,
+      .data_length = pending->data_length,
+  };
+  memcpy(packet.dst_mac_addr, destination_mac, sizeof(packet.dst_mac_addr));
+  memcpy(packet.src_mac_addr, context->mac, sizeof(packet.src_mac_addr));
+  const bool written = tcp_write_ethernet_packet(destination, &packet);
+  fclose(destination);
+  return written;
+}
+
+static bool send_pending_packet(host_context_t* context, const host_pending_packet_t* pending, const mac_address_t destination_mac) {
+  bool written = false;
+  if (pending->type == HOST_PENDING_PING) written = write_ping(context, pending->destination, destination_mac);
+  else if (pending->type == HOST_PENDING_UDP) written = write_udp(context, pending, destination_mac);
+  else if (pending->type == HOST_PENDING_TCP) written = write_tcp(context, pending, destination_mac);
+  if (written) {
+    fprintf(stdout, "Sent %s to ", pending->type == HOST_PENDING_PING ? "ping" : pending->type == HOST_PENDING_UDP ? "UDP datagram" : "TCP segment");
+    ipv4_address_print(stdout, pending->destination);
+    fputs(".\n", stdout);
+  }
+  return written;
+}
+
 static bool route_next_hop(const host_context_t* context, ipv4_address_t destination, ipv4_address_t* next_hop) {
   if (ip4_is_local(context, destination)) {
     *next_hop = destination;
@@ -307,19 +385,15 @@ static void handle_arp(host_context_t* context, const ethernet_frame_view_t* fra
     }
   }
 
-  bool send_pending_ping = false;
-  ipv4_address_t pending_destination = 0;
+  host_pending_packet_t pending = {0};
   mutex_lock(&context->mutex);
-  if (context->pending_ping.active && context->pending_ping.next_hop == packet.sender_protocol_address) {
-    pending_destination = context->pending_ping.destination;
-    context->pending_ping.active = false;
-    send_pending_ping = true;
+  if (context->pending_packet.active && context->pending_packet.next_hop == packet.sender_protocol_address) {
+    pending = context->pending_packet;
+    context->pending_packet.active = false;
   }
   mutex_unlock(&context->mutex);
-  if (send_pending_ping && write_ping(context, pending_destination, packet.sender_hardware_address)) {
-    fputs("Sent ping to ", stdout);
-    ipv4_address_print(stdout, pending_destination);
-    fputs(" after ARP resolution.\n", stdout);
+  if (pending.active) {
+    send_pending_packet(context, &pending, packet.sender_hardware_address);
   }
 }
 
@@ -466,7 +540,7 @@ static void receiver_thread(void* argument) {
 }
 
 static void print_help(void) {
-  fputs("Commands:\n  help              Show this command list.\n  info              Show host, routes, ARP cache, and learned devices.\n  arp <ip-address>  Resolve the local destination or next-hop gateway.\n  rarp              Request an IPv4 address for this host MAC.\n  ping <ip-address> Send an ICMP Echo Request after ARP resolution.\n  quit              Stop the receiver and exit.\n", stdout);
+  fputs("Commands:\n  help              Show this command list.\n  info              Show host, routes, ARP cache, and learned devices.\n  arp <ip-address>  Resolve the local destination or next-hop gateway.\n  rarp              Request an IPv4 address for this host MAC.\n  ping <ip-address> Send an ICMP Echo Request after ARP resolution.\n  udp <src_port> <dst_port> <dst_ip> -d <data>\n                    Send a UDP datagram after ARP resolution.\n  tcp <src_port> <dst_port> <dst_ip> -d <data> [-seq <number>] [-ack <number>]\n      [-window <number>] [-flags <syn,ack,...>]\n                    Send a base-header TCP segment after ARP resolution.\n  quit              Stop the receiver and exit.\n", stdout);
 }
 
 static void print_usage(void) {
@@ -549,17 +623,17 @@ static void command_ping(host_context_t* context, const char* argument) {
     if (entry) {
       memcpy(mac, entry->mac, sizeof(mac));
     } else {
-      context->pending_ping.destination = destination;
-      context->pending_ping.next_hop = next_hop;
-      context->pending_ping.active = true;
+      context->pending_packet = (host_pending_packet_t){
+          .destination = destination,
+          .next_hop = next_hop,
+          .type = HOST_PENDING_PING,
+          .active = true,
+      };
     }
     mutex_unlock(&context->mutex);
     if (entry) {
-      if (write_ping(context, destination, mac)) {
-        fputs("Sent ping to ", stdout);
-        ipv4_address_print(stdout, destination);
-        fputs(".\n", stdout);
-      }
+      const host_pending_packet_t pending = {.destination = destination, .type = HOST_PENDING_PING};
+      send_pending_packet(context, &pending, mac);
     } else if (write_arp_request(context, next_hop)) {
       fputs("Resolving ", stdout);
       ipv4_address_print(stdout, next_hop);
@@ -568,6 +642,147 @@ static void command_ping(host_context_t* context, const char* argument) {
       fputs(".\n", stdout);
     }
   }
+}
+
+static bool parse_uint16(const char* text, uint16_t* value) {
+  uint64_t parsed = 0;
+  if (*text == '\0') return false;
+  for (; *text; ++text) {
+    if (*text < '0' || *text > '9') return false;
+    parsed = parsed * 10 + (uint64_t)(*text - '0');
+    if (parsed > UINT16_MAX) return false;
+  }
+  *value = (uint16_t)parsed;
+  return true;
+}
+
+static bool parse_uint32(const char* text, uint32_t* value) {
+  uint64_t parsed = 0;
+  if (*text == '\0') return false;
+  for (; *text; ++text) {
+    if (*text < '0' || *text > '9') return false;
+    parsed = parsed * 10 + (uint64_t)(*text - '0');
+    if (parsed > UINT32_MAX) return false;
+  }
+  *value = (uint32_t)parsed;
+  return true;
+}
+
+static bool parse_tcp_flags(char* text, uint16_t* flags) {
+  *flags = 0;
+  char* flag = text;
+  while (*flag) {
+    char* next = strchr(flag, ',');
+    if (next) *next = '\0';
+    if (strcmpi(flag, "fin") == 0) *flags |= TCP_FLAG_FIN;
+    else if (strcmpi(flag, "syn") == 0) *flags |= TCP_FLAG_SYN;
+    else if (strcmpi(flag, "rst") == 0) *flags |= TCP_FLAG_RST;
+    else if (strcmpi(flag, "psh") == 0) *flags |= TCP_FLAG_PSH;
+    else if (strcmpi(flag, "ack") == 0) *flags |= TCP_FLAG_ACK;
+    else if (strcmpi(flag, "urg") == 0) *flags |= TCP_FLAG_URG;
+    else if (strcmpi(flag, "ece") == 0) *flags |= TCP_FLAG_ECE;
+    else if (strcmpi(flag, "cwr") == 0) *flags |= TCP_FLAG_CWR;
+    else if (strcmpi(flag, "ns") == 0) *flags |= TCP_FLAG_NS;
+    else return false;
+    if (!next) break;
+    flag = next + 1;
+    if (*flag == '\0') return false;
+  }
+  return true;
+}
+
+static char* next_token(char** text) {
+  while (**text == ' ') ++*text;
+  if (**text == '\0') return NULL;
+  char* token = *text;
+  while (**text != '\0' && **text != ' ') ++*text;
+  if (**text == ' ') *(*text)++ = '\0';
+  return token;
+}
+
+static void command_transport(host_context_t* context, host_pending_packet_t* pending) {
+  ipv4_address_t next_hop = 0;
+  if (!context->has_ip4) {
+    fputs("UDP and TCP require an IPv4 address.\n", stderr);
+  } else if (!route_next_hop(context, pending->destination, &next_hop)) {
+    fputs("Destination is outside the local subnet and no default gateway is configured.\n", stderr);
+  } else {
+    mutex_lock(&context->mutex);
+    host_arp_entry_t* entry = arp_find(context, next_hop);
+    mac_address_t mac = {0};
+    if (entry) {
+      memcpy(mac, entry->mac, sizeof(mac));
+    } else {
+      pending->next_hop = next_hop;
+      pending->active = true;
+      context->pending_packet = *pending;
+    }
+    mutex_unlock(&context->mutex);
+    if (entry) {
+      send_pending_packet(context, pending, mac);
+    } else if (write_arp_request(context, next_hop)) {
+      fputs("Resolving ", stdout);
+      ipv4_address_print(stdout, next_hop);
+      fputs(" before sending a transport packet.\n", stdout);
+    }
+  }
+}
+
+static void command_udp(host_context_t* context, char* argument) {
+  char* cursor = argument;
+  char* src_port = next_token(&cursor);
+  char* dst_port = next_token(&cursor);
+  char* dst_ip = next_token(&cursor);
+  char* data_marker = next_token(&cursor);
+  char* data = next_token(&cursor);
+  if (!src_port || !dst_port || !dst_ip || !data_marker || !data || next_token(&cursor) || strcmpi(data_marker, "-d") != 0) {
+    fputs("Usage: udp <src_port> <dst_port> <dst_ip> -d <data>\n", stderr);
+    return;
+  }
+  host_pending_packet_t pending = {.type = HOST_PENDING_UDP};
+  const size_t data_length = strlen(data);
+  if (!parse_uint16(src_port, &pending.src_port) || !parse_uint16(dst_port, &pending.dst_port) || !ipv4_parse_address(dst_ip, &pending.destination) || data_length > HOST_PENDING_DATA_MAX) {
+    fputs("Invalid UDP ports, destination, or data (maximum 1460 bytes).\n", stderr);
+    return;
+  }
+  memcpy(pending.data, data, data_length);
+  pending.data_length = (uint16_t)data_length;
+  command_transport(context, &pending);
+}
+
+static void command_tcp(host_context_t* context, char* argument) {
+  char* cursor = argument;
+  char* src_port = next_token(&cursor);
+  char* dst_port = next_token(&cursor);
+  char* dst_ip = next_token(&cursor);
+  host_pending_packet_t pending = {.type = HOST_PENDING_TCP, .sequence_number = 1, .window_size = UINT16_MAX, .flags = TCP_FLAG_PSH | TCP_FLAG_ACK};
+  char* data = NULL;
+  if (!src_port || !dst_port || !dst_ip || !parse_uint16(src_port, &pending.src_port) || !parse_uint16(dst_port, &pending.dst_port) || !ipv4_parse_address(dst_ip, &pending.destination)) goto usage;
+  for (char* option = next_token(&cursor); option; option = next_token(&cursor)) {
+    char* value = next_token(&cursor);
+    if (!value) goto usage;
+    if (strcmpi(option, "-d") == 0) data = value;
+    else if (strcmpi(option, "-seq") == 0) {
+      if (!parse_uint32(value, &pending.sequence_number)) goto usage;
+    }
+    else if (strcmpi(option, "-ack") == 0) {
+      if (!parse_uint32(value, &pending.acknowledgement_number)) goto usage;
+    }
+    else if (strcmpi(option, "-window") == 0) {
+      if (!parse_uint16(value, &pending.window_size)) goto usage;
+    }
+    else if (strcmpi(option, "-flags") == 0) {
+      if (!parse_tcp_flags(value, &pending.flags)) goto usage;
+    }
+    else if (strcmpi(option, "-d") != 0) goto usage;
+  }
+  if (!data || strlen(data) > HOST_PENDING_DATA_MAX) goto usage;
+  memcpy(pending.data, data, strlen(data));
+  pending.data_length = (uint16_t)strlen(data);
+  command_transport(context, &pending);
+  return;
+usage:
+  fputs("Usage: tcp <src_port> <dst_port> <dst_ip> -d <data> [-seq <number>] [-ack <number>] [-window <number>] [-flags <syn,ack,...>]\n", stderr);
 }
 
 int main(int argc, char** argv) {
@@ -600,7 +815,7 @@ int main(int argc, char** argv) {
   }
 
   print_help();
-  char command[64] = {0};
+  char command[HOST_PENDING_DATA_MAX + 256] = {0};
   while (context.running && fputs("> ", stdout) >= 0 && fflush(stdout) == 0 && fgets(command, sizeof(command), stdin)) {
     command[strcspn(command, "\r\n")] = '\0';
     char* argument = command;
@@ -623,6 +838,10 @@ int main(int argc, char** argv) {
       command_rarp(&context, argument);
     } else if (strcmpi(command, "ping") == 0) {
       command_ping(&context, argument);
+    } else if (strcmpi(command, "udp") == 0) {
+      command_udp(&context, argument);
+    } else if (strcmpi(command, "tcp") == 0) {
+      command_tcp(&context, argument);
     } else if (strcmpi(command, "quit") == 0) {
       context.running = false;
     } else if (command[0] != '\0') {
