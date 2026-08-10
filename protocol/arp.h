@@ -88,8 +88,19 @@ typedef struct arp_packet_data {
   ipv4_address_t target_protocol_address;
 } arp_packet_data_t;
 
+/* Data needed to write one unicast Ethernet/IPv4 ARP reply. */
+typedef struct arp_reply_data {
+  mac_address_t sender_hardware_address;
+  ipv4_address_t sender_protocol_address;
+  mac_address_t target_hardware_address;
+  ipv4_address_t target_protocol_address;
+} arp_reply_data_t;
+
 /* Writes one broadcast Ethernet II ARP request. */
 bool arp_write_ethernet_request(FILE* destination, const arp_packet_data_t* packet_data);
+
+/* Writes one unicast Ethernet II ARP reply. */
+bool arp_write_ethernet_reply(FILE* destination, const arp_reply_data_t* packet_data);
 
 /* Validates and decodes one Ethernet/IPv4 ARP request or reply from a byte buffer. */
 bool arp_parse_packet(const uint8_t* bytes, size_t byte_count, arp_packet_t* packet);
