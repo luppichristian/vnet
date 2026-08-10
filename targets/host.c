@@ -5,9 +5,11 @@ OSI/ISO layer: Layer 2 endpoint; optional IPv4 configuration supplies Layer 3 id
 
 #include <arp.h>
 #include <ethernet.h>
+#include <futils.h>
 #include <icmp.h>
 #include <ipv4.h>
 #include <mutex.h>
+#include <rarp.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -166,6 +168,19 @@ static bool write_arp_reply(host_context_t* context, const arp_packet_t* request
   return written;
 }
 
+static bool write_rarp_request(host_context_t* context) {
+  FILE* destination = fopen(context->path, "ab");
+  if (!destination) {
+    fputs("Could not open the network file for RARP.\n", stderr);
+    return false;
+  }
+  rarp_request_data_t request = {0};
+  memcpy(request.client_hardware_address, context->mac, sizeof(request.client_hardware_address));
+  const bool written = rarp_write_ethernet_request(destination, &request);
+  fclose(destination);
+  return written;
+}
+
 static bool write_ping(host_context_t* context, ipv4_address_t destination_ip, const mac_address_t destination_mac) {
   FILE* destination = fopen(context->path, "ab");
   if (!destination) {
@@ -308,6 +323,22 @@ static void handle_arp(host_context_t* context, const ethernet_frame_view_t* fra
   }
 }
 
+static void handle_rarp(host_context_t* context, const ethernet_frame_view_t* frame) {
+  rarp_packet_t packet = {0};
+  if (!rarp_parse_packet(frame->data, sizeof(packet), &packet)) {
+    return;
+  }
+  if (packet.operation == RARP_OPERATION_REPLY && memcmp(packet.target_hardware_address, context->mac, sizeof(context->mac)) == 0 && packet.target_protocol_address != 0) {
+    mutex_lock(&context->mutex);
+    context->ip4 = packet.target_protocol_address;
+    context->has_ip4 = true;
+    mutex_unlock(&context->mutex);
+    fputs("Received RARP assignment: ", stdout);
+    ipv4_address_print(stdout, packet.target_protocol_address);
+    fputs(".\n", stdout);
+  }
+}
+
 static void handle_ipv4(host_context_t* context, const ethernet_frame_view_t* frame) {
   ipv4_packet_view_t packet = {0};
   if (!context->has_ip4 || !ipv4_parse_packet(frame->data, frame->data_length, &packet) || packet.header.dst_addr != context->ip4 || packet.header.protocol != ICMP_IPV4_PROTOCOL) {
@@ -355,6 +386,8 @@ static void handle_ethernet(host_context_t* context, const uint8_t* bytes, size_
   }
   if (frame.header.type_or_length == ETHERNET_ETHERTYPE_ARP) {
     handle_arp(context, &frame);
+  } else if (frame.header.type_or_length == ETHERNET_ETHERTYPE_RARP) {
+    handle_rarp(context, &frame);
   } else if (frame.header.type_or_length == ETHERNET_ETHERTYPE_IPV4) {
     handle_ipv4(context, &frame);
   }
@@ -400,19 +433,28 @@ static void receiver_thread(void* argument) {
   uint8_t buffer[HOST_BUFFER_SIZE] = {0};
   size_t buffer_length = 0;
   while (context->running) {
-    const size_t read_count = fread(buffer + buffer_length, 1, sizeof(buffer) - buffer_length, context->source);
-    if (read_count > 0) {
-      buffer_length += read_count;
-      process_bytes(context, buffer, &buffer_length);
-    }
-    if (ferror(context->source)) {
+    long end = 0;
+    const long position = ftell(context->source);
+    if (position < 0 || !get_file_end(context->source, &end)) {
       mutex_lock(&context->mutex);
       fputs("Could not read the network file.\n", stderr);
       mutex_unlock(&context->mutex);
       context->running = false;
       break;
     }
-    clearerr(context->source);
+    if (position < end) {
+      const size_t available = (size_t)(end - position);
+      const size_t read_count = available < sizeof(buffer) - buffer_length ? available : sizeof(buffer) - buffer_length;
+      if (fread(buffer + buffer_length, 1, read_count, context->source) != read_count) {
+        mutex_lock(&context->mutex);
+        fputs("Could not read the network file.\n", stderr);
+        mutex_unlock(&context->mutex);
+        context->running = false;
+        break;
+      }
+      buffer_length += read_count;
+      process_bytes(context, buffer, &buffer_length);
+    }
     if (buffer_length == sizeof(buffer)) {
       mutex_lock(&context->mutex);
       fputs("Discarding an oversized or incomplete network frame.\n", stderr);
@@ -424,7 +466,7 @@ static void receiver_thread(void* argument) {
 }
 
 static void print_help(void) {
-  fputs("Commands:\n  help              Show this command list.\n  info              Show host, routes, ARP cache, and learned devices.\n  arp <ip-address>  Resolve the local destination or next-hop gateway.\n  ping <ip-address> Send an ICMP Echo Request after ARP resolution.\n  quit              Stop the receiver and exit.\n", stdout);
+  fputs("Commands:\n  help              Show this command list.\n  info              Show host, routes, ARP cache, and learned devices.\n  arp <ip-address>  Resolve the local destination or next-hop gateway.\n  rarp              Request an IPv4 address for this host MAC.\n  ping <ip-address> Send an ICMP Echo Request after ARP resolution.\n  quit              Stop the receiver and exit.\n", stdout);
 }
 
 static void print_usage(void) {
@@ -475,6 +517,18 @@ static void command_arp(host_context_t* context, const char* argument) {
       ipv4_address_print(stdout, destination);
       fputc(')', stdout);
     }
+    fputs(".\n", stdout);
+  }
+}
+
+static void command_rarp(host_context_t* context, const char* argument) {
+  if (*argument != '\0') {
+    fputs("Usage: rarp\n", stderr);
+  } else if (context->has_ip4) {
+    fputs("RARP requires a host without an IPv4 address.\n", stderr);
+  } else if (write_rarp_request(context)) {
+    fputs("Sent RARP request for ", stdout);
+    ethernet_mac_print(stdout, context->mac);
     fputs(".\n", stdout);
   }
 }
@@ -565,6 +619,8 @@ int main(int argc, char** argv) {
       print_info(&context);
     } else if (strcmpi(command, "arp") == 0) {
       command_arp(&context, argument);
+    } else if (strcmpi(command, "rarp") == 0) {
+      command_rarp(&context, argument);
     } else if (strcmpi(command, "ping") == 0) {
       command_ping(&context, argument);
     } else if (strcmpi(command, "quit") == 0) {

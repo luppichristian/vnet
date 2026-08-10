@@ -72,6 +72,7 @@ void ethernet_mac_print(FILE* destination, const mac_address_t mac);
 #define ETHERNET_ETHERTYPE_MIN  1536
 #define ETHERNET_ETHERTYPE_IPV4 0x0800
 #define ETHERNET_ETHERTYPE_ARP  0x0806
+#define ETHERNET_ETHERTYPE_RARP 0x8035
 #define ETHERNET_ETHERTYPE_IPV6 0x86DD
 
 typedef enum ethernet_frame_format {
