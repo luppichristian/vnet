@@ -1,18 +1,6 @@
 #include <ethernet.h>
+#include <math.h>
 #include <string.h>
-
-uint32_t ethernet_crc32(const void* data, size_t data_size) {
-  const uint8_t* bytes = data;
-  uint32_t crc = 0xFFFFFFFFu;
-  for (size_t i = 0; i < data_size; ++i) {
-    crc ^= bytes[i];
-    for (int bit = 0; bit < 8; ++bit) {
-      const uint32_t mask = -(crc & 1u);
-      crc = (crc >> 1) ^ (0xEDB88320u & mask);
-    }
-  }
-  return ~crc;
-}
 
 bool ethernet_write_frame(FILE* destination, const ethernet_frame_data_t* frame_data) {
   if (frame_data->data_length > ETHERNET_MAX_DATA_LEN) {
@@ -42,7 +30,7 @@ bool ethernet_write_frame(FILE* destination, const ethernet_frame_data_t* frame_
   offset += data_length;
   memcpy(crc_buffer + offset, padding, padding_length);
   offset += padding_length;
-  footer.crc = ethernet_crc32(crc_buffer, offset);
+  footer.crc = crc32(crc_buffer, offset);
 
   return fwrite(&header, sizeof(header), 1, destination) == 1 && fwrite(frame_data->data, 1, data_length, destination) == data_length && fwrite(padding, 1, padding_length, destination) == padding_length && fwrite(&footer, sizeof(footer), 1, destination) == 1;
 }
@@ -87,5 +75,5 @@ bool ethernet_parse_frame(const uint8_t* bytes, size_t byte_count, ethernet_fram
   }
   frame->data = bytes + sizeof(frame->header);
   memcpy(&frame->footer, frame->data + frame->data_length, sizeof(frame->footer));
-  return ethernet_crc32(bytes + ETHERNET_PREAMBLE_LEN + sizeof(frame->header.sfd), sizeof(frame->header.dst_mac) + sizeof(frame->header.src_mac) + sizeof(frame->header.type_or_length) + frame->data_length) == frame->footer.crc;
+  return crc32(bytes + ETHERNET_PREAMBLE_LEN + sizeof(frame->header.sfd), sizeof(frame->header.dst_mac) + sizeof(frame->header.src_mac) + sizeof(frame->header.type_or_length) + frame->data_length) == frame->footer.crc;
 }

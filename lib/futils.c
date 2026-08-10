@@ -1,14 +1,7 @@
-#pragma once
-
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
-#include <stdio.h>
-
-#define NETWORK_FILE_BUFFER_SIZE 4096
+#include "futils.h"
 
 /* Stores the current file end while preserving the read cursor, or clamps it after truncation. */
-static inline bool get_file_end(FILE* file, long* end) {
+bool get_file_end(FILE* file, long* end) {
   const long current = ftell(file);
   if (current < 0 || fseek(file, 0, SEEK_END) != 0) {
     return false;
@@ -18,8 +11,8 @@ static inline bool get_file_end(FILE* file, long* end) {
 }
 
 /* Forwards raw bytes through an append-mode destination until source_end. */
-static inline bool forward_bytes(FILE* source, FILE* destination, long source_end, size_t* forwarded_bytes) {
-  uint8_t buffer[NETWORK_FILE_BUFFER_SIZE];
+bool forward_bytes(FILE* source, FILE* destination, long source_end, size_t* forwarded_bytes) {
+  uint8_t buffer[FORWARD_FILE_BUFFER_SIZE];
   long source_position = ftell(source);
 
   if (source_position < 0) {

@@ -4,14 +4,15 @@ Only data written after the connection opens is forwarded to the other file.
 This supports both uni-directional and bi-directional connections.
 */
 
+#include <futils.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <thread.h>
 #include <vnet.h>
-#include "nfile.h"
 
 #define SLEEP_INTERVAL_MS 5
 
@@ -145,7 +146,7 @@ int main(int argc, char** argv) {
       status = EXIT_FAILURE;
       break;
     }
-    _sleep(SLEEP_INTERVAL_MS);
+    thread_sleep(SLEEP_INTERVAL_MS);
   }
 
   /* Cleanup */

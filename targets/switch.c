@@ -4,20 +4,15 @@ OSI/ISO layer: Layer 2 (data link); it learns and forwards by Ethernet MAC addre
 */
 
 #include <ethernet.h>
+#include <futils.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <thread.h>
 #include <vnet.h>
-#include "nfile.h"
-
-#ifdef _WIN32
-#  include <windows.h>
-#else
-#  include <time.h>
-#endif
 
 #define SWITCH_DEVICE_CAPACITY 256
 #define SWITCH_BUFFER_SIZE     8192
@@ -285,7 +280,7 @@ int main(int argc, char** argv) {
       status = EXIT_FAILURE;
       goto cleanup;
     }
-    _sleep(SLEEP_INTERVAL_MS);
+    thread_sleep(SLEEP_INTERVAL_MS);
   }
 
 cleanup:

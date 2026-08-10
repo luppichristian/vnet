@@ -4,14 +4,15 @@ OSI/ISO layer: Layer 1 (physical); it repeats opaque bytes without inspecting MA
 Only data written after the hub opens is repeated to every other port.
 */
 
+#include <futils.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <thread.h>
 #include <vnet.h>
-#include "nfile.h"
 
 #define SLEEP_INTERVAL_MS 5
 
@@ -144,7 +145,7 @@ int main(int argc, char** argv) {
       status = EXIT_FAILURE;
       goto cleanup;
     }
-    _sleep(SLEEP_INTERVAL_MS);
+    thread_sleep(SLEEP_INTERVAL_MS);
   }
 
 cleanup:

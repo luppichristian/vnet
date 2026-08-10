@@ -104,9 +104,6 @@ typedef struct ethernet_frame_view {
   uint16_t client_data_length;
 } ethernet_frame_view_t;
 
-/* Standard CRC-32 (IEEE 802.3), reflected, poly 0xEDB88320. */
-uint32_t ethernet_crc32(const void* data, size_t data_size);
-
 /* Writes one complete Ethernet frame, including preamble, SFD, padding, and FCS. */
 bool ethernet_write_frame(FILE* destination, const ethernet_frame_data_t* frame_data);
 

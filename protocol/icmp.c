@@ -1,16 +1,6 @@
 #include <icmp.h>
+#include <math.h>
 #include <string.h>
-
-uint16_t icmp_checksum(const void* data, size_t data_size) {
-  const uint8_t* bytes = data;
-  uint32_t sum = 0;
-  for (size_t i = 0; i < data_size; i += 2) {
-    const uint16_t word = bytes[i] | (uint16_t)(i + 1 < data_size ? bytes[i + 1] << 8 : 0);
-    sum += word;
-    sum = (sum & 0xFFFFu) + (sum >> 16);
-  }
-  return (uint16_t)~sum;
-}
 
 static bool icmp_write_ethernet_echo(FILE* destination, const icmp_echo_request_data_t* request_data, uint8_t type) {
   if (request_data->data_length > ETHERNET_MAX_DATA_LEN - sizeof(ipv4_header_t) - sizeof(icmp_echo_header_t)) {
@@ -26,7 +16,7 @@ static bool icmp_write_ethernet_echo(FILE* destination, const icmp_echo_request_
   };
   memcpy(packet, &header, sizeof(header));
   memcpy(packet + sizeof(header), request_data->data, request_data->data_length);
-  ((icmp_echo_header_t*)packet)->checksum = icmp_checksum(packet, sizeof(header) + request_data->data_length);
+  ((icmp_echo_header_t*)packet)->checksum = checksum16(packet, sizeof(header) + request_data->data_length);
 
   ipv4_packet_data_t ipv4_packet = {
       .src_addr = request_data->src_addr,
@@ -53,7 +43,7 @@ bool icmp_parse_echo_packet(const uint8_t* bytes, size_t byte_count, icmp_echo_h
     return false;
   }
   memcpy(header, bytes, sizeof(*header));
-  if ((header->type != ICMP_TYPE_ECHO_REQUEST && header->type != ICMP_TYPE_ECHO_REPLY) || header->code != ICMP_CODE_ECHO || icmp_checksum(bytes, byte_count) != 0) {
+  if ((header->type != ICMP_TYPE_ECHO_REQUEST && header->type != ICMP_TYPE_ECHO_REPLY) || header->code != ICMP_CODE_ECHO || checksum16(bytes, byte_count) != 0) {
     return false;
   }
   *data = bytes + sizeof(*header);

@@ -7,25 +7,15 @@ OSI/ISO layer: Layer 2 endpoint; optional IPv4 configuration supplies Layer 3 id
 #include <ethernet.h>
 #include <icmp.h>
 #include <ipv4.h>
+#include <mutex.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <thread.h>
 #include <vnet.h>
-
-#ifdef _WIN32
-#  include <share.h>
-#  include <windows.h>
-typedef HANDLE host_thread_t;
-typedef CRITICAL_SECTION host_mutex_t;
-#else
-#  include <pthread.h>
-#  include <time.h>
-typedef pthread_t host_thread_t;
-typedef pthread_mutex_t host_mutex_t;
-#endif
 
 #define HOST_DEVICE_CAPACITY 64
 #define HOST_ARP_CAPACITY    64
@@ -60,37 +50,13 @@ typedef struct host_context {
   uint16_t ping_sequence;
   volatile sig_atomic_t running;
   FILE* source;
-  host_mutex_t mutex;
+  mutex_t mutex;
   host_device_t devices[HOST_DEVICE_CAPACITY];
   size_t device_count;
   host_arp_entry_t arp_entries[HOST_ARP_CAPACITY];
   size_t arp_count;
   host_pending_ping_t pending_ping;
 } host_context_t;
-
-static void lock(host_mutex_t* mutex) {
-#ifdef _WIN32
-  EnterCriticalSection(mutex);
-#else
-  pthread_mutex_lock(mutex);
-#endif
-}
-
-static void unlock(host_mutex_t* mutex) {
-#ifdef _WIN32
-  LeaveCriticalSection(mutex);
-#else
-  pthread_mutex_unlock(mutex);
-#endif
-}
-
-static FILE* open_network_reader(const char* path) {
-#ifdef _WIN32
-  return _fsopen(path, "rb", _SH_DENYNO);
-#else
-  return fopen(path, "rb");
-#endif
-}
 
 static bool mac_parse(const char* text, mac_address_t mac) {
   unsigned int octets[6] = {0};
@@ -299,7 +265,7 @@ static bool route_next_hop(const host_context_t* context, ipv4_address_t destina
 }
 
 static void print_info(host_context_t* context) {
-  lock(&context->mutex);
+  mutex_lock(&context->mutex);
   fprintf(stdout, "Host file: %s\nHost MAC:  ", context->path);
   print_mac(context->mac);
   fputc('\n', stdout);
@@ -334,14 +300,14 @@ static void print_info(host_context_t* context) {
     fputc('\n', stdout);
   }
   fflush(stdout);
-  unlock(&context->mutex);
+  mutex_unlock(&context->mutex);
 }
 
 static void handle_vnet(host_context_t* context, const vnet_frame_header_t* frame) {
   if (strcmpi(frame->destination_path, context->path) != 0) {
     return;
   }
-  lock(&context->mutex);
+  mutex_lock(&context->mutex);
   if (frame->type == VNET_FRAME_CONNECTION_START) {
     device_start(context, frame->source_path);
     fprintf(stdout, "Connected to '%s'.\n", frame->source_path);
@@ -350,7 +316,7 @@ static void handle_vnet(host_context_t* context, const vnet_frame_header_t* fram
     fprintf(stdout, "Disconnected from '%s'.\n", frame->source_path);
   }
   fflush(stdout);
-  unlock(&context->mutex);
+  mutex_unlock(&context->mutex);
 }
 
 static void handle_arp(host_context_t* context, const ethernet_frame_view_t* frame) {
@@ -358,9 +324,9 @@ static void handle_arp(host_context_t* context, const ethernet_frame_view_t* fra
   if (!arp_parse_packet(frame->data, sizeof(packet), &packet)) {
     return;
   }
-  lock(&context->mutex);
+  mutex_lock(&context->mutex);
   arp_learn(context, packet.sender_protocol_address, packet.sender_hardware_address);
-  unlock(&context->mutex);
+  mutex_unlock(&context->mutex);
 
   if (context->has_ip4 && packet.operation == ARP_OPERATION_REQUEST && packet.target_protocol_address == context->ip4) {
     if (write_arp_reply(context, &packet)) {
@@ -372,13 +338,13 @@ static void handle_arp(host_context_t* context, const ethernet_frame_view_t* fra
 
   bool send_pending_ping = false;
   ipv4_address_t pending_destination = 0;
-  lock(&context->mutex);
+  mutex_lock(&context->mutex);
   if (context->pending_ping.active && context->pending_ping.next_hop == packet.sender_protocol_address) {
     pending_destination = context->pending_ping.destination;
     context->pending_ping.active = false;
     send_pending_ping = true;
   }
-  unlock(&context->mutex);
+  mutex_unlock(&context->mutex);
   if (send_pending_ping && write_ping(context, pending_destination, packet.sender_hardware_address)) {
     fputs("Sent ping to ", stdout);
     print_ip4(pending_destination);
@@ -418,7 +384,7 @@ static void handle_ethernet(host_context_t* context, const uint8_t* bytes, size_
     return;
   }
 
-  lock(&context->mutex);
+  mutex_lock(&context->mutex);
   device_learn(context, frame.header.src_mac);
   fputs("Received ", stdout);
   group ? fputs(memcmp(frame.header.dst_mac, "\xFF\xFF\xFF\xFF\xFF\xFF", sizeof(frame.header.dst_mac)) == 0 ? "broadcast" : "multicast", stdout) : fputs("unicast", stdout);
@@ -426,7 +392,7 @@ static void handle_ethernet(host_context_t* context, const uint8_t* bytes, size_
   print_mac(frame.header.src_mac);
   fprintf(stdout, " (%zu bytes).\n", byte_count);
   fflush(stdout);
-  unlock(&context->mutex);
+  mutex_unlock(&context->mutex);
 
   if (frame.format != ETHERNET_FRAME_FORMAT_II) {
     return;
@@ -473,11 +439,7 @@ static void process_bytes(host_context_t* context, uint8_t* buffer, size_t* buff
   }
 }
 
-#ifdef _WIN32
-static DWORD WINAPI receiver_thread(void* argument) {
-#else
-static void* receiver_thread(void* argument) {
-#endif
+static void receiver_thread(void* argument) {
   host_context_t* context = argument;
   uint8_t buffer[HOST_BUFFER_SIZE] = {0};
   size_t buffer_length = 0;
@@ -488,26 +450,21 @@ static void* receiver_thread(void* argument) {
       process_bytes(context, buffer, &buffer_length);
     }
     if (ferror(context->source)) {
-      lock(&context->mutex);
+      mutex_lock(&context->mutex);
       fputs("Could not read the network file.\n", stderr);
-      unlock(&context->mutex);
+      mutex_unlock(&context->mutex);
       context->running = false;
       break;
     }
     clearerr(context->source);
     if (buffer_length == sizeof(buffer)) {
-      lock(&context->mutex);
+      mutex_lock(&context->mutex);
       fputs("Discarding an oversized or incomplete network frame.\n", stderr);
-      unlock(&context->mutex);
+      mutex_unlock(&context->mutex);
       buffer_length = 0;
     }
-    _sleep(SLEEP_INTERVAL_MS);
+    thread_sleep(SLEEP_INTERVAL_MS);
   }
-#ifdef _WIN32
-  return 0;
-#else
-  return NULL;
-#endif
 }
 
 static void print_help(void) {
@@ -576,7 +533,7 @@ static void command_ping(host_context_t* context, const char* argument) {
   } else if (!route_next_hop(context, destination, &next_hop)) {
     fputs("Destination is outside the local subnet and no default gateway is configured.\n", stderr);
   } else {
-    lock(&context->mutex);
+    mutex_lock(&context->mutex);
     host_arp_entry_t* entry = arp_find(context, next_hop);
     mac_address_t mac = {0};
     if (entry) {
@@ -586,7 +543,7 @@ static void command_ping(host_context_t* context, const char* argument) {
       context->pending_ping.next_hop = next_hop;
       context->pending_ping.active = true;
     }
-    unlock(&context->mutex);
+    mutex_unlock(&context->mutex);
     if (entry) {
       if (write_ping(context, destination, mac)) {
         fputs("Sent ping to ", stdout);
@@ -613,25 +570,21 @@ int main(int argc, char** argv) {
     print_usage();
     return EXIT_FAILURE;
   }
-  context.source = open_network_reader(context.path);
+  context.source = fopen(context.path, "rb");
   if (!context.source || fseek(context.source, 0, SEEK_END) != 0) {
     fprintf(stderr, "Could not open '%s' for reading.\n", context.path);
     if (context.source) fclose(context.source);
     return EXIT_FAILURE;
   }
-#ifdef _WIN32
-  InitializeCriticalSection(&context.mutex);
-#else
-  pthread_mutex_init(&context.mutex, NULL);
-#endif
-  host_thread_t thread;
-#ifdef _WIN32
-  thread = CreateThread(NULL, 0, receiver_thread, &context, 0, NULL);
-  if (!thread) {
-#else
-  if (pthread_create(&thread, NULL, receiver_thread, &context) != 0) {
-#endif
+  if (!mutex_init(&context.mutex)) {
+    fputs("Could not initialize the host mutex.\n", stderr);
+    fclose(context.source);
+    return EXIT_FAILURE;
+  }
+  thread_t thread;
+  if (!thread_start(&thread, receiver_thread, &context)) {
     fprintf(stderr, "Could not start the packet receiver thread.\n");
+    mutex_destroy(&context.mutex);
     fclose(context.source);
     return EXIT_FAILURE;
   }
@@ -665,14 +618,8 @@ int main(int argc, char** argv) {
     }
   }
   context.running = false;
-#ifdef _WIN32
-  WaitForSingleObject(thread, INFINITE);
-  CloseHandle(thread);
-  DeleteCriticalSection(&context.mutex);
-#else
-  pthread_join(thread, NULL);
-  pthread_mutex_destroy(&context.mutex);
-#endif
+  thread_join(&thread);
+  mutex_destroy(&context.mutex);
   fclose(context.source);
   return EXIT_SUCCESS;
 }

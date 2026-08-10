@@ -120,16 +120,6 @@ typedef struct ipv4_header {
 
 #pragma pack(pop)
 
-/*
-IPv4 protects only its header with a one's-complement checksum. A sender sets
-header_checksum to zero, calculates this function over the complete header,
-then stores the returned value in header_checksum. A receiver calculates over
-the complete received header, including header_checksum; a valid header returns
-zero. Payload integrity is handled by upper protocols and Ethernet FCS covers
-the complete local frame.
-*/
-uint16_t ipv4_checksum(const void* data, size_t data_size);
-
 /* Data needed to write one IPv4 datagram inside an Ethernet II frame. */
 typedef struct ipv4_packet_data {
   mac_address_t dst_mac_addr;

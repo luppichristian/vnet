@@ -10,6 +10,7 @@ We send data by appending to the file and receive data by reading it periodicall
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <thread.h>
 #include <vnet.h>
 
 /* Max amount of bytes that can be read at each iteration*/
@@ -118,12 +119,12 @@ int main(int argc, char** argv) {
     fseek(f, 0, SEEK_END);
     const long end = ftell(f);
     if (end == offset) {
-      _sleep(3);
+      thread_sleep(3);
       continue;
     }
 
     /* Compute bytes to read */
-    const long to_read = min(end - offset, MAX_READ);
+    const long to_read = end - offset < MAX_READ ? end - offset : MAX_READ;
     if (to_read < 0) {
       fclose(f);
       fprintf(stderr, "Unexpected file modification while watching the file \'%s\'.", fpath);

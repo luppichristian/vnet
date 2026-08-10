@@ -1,16 +1,6 @@
 #include <ipv4.h>
+#include <math.h>
 #include <string.h>
-
-uint16_t ipv4_checksum(const void* data, size_t data_size) {
-  const uint8_t* bytes = data;
-  uint32_t sum = 0;
-  for (size_t i = 0; i < data_size; i += 2) {
-    const uint16_t word = bytes[i] | (uint16_t)(i + 1 < data_size ? bytes[i + 1] << 8 : 0);
-    sum += word;
-    sum = (sum & 0xFFFFu) + (sum >> 16);
-  }
-  return (uint16_t)~sum;
-}
 
 bool ipv4_write_ethernet_packet(FILE* destination, const ipv4_packet_data_t* packet_data) {
   if (packet_data->data_length > ETHERNET_MAX_DATA_LEN - sizeof(ipv4_header_t)) {
@@ -29,7 +19,7 @@ bool ipv4_write_ethernet_packet(FILE* destination, const ipv4_packet_data_t* pac
       .src_addr = packet_data->src_addr,
       .dst_addr = packet_data->dst_addr,
   };
-  header.header_checksum = ipv4_checksum(&header, sizeof(header));
+  header.header_checksum = checksum16(&header, sizeof(header));
   memcpy(packet, &header, sizeof(header));
   memcpy(packet + sizeof(header), packet_data->data, packet_data->data_length);
 
@@ -48,7 +38,7 @@ bool ipv4_parse_packet(const uint8_t* bytes, size_t byte_count, ipv4_packet_view
     return false;
   }
   memcpy(&packet->header, bytes, sizeof(packet->header));
-  if (packet->header.version != 4 || packet->header.ihl != 5 || packet->header.total_length < sizeof(packet->header) || packet->header.total_length > byte_count || ipv4_checksum(&packet->header, sizeof(packet->header)) != 0) {
+  if (packet->header.version != 4 || packet->header.ihl != 5 || packet->header.total_length < sizeof(packet->header) || packet->header.total_length > byte_count || checksum16(&packet->header, sizeof(packet->header)) != 0) {
     return false;
   }
   packet->payload = bytes + sizeof(packet->header);

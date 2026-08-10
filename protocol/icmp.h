@@ -1,8 +1,8 @@
 #pragma once
 
-#include <stdbool.h>
 #include <ethernet.h>
 #include <ipv4.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -73,13 +73,6 @@ typedef struct icmp_echo_header {
 } icmp_echo_header_t;
 
 #pragma pack(pop)
-
-/*
-The sender clears checksum, computes this value over the entire ICMP message,
-and stores it in checksum. A receiver recomputes it over the received message;
-a valid message returns zero.
-*/
-uint16_t icmp_checksum(const void* data, size_t data_size);
 
 /* Data needed to write one ICMP Echo Request inside an IPv4 Ethernet II frame. */
 typedef struct icmp_echo_request_data {
