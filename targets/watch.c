@@ -24,8 +24,12 @@ static void print_ipv4_packet(const uint8_t* bytes, uint16_t data_field_length) 
   }
 
   fprintf(stdout, "  Valid IPv4 packet (%u bytes):\n", packet.header.total_length);
-  fprintf(stdout, "    IPv4 source:     %u.%u.%u.%u\n", packet.header.src_addr & 0xFF, (packet.header.src_addr >> 8) & 0xFF, (packet.header.src_addr >> 16) & 0xFF, packet.header.src_addr >> 24);
-  fprintf(stdout, "    IPv4 destination:%u.%u.%u.%u\n", packet.header.dst_addr & 0xFF, (packet.header.dst_addr >> 8) & 0xFF, (packet.header.dst_addr >> 16) & 0xFF, packet.header.dst_addr >> 24);
+  fputs("    IPv4 source:     ", stdout);
+  ipv4_address_print(stdout, packet.header.src_addr);
+  fputc('\n', stdout);
+  fputs("    IPv4 destination:", stdout);
+  ipv4_address_print(stdout, packet.header.dst_addr);
+  fputc('\n', stdout);
   fprintf(stdout, "    IPv4 total length: %u bytes, TTL: %u, protocol: %u\n", packet.header.total_length, packet.header.ttl, packet.header.protocol);
 }
 
@@ -40,8 +44,12 @@ static bool print_ethernet_frame(const uint8_t* bytes, size_t byte_count) {
 
   fprintf(stdout, "Received %li bytes (%li bits):\n", (long)byte_count, (long)byte_count * 8);
   fprintf(stdout, "  Valid %s frame (%zu bytes):\n", frame.format == ETHERNET_FRAME_FORMAT_IEEE_802_3 ? "IEEE 802.3 Ethernet" : "Ethernet II", byte_count);
-  fprintf(stdout, "    Destination MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", header->dst_mac[0], header->dst_mac[1], header->dst_mac[2], header->dst_mac[3], header->dst_mac[4], header->dst_mac[5]);
-  fprintf(stdout, "    Source MAC:      %02X:%02X:%02X:%02X:%02X:%02X\n", header->src_mac[0], header->src_mac[1], header->src_mac[2], header->src_mac[3], header->src_mac[4], header->src_mac[5]);
+  fputs("    Destination MAC: ", stdout);
+  ethernet_mac_print(stdout, header->dst_mac);
+  fputc('\n', stdout);
+  fputs("    Source MAC:      ", stdout);
+  ethernet_mac_print(stdout, header->src_mac);
+  fputc('\n', stdout);
   if (frame.format == ETHERNET_FRAME_FORMAT_IEEE_802_3) {
     fprintf(stdout, "    Client data:     %u bytes\n", frame.client_data_length);
     fprintf(stdout, "    Padding:         %u bytes\n", frame.data_length - frame.client_data_length);

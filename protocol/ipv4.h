@@ -58,6 +58,18 @@ typedef uint32_t ipv4_address_t;
 #define IPV4_ADDRESS(a, b, c, d) \
   ((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
 
+/* Parses a dotted-decimal IPv4 address into this simulator's native address representation. */
+bool ipv4_parse_address(const char* text, ipv4_address_t* address);
+
+/* Returns true when an IPv4 subnet mask has contiguous leading one bits. */
+bool ipv4_mask_is_contiguous(ipv4_address_t mask);
+
+/* Returns true when two IPv4 addresses belong to the same subnet under mask. */
+bool ipv4_addresses_share_subnet(ipv4_address_t first, ipv4_address_t second, ipv4_address_t mask);
+
+/* Writes a dotted-decimal IPv4 address to the caller-owned stream. */
+void ipv4_address_print(FILE* destination, ipv4_address_t address);
+
 #pragma pack(push, 1)
 
 typedef struct ipv4_header {

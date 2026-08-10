@@ -58,52 +58,8 @@ typedef struct host_context {
   host_pending_ping_t pending_ping;
 } host_context_t;
 
-static bool mac_parse(const char* text, mac_address_t mac) {
-  unsigned int octets[6] = {0};
-  char trailing = '\0';
-  if (sscanf(text, "%2x:%2x:%2x:%2x:%2x:%2x%c", &octets[0], &octets[1], &octets[2], &octets[3], &octets[4], &octets[5], &trailing) != 6) {
-    return false;
-  }
-  for (size_t i = 0; i < sizeof(mac_address_t); ++i) {
-    mac[i] = (uint8_t)octets[i];
-  }
-  return true;
-}
-
-static bool ip4_parse(const char* text, ipv4_address_t* address) {
-  unsigned int octets[4] = {0};
-  char trailing = '\0';
-  if (sscanf(text, "%u.%u.%u.%u%c", &octets[0], &octets[1], &octets[2], &octets[3], &trailing) != 4) {
-    return false;
-  }
-  for (size_t i = 0; i < 4; ++i) {
-    if (octets[i] > UINT8_MAX) {
-      return false;
-    }
-  }
-  *address = IPV4_ADDRESS(octets[0], octets[1], octets[2], octets[3]);
-  return true;
-}
-
-static bool ip4_mask_is_contiguous(ipv4_address_t mask) {
-  const uint32_t bits = ((mask & 0x000000FFu) << 24) | ((mask & 0x0000FF00u) << 8) | ((mask & 0x00FF0000u) >> 8) | ((mask & 0xFF000000u) >> 24);
-  return (bits | (bits - 1u)) == UINT32_MAX;
-}
-
 static bool ip4_is_local(const host_context_t* context, ipv4_address_t address) {
-  return (context->ip4 & context->mask) == (address & context->mask);
-}
-
-static bool mac_is_group(const mac_address_t mac) {
-  return (mac[0] & 1u) != 0;
-}
-
-static void print_mac(const mac_address_t mac) {
-  fprintf(stdout, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-}
-
-static void print_ip4(ipv4_address_t address) {
-  fprintf(stdout, "%u.%u.%u.%u", address & 0xFF, (address >> 8) & 0xFF, (address >> 16) & 0xFF, address >> 24);
+  return ipv4_addresses_share_subnet(context->ip4, address, context->mask);
 }
 
 static host_device_t* device_find_path(host_context_t* context, const char* path) {
@@ -267,33 +223,33 @@ static bool route_next_hop(const host_context_t* context, ipv4_address_t destina
 static void print_info(host_context_t* context) {
   mutex_lock(&context->mutex);
   fprintf(stdout, "Host file: %s\nHost MAC:  ", context->path);
-  print_mac(context->mac);
+  ethernet_mac_print(stdout, context->mac);
   fputc('\n', stdout);
   if (context->has_ip4) {
     fputs("Host IPv4: ", stdout);
-    print_ip4(context->ip4);
+    ipv4_address_print(stdout, context->ip4);
     fputs("\nSubnet mask: ", stdout);
-    print_ip4(context->mask);
+    ipv4_address_print(stdout, context->mask);
     fputc('\n', stdout);
     if (context->has_gateway) {
       fputs("Default gateway: ", stdout);
-      print_ip4(context->gateway);
+      ipv4_address_print(stdout, context->gateway);
       fputc('\n', stdout);
     }
   }
   fprintf(stdout, "ARP cache (%zu):\n", context->arp_count);
   for (size_t i = 0; i < context->arp_count; ++i) {
     fputs("  ", stdout);
-    print_ip4(context->arp_entries[i].ip4);
+    ipv4_address_print(stdout, context->arp_entries[i].ip4);
     fputs("  ", stdout);
-    print_mac(context->arp_entries[i].mac);
+    ethernet_mac_print(stdout, context->arp_entries[i].mac);
     fputc('\n', stdout);
   }
   fprintf(stdout, "Devices (%zu):\n", context->device_count);
   for (size_t i = 0; i < context->device_count; ++i) {
     fprintf(stdout, "  %-48s ", context->devices[i].path);
     if (context->devices[i].has_mac) {
-      print_mac(context->devices[i].mac);
+      ethernet_mac_print(stdout, context->devices[i].mac);
     } else {
       fputs("(MAC not learned)", stdout);
     }
@@ -331,7 +287,7 @@ static void handle_arp(host_context_t* context, const ethernet_frame_view_t* fra
   if (context->has_ip4 && packet.operation == ARP_OPERATION_REQUEST && packet.target_protocol_address == context->ip4) {
     if (write_arp_reply(context, &packet)) {
       fputs("Replied to ARP request from ", stdout);
-      print_ip4(packet.sender_protocol_address);
+      ipv4_address_print(stdout, packet.sender_protocol_address);
       fputs(".\n", stdout);
     }
   }
@@ -347,7 +303,7 @@ static void handle_arp(host_context_t* context, const ethernet_frame_view_t* fra
   mutex_unlock(&context->mutex);
   if (send_pending_ping && write_ping(context, pending_destination, packet.sender_hardware_address)) {
     fputs("Sent ping to ", stdout);
-    print_ip4(pending_destination);
+    ipv4_address_print(stdout, pending_destination);
     fputs(" after ARP resolution.\n", stdout);
   }
 }
@@ -365,11 +321,11 @@ static void handle_ipv4(host_context_t* context, const ethernet_frame_view_t* fr
   }
   if (echo.type == ICMP_TYPE_ECHO_REQUEST && write_ping_reply(context, frame, &packet, &echo, data, data_length)) {
     fputs("Replied to ping from ", stdout);
-    print_ip4(packet.header.src_addr);
+    ipv4_address_print(stdout, packet.header.src_addr);
     fputs(".\n", stdout);
   } else if (echo.type == ICMP_TYPE_ECHO_REPLY) {
     fputs("Ping reply from ", stdout);
-    print_ip4(packet.header.src_addr);
+    ipv4_address_print(stdout, packet.header.src_addr);
     fprintf(stdout, ": sequence=%u.\n", echo.sequence_number);
   }
 }
@@ -379,7 +335,7 @@ static void handle_ethernet(host_context_t* context, const uint8_t* bytes, size_
   if (!ethernet_parse_frame(bytes, byte_count, &frame)) {
     return;
   }
-  const bool group = mac_is_group(frame.header.dst_mac);
+  const bool group = ethernet_mac_is_group(frame.header.dst_mac);
   if (!group && memcmp(frame.header.dst_mac, context->mac, sizeof(context->mac)) != 0) {
     return;
   }
@@ -387,9 +343,9 @@ static void handle_ethernet(host_context_t* context, const uint8_t* bytes, size_
   mutex_lock(&context->mutex);
   device_learn(context, frame.header.src_mac);
   fputs("Received ", stdout);
-  group ? fputs(memcmp(frame.header.dst_mac, "\xFF\xFF\xFF\xFF\xFF\xFF", sizeof(frame.header.dst_mac)) == 0 ? "broadcast" : "multicast", stdout) : fputs("unicast", stdout);
+  group ? fputs(ethernet_mac_is_broadcast(frame.header.dst_mac) ? "broadcast" : "multicast", stdout) : fputs("unicast", stdout);
   fputs(" frame from ", stdout);
-  print_mac(frame.header.src_mac);
+  ethernet_mac_print(stdout, frame.header.src_mac);
   fprintf(stdout, " (%zu bytes).\n", byte_count);
   fflush(stdout);
   mutex_unlock(&context->mutex);
@@ -482,16 +438,16 @@ static bool parse_options(host_context_t* context, int argc, char** argv) {
       return false;
     }
     if (strcmpi(argv[i], "-ip4") == 0) {
-      if (context->has_ip4 || !ip4_parse(argv[i + 1], &context->ip4)) {
+      if (context->has_ip4 || !ipv4_parse_address(argv[i + 1], &context->ip4)) {
         return false;
       }
       context->has_ip4 = true;
     } else if (strcmpi(argv[i], "-mask") == 0) {
-      if (!ip4_parse(argv[i + 1], &context->mask) || !ip4_mask_is_contiguous(context->mask)) {
+      if (!ipv4_parse_address(argv[i + 1], &context->mask) || !ipv4_mask_is_contiguous(context->mask)) {
         return false;
       }
     } else if (strcmpi(argv[i], "-gateway") == 0) {
-      if (context->has_gateway || !ip4_parse(argv[i + 1], &context->gateway)) {
+      if (context->has_gateway || !ipv4_parse_address(argv[i + 1], &context->gateway)) {
         return false;
       }
       context->has_gateway = true;
@@ -507,16 +463,16 @@ static void command_arp(host_context_t* context, const char* argument) {
   ipv4_address_t next_hop = 0;
   if (!context->has_ip4) {
     fputs("ARP requires an IPv4 address.\n", stderr);
-  } else if (!ip4_parse(argument, &destination)) {
+  } else if (!ipv4_parse_address(argument, &destination)) {
     fputs("Usage: arp <ip-address>\n", stderr);
   } else if (!route_next_hop(context, destination, &next_hop)) {
     fputs("Destination is outside the local subnet and no default gateway is configured.\n", stderr);
   } else if (write_arp_request(context, next_hop)) {
     fputs("Sent ARP request for ", stdout);
-    print_ip4(next_hop);
+    ipv4_address_print(stdout, next_hop);
     if (next_hop != destination) {
       fputs(" (default gateway for ", stdout);
-      print_ip4(destination);
+      ipv4_address_print(stdout, destination);
       fputc(')', stdout);
     }
     fputs(".\n", stdout);
@@ -528,7 +484,7 @@ static void command_ping(host_context_t* context, const char* argument) {
   ipv4_address_t next_hop = 0;
   if (!context->has_ip4) {
     fputs("Ping requires an IPv4 address.\n", stderr);
-  } else if (!ip4_parse(argument, &destination)) {
+  } else if (!ipv4_parse_address(argument, &destination)) {
     fputs("Usage: ping <ip-address>\n", stderr);
   } else if (!route_next_hop(context, destination, &next_hop)) {
     fputs("Destination is outside the local subnet and no default gateway is configured.\n", stderr);
@@ -547,14 +503,14 @@ static void command_ping(host_context_t* context, const char* argument) {
     if (entry) {
       if (write_ping(context, destination, mac)) {
         fputs("Sent ping to ", stdout);
-        print_ip4(destination);
+        ipv4_address_print(stdout, destination);
         fputs(".\n", stdout);
       }
     } else if (write_arp_request(context, next_hop)) {
       fputs("Resolving ", stdout);
-      print_ip4(next_hop);
+      ipv4_address_print(stdout, next_hop);
       fputs(" before pinging ", stdout);
-      print_ip4(destination);
+      ipv4_address_print(stdout, destination);
       fputs(".\n", stdout);
     }
   }
@@ -566,7 +522,7 @@ int main(int argc, char** argv) {
     return EXIT_FAILURE;
   }
   host_context_t context = {.path = argv[1], .running = true};
-  if (!mac_parse(argv[2], context.mac) || !parse_options(&context, argc, argv) || (context.has_gateway && !ip4_is_local(&context, context.gateway))) {
+  if (!ethernet_mac_parse(argv[2], context.mac) || !parse_options(&context, argc, argv) || (context.has_gateway && !ip4_is_local(&context, context.gateway))) {
     print_usage();
     return EXIT_FAILURE;
   }

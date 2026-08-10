@@ -2,6 +2,34 @@
 #include <math.h>
 #include <string.h>
 
+bool ipv4_parse_address(const char* text, ipv4_address_t* address) {
+  unsigned int octets[4] = {0};
+  char trailing = '\0';
+  if (sscanf(text, "%u.%u.%u.%u%c", &octets[0], &octets[1], &octets[2], &octets[3], &trailing) != 4) {
+    return false;
+  }
+  for (size_t i = 0; i < 4; ++i) {
+    if (octets[i] > UINT8_MAX) {
+      return false;
+    }
+  }
+  *address = IPV4_ADDRESS(octets[0], octets[1], octets[2], octets[3]);
+  return true;
+}
+
+bool ipv4_mask_is_contiguous(ipv4_address_t mask) {
+  const uint32_t bits = ((mask & 0x000000FFu) << 24) | ((mask & 0x0000FF00u) << 8) | ((mask & 0x00FF0000u) >> 8) | ((mask & 0xFF000000u) >> 24);
+  return (bits | (bits - 1u)) == UINT32_MAX;
+}
+
+bool ipv4_addresses_share_subnet(ipv4_address_t first, ipv4_address_t second, ipv4_address_t mask) {
+  return (first & mask) == (second & mask);
+}
+
+void ipv4_address_print(FILE* destination, ipv4_address_t address) {
+  fprintf(destination, "%u.%u.%u.%u", address & 0xFF, (address >> 8) & 0xFF, (address >> 16) & 0xFF, address >> 24);
+}
+
 bool ipv4_write_ethernet_packet(FILE* destination, const ipv4_packet_data_t* packet_data) {
   if (packet_data->data_length > ETHERNET_MAX_DATA_LEN - sizeof(ipv4_header_t)) {
     return false;

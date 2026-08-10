@@ -52,6 +52,18 @@ instead prints every stored octet bit-by-bit in real transmission order.
 /* A six-octet Ethernet MAC address. Destination is emitted before source. */
 typedef uint8_t mac_address_t[6];
 
+/* Parses a colon-separated MAC address into six octets. */
+bool ethernet_mac_parse(const char* text, mac_address_t mac);
+
+/* Returns true when the individual/group bit marks broadcast or multicast delivery. */
+bool ethernet_mac_is_group(const mac_address_t mac);
+
+/* Returns true only for FF:FF:FF:FF:FF:FF. */
+bool ethernet_mac_is_broadcast(const mac_address_t mac);
+
+/* Writes an uppercase colon-separated MAC address to the caller-owned stream. */
+void ethernet_mac_print(FILE* destination, const mac_address_t mac);
+
 /* The IEEE 802.3 length field excludes padding, which reaches the 46-octet minimum. */
 #define ETHERNET_MIN_DATA_LEN 46
 #define ETHERNET_MAX_DATA_LEN 1500

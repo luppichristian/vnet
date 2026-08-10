@@ -2,6 +2,31 @@
 #include <math.h>
 #include <string.h>
 
+bool ethernet_mac_parse(const char* text, mac_address_t mac) {
+  unsigned int octets[6] = {0};
+  char trailing = '\0';
+  if (sscanf(text, "%2x:%2x:%2x:%2x:%2x:%2x%c", &octets[0], &octets[1], &octets[2], &octets[3], &octets[4], &octets[5], &trailing) != 6) {
+    return false;
+  }
+  for (size_t i = 0; i < sizeof(mac_address_t); ++i) {
+    mac[i] = (uint8_t)octets[i];
+  }
+  return true;
+}
+
+bool ethernet_mac_is_group(const mac_address_t mac) {
+  return (mac[0] & 1u) != 0;
+}
+
+bool ethernet_mac_is_broadcast(const mac_address_t mac) {
+  static const mac_address_t broadcast = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  return memcmp(mac, broadcast, sizeof(broadcast)) == 0;
+}
+
+void ethernet_mac_print(FILE* destination, const mac_address_t mac) {
+  fprintf(destination, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
 bool ethernet_write_frame(FILE* destination, const ethernet_frame_data_t* frame_data) {
   if (frame_data->data_length > ETHERNET_MAX_DATA_LEN) {
     return false;

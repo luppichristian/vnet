@@ -40,14 +40,6 @@ static void handle_signal(int sig) {
   }
 }
 
-static bool mac_is_group(const mac_address_t mac) {
-  return (mac[0] & 1u) != 0;
-}
-
-static void print_mac(const mac_address_t mac) {
-  fprintf(stdout, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-}
-
 static switch_device_t* device_find(switch_device_t* devices, size_t device_count, const mac_address_t mac) {
   for (size_t i = 0; i < device_count; ++i) {
     if (memcmp(devices[i].mac, mac, sizeof(devices[i].mac)) == 0) {
@@ -68,7 +60,7 @@ static void device_remove_port(switch_device_t* devices, size_t* device_count, s
 }
 
 static void device_learn(switch_device_t* devices, size_t* device_count, const mac_address_t mac, size_t port) {
-  if (mac_is_group(mac)) {
+  if (ethernet_mac_is_group(mac)) {
     return;
   }
   switch_device_t* device = device_find(devices, *device_count, mac);
@@ -84,7 +76,7 @@ static void device_learn(switch_device_t* devices, size_t* device_count, const m
   memcpy(device->mac, mac, sizeof(device->mac));
   device->port = port;
   fputs("Learned ", stdout);
-  print_mac(mac);
+  ethernet_mac_print(stdout, mac);
   fprintf(stdout, " on port %zu.\n", port + 1);
 }
 
@@ -105,7 +97,7 @@ static bool forward_ethernet(switch_port_t* ports, size_t port_count, switch_dev
   device_learn(devices, device_count, frame.header.src_mac, ingress_port);
 
   bool targets[SWITCH_DEVICE_CAPACITY] = {false};
-  if (mac_is_group(frame.header.dst_mac)) {
+  if (ethernet_mac_is_group(frame.header.dst_mac)) {
     for (size_t i = 0; i < port_count; ++i) {
       targets[i] = i != ingress_port;
     }
