@@ -10,57 +10,78 @@
 ===================================
 Domain Name System Message Format
 ===================================
-DNS is an application-layer naming protocol. A client sends a question to a
-name server, usually over UDP port 53, and receives resource records that map
-names to addresses. DNS data is carried inside UDP, then IPv4 and Ethernet:
-
-  Ethernet II data: IPv4 header | UDP header | DNS header | question/answer
-
-This VNet model supports one uncompressed A-record question or response per
-message. It retains DNS transaction identifiers and response codes while
-omitting recursive resolution, referrals, caching policy, multiple records,
-EDNS, DNSSEC, TCP fallback, and wire-name compression. Names are stored as
-NUL-terminated presentation strings rather than DNS label octets because this
-compiler-local simulator has one shared writer and reader.
+DNS is an application-layer naming protocol carried by UDP, IPv4, and Ethernet.
+This VNet model supports authoritative A and CNAME records in one uncompressed
+question or response. It preserves transaction identifiers and response codes,
+but omits recursive resolution, TTLs, classes, multiple-answer messages, EDNS,
+DNSSEC, TCP fallback, and DNS wire-name compression. Names use presentation
+strings and native values because the simulator has one shared writer and reader.
 */
 
 #define DNS_UDP_PORT 53
-#define DNS_NAME_MAX 63
+#define DNS_NAME_MAX 253
 
 #define DNS_MESSAGE_QUERY    0
 #define DNS_MESSAGE_RESPONSE 1
 
-#define DNS_RESPONSE_OK        0
+#define DNS_RESPONSE_OK         0
 #define DNS_RESPONSE_NAME_ERROR 3
+
+#define DNS_RECORD_NONE  0
+#define DNS_RECORD_A     1
+#define DNS_RECORD_CNAME 5
 
 #pragma pack(push, 1)
 
-typedef struct dns_message {
-  /* Client-chosen value copied by the matching server response. */
-  uint16_t transaction_id;
+typedef union dns_record_data {
+  /* IPv4 address for an A record. */
+  ipv4_address_t address;
 
-  /* Query requests a name; response supplies an address or error. */
-  uint8_t type;
+  /* Canonical presentation-format name for a CNAME record. */
+  char name[DNS_NAME_MAX + 1];
+} dns_record_data_t;
 
-  /* Zero is success. Name error means the authoritative VNet server has no A record. */
-  uint8_t response_code;
+typedef struct dns_record {
+  /* IANA record type: A or CNAME in this model. */
+  uint16_t type;
 
-  /* Presentation-format host name. The terminating NUL is part of this fixed simulation record. */
+  /* Owner name: the queried alias or canonical name. */
   char name[DNS_NAME_MAX + 1];
 
-  /* IPv4 A-record value in a successful response; zero otherwise. */
-  ipv4_address_t address;
+  /* Type-specific resource-record data. */
+  dns_record_data_t data;
+} dns_record_t;
+
+typedef struct dns_message {
+  /* Client-selected value copied by the matching server response. */
+  uint16_t transaction_id;
+
+  /* Query requests a record; response supplies a record or error. */
+  uint8_t type;
+
+  /* Zero on success; NAME_ERROR means no authoritative record exists. */
+  uint8_t response_code;
+
+  /* Query type/name or the one response record. */
+  dns_record_t record;
 } dns_message_t;
 
 #pragma pack(pop)
 
-_Static_assert(sizeof(dns_message_t) == 72, "DNS VNet message size must remain fixed");
+_Static_assert(sizeof(dns_record_t) == 510, "DNS VNet record size must remain fixed");
+_Static_assert(sizeof(dns_message_t) == 514, "DNS VNet message size must remain fixed");
 
-/* Builds one DNS A-record query. name must be a non-empty presentation-format name. */
-bool dns_write_query(uint16_t transaction_id, const char* name, dns_message_t* message);
+/* Builds an A or CNAME query for a non-empty presentation-format name. */
+bool dns_write_query(uint16_t transaction_id, uint16_t record_type, const char* name, dns_message_t* message);
 
-/* Builds one successful DNS A-record response or a name-error response when address is zero. */
-bool dns_write_response(uint16_t transaction_id, const char* name, ipv4_address_t address, dns_message_t* message);
+/* Builds one successful response containing record, or a name-error response when record is NULL. */
+bool dns_write_response(uint16_t transaction_id, const char* name, const dns_record_t* record, dns_message_t* message);
+
+/* Initializes a valid authoritative A record. address must not be zero. */
+bool dns_record_write_a(const char* name, ipv4_address_t address, dns_record_t* record);
+
+/* Initializes a valid authoritative CNAME record. */
+bool dns_record_write_cname(const char* name, const char* target, dns_record_t* record);
 
 /* Validates and decodes one complete VNet DNS query or response. */
 bool dns_parse_message(const uint8_t* bytes, size_t byte_count, dns_message_t* message);

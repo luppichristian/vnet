@@ -1,5 +1,16 @@
 #include "dns_server.h"
 
+static const char* record_type_name(uint16_t type) {
+  return type == DNS_RECORD_A ? "A" : type == DNS_RECORD_CNAME ? "CNAME" : "unknown";
+}
+
+static const dns_record_t* find_record(const dns_server_context_t* context, const char* name) {
+  for (size_t i = 0; i < context->record_count; ++i) {
+    if (strcmpi(context->records[i].name, name) == 0) return &context->records[i];
+  }
+  return NULL;
+}
+
 static void command_info(void* argument, char* arguments) {
   dns_server_context_t* context = argument;
   if (!cmd_app_arguments_empty(arguments)) {
@@ -8,14 +19,20 @@ static void command_info(void* argument, char* arguments) {
   }
   fprintf(stdout, "DNS server file: %s\nDNS server IPv4: ", context->path);
   ipv4_address_print(stdout, context->address);
-  fprintf(stdout, "\nA record: %s -> ", context->name);
-  ipv4_address_print(stdout, context->record_address);
-  fputs("\n", stdout);
+  fprintf(stdout, "\nRecords (%zu):\n", context->record_count);
+  for (size_t i = 0; i < context->record_count; ++i) {
+    const dns_record_t* record = &context->records[i];
+    fprintf(stdout, "  %-5s %-40s ", record_type_name(record->type), record->name);
+    if (record->type == DNS_RECORD_A) ipv4_address_print(stdout, record->data.address);
+    else fputs(record->data.name, stdout);
+    fputc('\n', stdout);
+  }
 }
 
 static bool write_dns_response(dns_server_context_t* context, const ethernet_frame_view_t* frame, const ipv4_packet_view_t* ipv4, const udp_packet_view_t* udp, const dns_message_t* query) {
   dns_message_t response = {0};
-  if (!dns_write_response(query->transaction_id, query->name, strcmpi(query->name, context->name) == 0 ? context->record_address : 0, &response)) return false;
+  const dns_record_t* record = find_record(context, query->record.name);
+  if (!dns_write_response(query->transaction_id, query->record.name, record, &response)) return false;
   FILE* destination = fopen(context->path, "ab");
   if (!destination) return false;
   udp_packet_data_t packet = {
@@ -56,21 +73,31 @@ static void handle_frame(dns_server_context_t* context, const uint8_t* bytes, si
     return;
   }
   if (frame.header.type_or_length != ETHERNET_ETHERTYPE_IPV4 || memcmp(frame.header.dst_mac, context->mac, sizeof(context->mac)) != 0 || !ipv4_parse_packet(frame.data, frame.data_length, &ipv4) || ipv4.header.dst_addr != context->address || ipv4.header.protocol != UDP_IPV4_PROTOCOL || !udp_parse_packet(ipv4.payload, ipv4.payload_length, ipv4.header.src_addr, ipv4.header.dst_addr, &udp) || udp.header.dst_port != DNS_UDP_PORT || !dns_parse_message(udp.data, udp.data_length, &query) || query.type != DNS_MESSAGE_QUERY) return;
-  if (write_dns_response(context, &frame, &ipv4, &udp, &query)) fprintf(stdout, "DNS query: %s (%s).\n", query.name, strcmpi(query.name, context->name) == 0 ? "answered" : "name error");
+  if (write_dns_response(context, &frame, &ipv4, &udp, &query)) fprintf(stdout, "DNS query: %s (%s).\n", query.record.name, find_record(context, query.record.name) ? "answered" : "name error");
+}
+
+static bool parse_record(const char* type, const char* name, const char* value, dns_record_t* record) {
+  if (strcmpi(type, "A") == 0) {
+    ipv4_address_t address = 0;
+    return ipv4_parse_address(value, &address) && dns_record_write_a(name, address, record);
+  }
+  return strcmpi(type, "CNAME") == 0 && dns_record_write_cname(name, value, record);
 }
 
 int main(int argc, char** argv) {
-  if (argc != 6) {
-    fputs("Usage: dns_server <file> <mac-address> <ip-address> <name> <address>\n", stderr);
+  if (argc < 7 || (argc - 4) % 3 != 0) {
+    fputs("Usage: dns_server <file> <mac-address> <ip-address> <A|CNAME> <name> <address|target> [...records]\n", stderr);
     return EXIT_FAILURE;
   }
   dns_server_context_t context = {.path = argv[1]};
-  if (!ethernet_mac_parse(argv[2], context.mac) || !ipv4_parse_address(argv[3], &context.address) || !dns_write_query(1, argv[4], &(dns_message_t) {0}) || !ipv4_parse_address(argv[5], &context.record_address)) return EXIT_FAILURE;
-  memcpy(context.name, argv[4], strlen(argv[4]) + 1);
+  if (!ethernet_mac_parse(argv[2], context.mac) || !ipv4_parse_address(argv[3], &context.address) || (size_t)((argc - 4) / 3) > DNS_SERVER_RECORD_CAPACITY) return EXIT_FAILURE;
+  for (int index = 4; index < argc; index += 3) {
+    if (!parse_record(argv[index], argv[index + 1], argv[index + 2], &context.records[context.record_count++])) return EXIT_FAILURE;
+  }
   context.source = fopen(context.path, "rb");
   if (!context.source || fseek(context.source, 0, SEEK_END) != 0) return EXIT_FAILURE;
   cmd_app_init(&context.commands);
-  if (!cmd_app_register(&context.commands, "info", "Show the authoritative A record.", command_info, &context) || !cmd_app_start(&context.commands)) return EXIT_FAILURE;
+  if (!cmd_app_register(&context.commands, "info", "Show the authoritative DNS records.", command_info, &context) || !cmd_app_start(&context.commands)) return EXIT_FAILURE;
   uint8_t buffer[DNS_SERVER_BUFFER_SIZE] = {0};
   while (cmd_app_is_running(&context.commands)) {
     long end = 0;

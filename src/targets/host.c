@@ -345,20 +345,43 @@ static void handle_dhcp(host_context_t* context, const udp_packet_view_t* udp) {
   }
 }
 
+static void send_dns_query(host_context_t* context, const char* name) {
+  dns_message_t message = {0};
+  host_pending_packet_t pending = {.type = HOST_PENDING_DNS, .destination = context->dns_server, .src_port = DNS_UDP_PORT, .dst_port = DNS_UDP_PORT};
+  if (!dns_write_query(++context->next_transaction_id, DNS_RECORD_A, name, &message)) return;
+  context->dns_transaction_id = message.transaction_id;
+  memcpy(context->dns_query_name, name, strlen(name) + 1);
+  memcpy(pending.data, &message, sizeof(message));
+  pending.data_length = sizeof(message);
+  command_transport(context, &pending);
+}
+
 static void handle_dns(host_context_t* context, const udp_packet_view_t* udp) {
   dns_message_t message = {0};
-  if (udp->header.src_port != DNS_UDP_PORT || udp->header.dst_port != DNS_UDP_PORT || !dns_parse_message(udp->data, udp->data_length, &message) || message.type != DNS_MESSAGE_RESPONSE || message.transaction_id != context->dns_transaction_id) return;
+  if (udp->header.src_port != DNS_UDP_PORT || udp->header.dst_port != DNS_UDP_PORT || !dns_parse_message(udp->data, udp->data_length, &message) || message.type != DNS_MESSAGE_RESPONSE || message.transaction_id != context->dns_transaction_id || strcmpi(message.record.name, context->dns_query_name) != 0) return;
   if (message.response_code != DNS_RESPONSE_OK) {
-    fprintf(stderr, "DNS name '%s' was not found.\n", message.name);
+    fprintf(stderr, "DNS name '%s' was not found.\n", message.record.name);
     context->dns_pending_packet.active = false;
     return;
   }
+  if (message.record.type == DNS_RECORD_CNAME) {
+    if (++context->dns_cname_hops > 8) {
+      fputs("DNS CNAME chain is too deep.\n", stderr);
+      context->dns_pending_packet.active = false;
+      return;
+    }
+    fprintf(stdout, "DNS: %s CNAME %s.\n", message.record.name, message.record.data.name);
+    send_dns_query(context, message.record.data.name);
+    return;
+  }
+  if (message.record.type != DNS_RECORD_A) return;
   host_pending_packet_t pending = context->dns_pending_packet;
   context->dns_pending_packet.active = false;
-  pending.destination = message.address;
+  context->dns_cname_hops = 0;
+  pending.destination = message.record.data.address;
   fputs("DNS: ", stdout);
-  fprintf(stdout, "%s -> ", message.name);
-  ipv4_address_print(stdout, message.address);
+  fprintf(stdout, "%s -> ", message.record.name);
+  ipv4_address_print(stdout, message.record.data.address);
   fputs(".\n", stdout);
   command_transport(context, &pending);
 }
@@ -612,20 +635,16 @@ static void command_dhcp(void* context_argument, char* arguments) {
 static void command_dns(void* context_argument, char* arguments) {
   host_context_t* context = context_argument;
   dns_message_t message = {0};
-  host_pending_packet_t pending = {.type = HOST_PENDING_DNS, .src_port = DNS_UDP_PORT, .dst_port = DNS_UDP_PORT};
   if (!context->has_ip4) {
     fputs("DNS requires an IPv4 address.\n", stderr);
   } else if (!context->has_dns_server) {
     fputs("No DNS server was configured with -dns or DHCP.\n", stderr);
-  } else if (!dns_write_query(++context->next_transaction_id, arguments, &message)) {
+  } else if (!dns_write_query(1, DNS_RECORD_A, arguments, &message)) {
     fputs("Usage: dns <name>\n", stderr);
   } else {
-    context->dns_transaction_id = message.transaction_id;
     context->dns_pending_packet.active = false;
-    pending.destination = context->dns_server;
-    memcpy(pending.data, &message, sizeof(message));
-    pending.data_length = sizeof(message);
-    command_transport(context, &pending);
+    context->dns_cname_hops = 0;
+    send_dns_query(context, arguments);
   }
 }
 
@@ -637,16 +656,13 @@ static void command_ping(void* context_argument, char* argument) {
     fputs("Ping requires an IPv4 address.\n", stderr);
   } else if (!ipv4_parse_address(argument, &destination)) {
     dns_message_t query = {0};
-    host_pending_packet_t dns_pending = {.type = HOST_PENDING_DNS, .destination = context->dns_server, .src_port = DNS_UDP_PORT, .dst_port = DNS_UDP_PORT};
-    if (!context->has_dns_server || !dns_write_query(++context->next_transaction_id, argument, &query)) {
+    if (!context->has_dns_server || !dns_write_query(1, DNS_RECORD_A, argument, &query)) {
       fputs("Usage: ping <ip-address|dns-name>\n", stderr);
       return;
     }
-    context->dns_transaction_id = query.transaction_id;
     context->dns_pending_packet = (host_pending_packet_t) {.type = HOST_PENDING_PING, .active = true};
-    memcpy(dns_pending.data, &query, sizeof(query));
-    dns_pending.data_length = sizeof(query);
-    command_transport(context, &dns_pending);
+    context->dns_cname_hops = 0;
+    send_dns_query(context, argument);
     return;
   } else if (!route_next_hop(context, destination, &next_hop)) {
     fputs("Destination is outside the local subnet and no default gateway is configured.\n", stderr);

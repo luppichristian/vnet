@@ -73,6 +73,8 @@ typedef struct host_context {
   uint16_t next_transaction_id;
   uint16_t dns_transaction_id;
   uint16_t dhcp_transaction_id;
+  uint8_t dns_cname_hops;
+  char dns_query_name[DNS_NAME_MAX + 1];
   host_pending_packet_t dns_pending_packet;
   uint16_t ping_sequence;
   FILE* source;
