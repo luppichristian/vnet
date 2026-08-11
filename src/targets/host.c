@@ -12,6 +12,7 @@ OSI/ISO layer: Layer 2 endpoint; optional IPv4 configuration supplies Layer 3 id
 #include <arp_table.h>
 #include <mutex.h>
 #include <rarp.h>
+#include <socket.h>
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -68,6 +69,7 @@ typedef struct host_context {
   vnet_peer_table_t devices;
   arp_entry_t arp_entries[HOST_ARP_CAPACITY];
   arp_table_t arp;
+  socket_context_t sockets;
   host_pending_packet_t pending_packet;
 } host_context_t;
 
@@ -242,6 +244,28 @@ static bool route_next_hop(const host_context_t* context, ipv4_address_t destina
   return false;
 }
 
+static bool host_socket_emit(void* argument, ipv4_address_t destination_address, uint8_t protocol, const uint8_t* payload, uint16_t payload_length) {
+  host_context_t* context = argument;
+  ipv4_address_t next_hop = 0;
+  if (!context->has_ip4 || !route_next_hop(context, destination_address, &next_hop)) return false;
+  const arp_entry_t* neighbor = arp_find(context, next_hop);
+  if (!neighbor) return false;
+  FILE* destination = fopen(context->path, "ab");
+  if (!destination) return false;
+  ipv4_packet_data_t packet = {
+      .src_addr = context->ip4,
+      .dst_addr = destination_address,
+      .protocol = protocol,
+      .data = payload,
+      .data_length = payload_length,
+  };
+  memcpy(packet.src_mac_addr, context->mac, sizeof(packet.src_mac_addr));
+  memcpy(packet.dst_mac_addr, neighbor->mac, sizeof(packet.dst_mac_addr));
+  const bool written = ipv4_write_ethernet_packet(destination, &packet);
+  fclose(destination);
+  return written;
+}
+
 static void print_info(host_context_t* context) {
   mutex_lock(&context->mutex);
   fprintf(stdout, "Host file: %s\nHost MAC:  ", context->path);
@@ -336,6 +360,7 @@ static void handle_rarp(host_context_t* context, const ethernet_frame_view_t* fr
   if (packet.operation == RARP_OPERATION_REPLY && memcmp(packet.target_hardware_address, context->mac, sizeof(context->mac)) == 0 && packet.target_protocol_address != 0) {
     mutex_lock(&context->mutex);
     context->ip4 = packet.target_protocol_address;
+    context->sockets.local_address = packet.target_protocol_address;
     context->has_ip4 = true;
     mutex_unlock(&context->mutex);
     fputs("Received RARP assignment: ", stdout);
@@ -346,9 +371,14 @@ static void handle_rarp(host_context_t* context, const ethernet_frame_view_t* fr
 
 static void handle_ipv4(host_context_t* context, const ethernet_frame_view_t* frame) {
   ipv4_packet_view_t packet = {0};
-  if (!context->has_ip4 || !ipv4_parse_packet(frame->data, frame->data_length, &packet) || packet.header.dst_addr != context->ip4 || packet.header.protocol != ICMP_IPV4_PROTOCOL) {
+  if (!context->has_ip4 || !ipv4_parse_packet(frame->data, frame->data_length, &packet) || packet.header.dst_addr != context->ip4) {
     return;
   }
+  if (packet.header.protocol == SOCKET_PROTOCOL_TCP || packet.header.protocol == SOCKET_PROTOCOL_UDP) {
+    socket_receive_ipv4(&context->sockets, &packet);
+    return;
+  }
+  if (packet.header.protocol != ICMP_IPV4_PROTOCOL) return;
   icmp_echo_header_t echo = {0};
   const uint8_t* data = NULL;
   size_t data_length = 0;
@@ -716,6 +746,60 @@ usage:
   fputs("Usage: tcp <src_port> <dst_port> <dst_ip> -d <data> [-seq <number>] [-ack <number>] [-window <number>] [-flags <syn,ack,...>]\n", stderr);
 }
 
+static void command_socket(void* context_argument, char* argument) {
+  host_context_t* context = context_argument;
+  char* cursor = argument;
+  char* action = cmd_app_next_argument(&cursor);
+  char* first = cmd_app_next_argument(&cursor);
+  char* second = cmd_app_next_argument(&cursor);
+  char* third = cmd_app_next_argument(&cursor);
+  if (!action) goto usage;
+  mutex_lock(&context->mutex);
+  if (strcmpi(action, "info") == 0 && !first) {
+    for (size_t i = 0; i < SOCKET_CAPACITY; ++i) {
+      const socket_entry_t* entry = socket_get(&context->sockets, (socket_handle_t)(i + 1));
+      if (entry) fprintf(stdout, "  %zu  %s  state=%d local=%u remote=%u\n", i + 1, entry->protocol == SOCKET_PROTOCOL_TCP ? "tcp" : "udp", entry->state, entry->local_port, entry->remote_port);
+    }
+  } else if (strcmpi(action, "udp-open") == 0 && first && !second) {
+    uint16_t port = 0; socket_handle_t handle = 0;
+    if (!cmd_app_parse_uint16(first, &port) || !socket_open(&context->sockets, SOCKET_PROTOCOL_UDP, &handle) || !socket_bind(&context->sockets, handle, port)) goto usage_locked;
+    fprintf(stdout, "Socket %u opened for UDP port %u.\n", handle, socket_get(&context->sockets, handle)->local_port);
+  } else if (strcmpi(action, "tcp-listen") == 0 && first && !second) {
+    uint16_t port = 0; socket_handle_t handle = 0;
+    if (!cmd_app_parse_uint16(first, &port) || !socket_open(&context->sockets, SOCKET_PROTOCOL_TCP, &handle) || !socket_bind(&context->sockets, handle, port) || !socket_listen(&context->sockets, handle)) goto usage_locked;
+    fprintf(stdout, "Socket %u listening on TCP port %u.\n", handle, port);
+  } else if (strcmpi(action, "tcp-connect") == 0 && first && second && !third) {
+    ipv4_address_t address = 0; uint16_t port = 0; socket_handle_t handle = 0;
+    if (!ipv4_parse_address(first, &address) || !cmd_app_parse_uint16(second, &port) || !socket_open(&context->sockets, SOCKET_PROTOCOL_TCP, &handle) || !socket_connect(&context->sockets, handle, address, port)) goto usage_locked;
+    fprintf(stdout, "Socket %u connecting to TCP port %u.\n", handle, port);
+  } else if (strcmpi(action, "udp-send") == 0 && first && second && third) {
+    char* data = cmd_app_next_argument(&cursor);
+    uint16_t handle = 0, port = 0; ipv4_address_t address = 0;
+    if (!data || cmd_app_next_argument(&cursor) || !cmd_app_parse_uint16(first, &handle) || !ipv4_parse_address(second, &address) || !cmd_app_parse_uint16(third, &port) || !socket_send_to(&context->sockets, handle, address, port, data, (uint16_t)strlen(data))) goto usage_locked;
+  } else if (strcmpi(action, "send") == 0 && first && second && !third) {
+    uint16_t handle = 0;
+    if (!cmd_app_parse_uint16(first, &handle) || !socket_send(&context->sockets, handle, second, (uint16_t)strlen(second))) goto usage_locked;
+  } else if (strcmpi(action, "accept") == 0 && first && !second) {
+    uint16_t listener = 0; socket_handle_t connection = 0;
+    if (!cmd_app_parse_uint16(first, &listener) || !socket_accept(&context->sockets, listener, &connection)) goto usage_locked;
+    fprintf(stdout, "Accepted TCP socket %u.\n", connection);
+  } else if (strcmpi(action, "receive") == 0 && first && !second) {
+    uint16_t handle = 0; uint8_t bytes[SOCKET_RECEIVE_CAPACITY + 1] = {0};
+    if (!cmd_app_parse_uint16(first, &handle)) goto usage_locked;
+    const size_t length = socket_receive(&context->sockets, handle, bytes, SOCKET_RECEIVE_CAPACITY, NULL, NULL);
+    if (!length) fputs("No socket data.\n", stdout); else fprintf(stdout, "Received %zu bytes: %.*s\n", length, (int)length, bytes);
+  } else if (strcmpi(action, "close") == 0 && first && !second) {
+    uint16_t handle = 0;
+    if (!cmd_app_parse_uint16(first, &handle) || !socket_close(&context->sockets, handle)) goto usage_locked;
+  } else goto usage_locked;
+  mutex_unlock(&context->mutex);
+  return;
+usage_locked:
+  mutex_unlock(&context->mutex);
+usage:
+  fputs("Usage: socket info | udp-open <port> | tcp-listen <port> | tcp-connect <ip> <port> | udp-send <socket> <ip> <port> <data> | send <socket> <data> | accept <socket> | receive <socket> | close <socket>\n", stderr);
+}
+
 int main(int argc, char** argv) {
   if (argc < 3 || ((argc - 3) % 2) != 0) {
     print_usage();
@@ -739,6 +823,12 @@ int main(int argc, char** argv) {
   }
   vnet_peer_table_init(&context.devices, context.device_entries, HOST_DEVICE_CAPACITY);
   arp_table_init(&context.arp, context.arp_entries, HOST_ARP_CAPACITY);
+  if (!socket_context_init(&context.sockets, context.ip4, host_socket_emit, &context)) {
+    fputs("Could not initialize the host socket context.\n", stderr);
+    mutex_destroy(&context.mutex);
+    fclose(context.source);
+    return EXIT_FAILURE;
+  }
   cmd_app_init(&context.commands);
   thread_t thread;
   if (!thread_start(&thread, receiver_thread, &context)) {
@@ -748,7 +838,7 @@ int main(int argc, char** argv) {
     return EXIT_FAILURE;
   }
 
-  if (!cmd_app_register(&context.commands, "info", "Show host, routes, ARP cache, and learned devices.", command_info, &context) || !cmd_app_register(&context.commands, "arp", "Resolve the local destination or next-hop gateway.", command_arp, &context) || !cmd_app_register(&context.commands, "arp-delete", "Remove one learned ARP neighbor.", command_arp_delete, &context) || !cmd_app_register(&context.commands, "rarp", "Request an IPv4 address for this host MAC.", command_rarp, &context) || !cmd_app_register(&context.commands, "ping", "Send an ICMP Echo Request after ARP resolution.", command_ping, &context) || !cmd_app_register(&context.commands, "udp", "Send a UDP datagram after ARP resolution.", command_udp, &context) || !cmd_app_register(&context.commands, "tcp", "Send a base-header TCP segment after ARP resolution.", command_tcp, &context) || !cmd_app_start(&context.commands)) {
+  if (!cmd_app_register(&context.commands, "info", "Show host, routes, ARP cache, and learned devices.", command_info, &context) || !cmd_app_register(&context.commands, "arp", "Resolve the local destination or next-hop gateway.", command_arp, &context) || !cmd_app_register(&context.commands, "arp-delete", "Remove one learned ARP neighbor.", command_arp_delete, &context) || !cmd_app_register(&context.commands, "rarp", "Request an IPv4 address for this host MAC.", command_rarp, &context) || !cmd_app_register(&context.commands, "ping", "Send an ICMP Echo Request after ARP resolution.", command_ping, &context) || !cmd_app_register(&context.commands, "udp", "Send a UDP datagram after ARP resolution.", command_udp, &context) || !cmd_app_register(&context.commands, "tcp", "Send a base-header TCP segment after ARP resolution.", command_tcp, &context) || !cmd_app_register(&context.commands, "socket", "Control virtual TCP and UDP sockets.", command_socket, &context) || !cmd_app_start(&context.commands)) {
     fputs("Could not start the command application.\n", stderr);
     cmd_app_stop(&context.commands);
     thread_join(&thread);

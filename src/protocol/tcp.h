@@ -25,9 +25,9 @@ A TCP segment establishes a byte-stream connection with SYN/ACK exchange,
 sequence and acknowledgement numbers, retransmission, receive-window flow
 control, and checksum protection. This simulator serializes, validates, and
 inspects one base 20-octet TCP header plus optional data. It exposes the header
-flags, sequence/acknowledgement numbers, and window, but does not maintain a
-TCP connection state machine, retransmission queue, options, or congestion
-control.
+flags, sequence/acknowledgement numbers, and window. Connection state and
+endpoint queues belong to the private VNet socket backend, not this wire-format
+module.
 
 The TCP checksum is mandatory. It covers an IPv4 pseudo-header and the complete
 TCP segment, including any options and data, but not the enclosing IPv4 header
@@ -118,6 +118,9 @@ typedef struct tcp_packet_view {
   const uint8_t* data;
   uint16_t data_length;
 } tcp_packet_view_t;
+
+/* Serializes one checksummed, base-header TCP segment without IPv4 or Ethernet encapsulation. */
+bool tcp_serialize_packet(const tcp_packet_data_t* packet_data, uint8_t* bytes, size_t capacity, uint16_t* length);
 
 /* Writes one checksummed, base-header TCP segment inside an IPv4 Ethernet II frame. */
 bool tcp_write_ethernet_packet(FILE* destination, const tcp_packet_data_t* packet_data);

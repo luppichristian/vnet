@@ -77,6 +77,9 @@ typedef struct udp_packet_view {
   uint16_t data_length;
 } udp_packet_view_t;
 
+/* Serializes one checksummed UDP datagram without IPv4 or Ethernet encapsulation. */
+bool udp_serialize_packet(const udp_packet_data_t* packet_data, uint8_t* bytes, size_t capacity, uint16_t* length);
+
 /* Writes one checksummed UDP datagram inside an IPv4 Ethernet II frame. */
 bool udp_write_ethernet_packet(FILE* destination, const udp_packet_data_t* packet_data);
 
