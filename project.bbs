@@ -36,6 +36,14 @@ targets(
   )
 
   console(
+    id(router)
+    output(router)
+    stdver(c17)
+    include_dirs(src/lib src/protocol src/tables src/targets)
+    units(src/targets/router.c src/lib/*.c src/protocol/*.c src/tables/*.c)
+  )
+
+  console(
     id(watch)
     output(watch)
     stdver(c17)
