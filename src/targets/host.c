@@ -5,6 +5,8 @@ OSI/ISO layer: Layer 2 endpoint; optional IPv4 configuration supplies Layer 3 id
 
 #include <arp.h>
 #include <cmd_app.h>
+#include <dhcp.h>
+#include <dns.h>
 #include <ethernet.h>
 #include <futils.h>
 #include <icmp.h>
@@ -36,6 +38,7 @@ typedef enum host_pending_type {
   HOST_PENDING_PING,
   HOST_PENDING_UDP,
   HOST_PENDING_TCP,
+  HOST_PENDING_DNS,
 } host_pending_type_t;
 
 typedef struct host_pending_packet {
@@ -61,6 +64,14 @@ typedef struct host_context {
   ipv4_address_t gateway;
   bool has_ip4;
   bool has_gateway;
+  ipv4_address_t dns_server;
+  ipv4_address_t dhcp_server;
+  bool has_dns_server;
+  bool has_dhcp_server;
+  uint16_t next_transaction_id;
+  uint16_t dns_transaction_id;
+  uint16_t dhcp_transaction_id;
+  host_pending_packet_t dns_pending_packet;
   uint16_t ping_sequence;
   FILE* source;
   mutex_t mutex;
@@ -74,6 +85,8 @@ typedef struct host_context {
 } host_context_t;
 
 typedef arp_entry_t host_arp_entry_t;
+
+static void command_transport(host_context_t* context, host_pending_packet_t* pending);
 
 static arp_entry_t* arp_find(host_context_t* context, ipv4_address_t address) {
   return arp_table_find(&context->arp, 0, address);
@@ -124,6 +137,24 @@ static bool write_rarp_request(host_context_t* context) {
   rarp_request_data_t request = {0};
   memcpy(request.client_hardware_address, context->mac, sizeof(request.client_hardware_address));
   const bool written = rarp_write_ethernet_request(destination, &request);
+  fclose(destination);
+  return written;
+}
+
+static bool write_dhcp_message(host_context_t* context, const dhcp_message_t* message) {
+  FILE* destination = fopen(context->path, "ab");
+  if (!destination) return false;
+  const udp_packet_data_t packet = {
+      .dst_mac_addr = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
+      .src_mac_addr = {context->mac[0], context->mac[1], context->mac[2], context->mac[3], context->mac[4], context->mac[5]},
+      .src_addr = 0,
+      .dst_addr = IPV4_ADDRESS(255, 255, 255, 255),
+      .src_port = DHCP_CLIENT_UDP_PORT,
+      .dst_port = DHCP_SERVER_UDP_PORT,
+      .data = message,
+      .data_length = sizeof(*message),
+  };
+  const bool written = udp_write_ethernet_packet(destination, &packet);
   fclose(destination);
   return written;
 }
@@ -223,6 +254,8 @@ static bool send_pending_packet(host_context_t* context, const host_pending_pack
     written = write_udp(context, pending, destination_mac);
   else if (pending->type == HOST_PENDING_TCP)
     written = write_tcp(context, pending, destination_mac);
+  else if (pending->type == HOST_PENDING_DNS)
+    written = write_udp(context, pending, destination_mac);
   if (written) {
     fprintf(stdout, "Sent %s to ", pending->type == HOST_PENDING_PING ? "ping" : pending->type == HOST_PENDING_UDP ? "UDP datagram"
                                                                                                                    : "TCP segment");
@@ -280,6 +313,16 @@ static void print_info(host_context_t* context) {
     if (context->has_gateway) {
       fputs("Default gateway: ", stdout);
       ipv4_address_print(stdout, context->gateway);
+      fputc('\n', stdout);
+    }
+    if (context->has_dns_server) {
+      fputs("DNS server: ", stdout);
+      ipv4_address_print(stdout, context->dns_server);
+      fputc('\n', stdout);
+    }
+    if (context->has_dhcp_server) {
+      fputs("DHCP server: ", stdout);
+      ipv4_address_print(stdout, context->dhcp_server);
       fputc('\n', stdout);
     }
   }
@@ -369,11 +412,57 @@ static void handle_rarp(host_context_t* context, const ethernet_frame_view_t* fr
   }
 }
 
-static void handle_ipv4(host_context_t* context, const ethernet_frame_view_t* frame) {
-  ipv4_packet_view_t packet = {0};
-  if (!context->has_ip4 || !ipv4_parse_packet(frame->data, frame->data_length, &packet) || packet.header.dst_addr != context->ip4) {
+static void handle_dhcp(host_context_t* context, const udp_packet_view_t* udp) {
+  dhcp_message_t message = {0};
+  if (udp->header.src_port != DHCP_SERVER_UDP_PORT || udp->header.dst_port != DHCP_CLIENT_UDP_PORT || !dhcp_parse_message(udp->data, udp->data_length, &message) || memcmp(message.client_mac, context->mac, sizeof(context->mac)) != 0 || message.transaction_id != context->dhcp_transaction_id) return;
+  if (message.type == DHCP_MESSAGE_OFFER) {
+    dhcp_message_t request = {0};
+    if (dhcp_write_client_message(DHCP_MESSAGE_REQUEST, message.transaction_id, context->mac, message.client_address, message.server_address, &request) && write_dhcp_message(context, &request)) fputs("Requested offered DHCP address.\n", stdout);
+  } else if (message.type == DHCP_MESSAGE_ACK) {
+    context->ip4 = message.client_address;
+    context->mask = message.subnet_mask;
+    context->gateway = message.gateway;
+    context->dns_server = message.dns_server;
+    context->has_ip4 = true;
+    context->has_gateway = message.gateway != 0;
+    context->has_dns_server = message.dns_server != 0;
+    context->sockets.local_address = message.client_address;
+    fputs("Received DHCP assignment: ", stdout);
+    ipv4_address_print(stdout, message.client_address);
+    fputs(".\n", stdout);
+  } else if (message.type == DHCP_MESSAGE_NAK) {
+    fputs("DHCP server rejected the requested address.\n", stderr);
+  }
+}
+
+static void handle_dns(host_context_t* context, const udp_packet_view_t* udp) {
+  dns_message_t message = {0};
+  if (udp->header.src_port != DNS_UDP_PORT || udp->header.dst_port != DNS_UDP_PORT || !dns_parse_message(udp->data, udp->data_length, &message) || message.type != DNS_MESSAGE_RESPONSE || message.transaction_id != context->dns_transaction_id) return;
+  if (message.response_code != DNS_RESPONSE_OK) {
+    fprintf(stderr, "DNS name '%s' was not found.\n", message.name);
+    context->dns_pending_packet.active = false;
     return;
   }
+  host_pending_packet_t pending = context->dns_pending_packet;
+  context->dns_pending_packet.active = false;
+  pending.destination = message.address;
+  fputs("DNS: ", stdout);
+  fprintf(stdout, "%s -> ", message.name);
+  ipv4_address_print(stdout, message.address);
+  fputs(".\n", stdout);
+  command_transport(context, &pending);
+}
+
+static void handle_ipv4(host_context_t* context, const ethernet_frame_view_t* frame) {
+  ipv4_packet_view_t packet = {0};
+  if (!ipv4_parse_packet(frame->data, frame->data_length, &packet)) return;
+  if (packet.header.protocol == UDP_IPV4_PROTOCOL) {
+    udp_packet_view_t udp = {0};
+    if (!udp_parse_packet(packet.payload, packet.payload_length, packet.header.src_addr, packet.header.dst_addr, &udp)) return;
+    if (packet.header.dst_addr == IPV4_ADDRESS(255, 255, 255, 255) || !context->has_ip4) handle_dhcp(context, &udp);
+    else if (packet.header.dst_addr == context->ip4) handle_dns(context, &udp);
+  }
+  if (!context->has_ip4 || packet.header.dst_addr != context->ip4) return;
   if (packet.header.protocol == SOCKET_PROTOCOL_TCP || packet.header.protocol == SOCKET_PROTOCOL_UDP) {
     socket_receive_ipv4(&context->sockets, &packet);
     return;
@@ -506,7 +595,7 @@ static void receiver_thread(void* argument) {
 }
 
 static void print_usage(void) {
-  fputs("Usage: host <file> <mac-address> [-ip4 <address> [-mask <address>] [-gateway <address>] ]\n", stderr);
+  fputs("Usage: host <file> <mac-address> [-ip4 <address> [-mask <address>] [-gateway <address>] [-dns <address>] [-dhcp <address>]]\n", stderr);
 }
 
 static bool parse_options(host_context_t* context, int argc, char** argv) {
@@ -529,6 +618,12 @@ static bool parse_options(host_context_t* context, int argc, char** argv) {
         return false;
       }
       context->has_gateway = true;
+    } else if (strcmpi(argv[i], "-dns") == 0) {
+      if (context->has_dns_server || !ipv4_parse_address(argv[i + 1], &context->dns_server)) return false;
+      context->has_dns_server = true;
+    } else if (strcmpi(argv[i], "-dhcp") == 0) {
+      if (context->has_dhcp_server || !ipv4_parse_address(argv[i + 1], &context->dhcp_server)) return false;
+      context->has_dhcp_server = true;
     } else {
       return false;
     }
@@ -592,6 +687,41 @@ static void command_rarp(void* context_argument, char* argument) {
   }
 }
 
+static void command_dhcp(void* context_argument, char* arguments) {
+  host_context_t* context = context_argument;
+  dhcp_message_t message = {0};
+  if (!cmd_app_arguments_empty(arguments)) {
+    fputs("Usage: dhcp\n", stderr);
+  } else if (context->has_ip4) {
+    fputs("DHCP requires a host without an IPv4 address.\n", stderr);
+  } else if (!context->has_dhcp_server) {
+    fputs("No DHCP server was configured with -dhcp.\n", stderr);
+  } else {
+    context->dhcp_transaction_id = ++context->next_transaction_id;
+    if (dhcp_write_client_message(DHCP_MESSAGE_DISCOVER, context->dhcp_transaction_id, context->mac, 0, 0, &message) && write_dhcp_message(context, &message)) fputs("Sent DHCP DISCOVER.\n", stdout);
+  }
+}
+
+static void command_dns(void* context_argument, char* arguments) {
+  host_context_t* context = context_argument;
+  dns_message_t message = {0};
+  host_pending_packet_t pending = {.type = HOST_PENDING_DNS, .src_port = DNS_UDP_PORT, .dst_port = DNS_UDP_PORT};
+  if (!context->has_ip4) {
+    fputs("DNS requires an IPv4 address.\n", stderr);
+  } else if (!context->has_dns_server) {
+    fputs("No DNS server was configured with -dns or DHCP.\n", stderr);
+  } else if (!dns_write_query(++context->next_transaction_id, arguments, &message)) {
+    fputs("Usage: dns <name>\n", stderr);
+  } else {
+    context->dns_transaction_id = message.transaction_id;
+    context->dns_pending_packet.active = false;
+    pending.destination = context->dns_server;
+    memcpy(pending.data, &message, sizeof(message));
+    pending.data_length = sizeof(message);
+    command_transport(context, &pending);
+  }
+}
+
 static void command_ping(void* context_argument, char* argument) {
   host_context_t* context = context_argument;
   ipv4_address_t destination = 0;
@@ -599,7 +729,18 @@ static void command_ping(void* context_argument, char* argument) {
   if (!context->has_ip4) {
     fputs("Ping requires an IPv4 address.\n", stderr);
   } else if (!ipv4_parse_address(argument, &destination)) {
-    fputs("Usage: ping <ip-address>\n", stderr);
+    dns_message_t query = {0};
+    host_pending_packet_t dns_pending = {.type = HOST_PENDING_DNS, .destination = context->dns_server, .src_port = DNS_UDP_PORT, .dst_port = DNS_UDP_PORT};
+    if (!context->has_dns_server || !dns_write_query(++context->next_transaction_id, argument, &query)) {
+      fputs("Usage: ping <ip-address|dns-name>\n", stderr);
+      return;
+    }
+    context->dns_transaction_id = query.transaction_id;
+    context->dns_pending_packet = (host_pending_packet_t) {.type = HOST_PENDING_PING, .active = true};
+    memcpy(dns_pending.data, &query, sizeof(query));
+    dns_pending.data_length = sizeof(query);
+    command_transport(context, &dns_pending);
+    return;
   } else if (!route_next_hop(context, destination, &next_hop)) {
     fputs("Destination is outside the local subnet and no default gateway is configured.\n", stderr);
   } else {
@@ -838,7 +979,7 @@ int main(int argc, char** argv) {
     return EXIT_FAILURE;
   }
 
-  if (!cmd_app_register(&context.commands, "info", "Show host, routes, ARP cache, and learned devices.", command_info, &context) || !cmd_app_register(&context.commands, "arp", "Resolve the local destination or next-hop gateway.", command_arp, &context) || !cmd_app_register(&context.commands, "arp-delete", "Remove one learned ARP neighbor.", command_arp_delete, &context) || !cmd_app_register(&context.commands, "rarp", "Request an IPv4 address for this host MAC.", command_rarp, &context) || !cmd_app_register(&context.commands, "ping", "Send an ICMP Echo Request after ARP resolution.", command_ping, &context) || !cmd_app_register(&context.commands, "udp", "Send a UDP datagram after ARP resolution.", command_udp, &context) || !cmd_app_register(&context.commands, "tcp", "Send a base-header TCP segment after ARP resolution.", command_tcp, &context) || !cmd_app_register(&context.commands, "socket", "Control virtual TCP and UDP sockets.", command_socket, &context) || !cmd_app_start(&context.commands)) {
+  if (!cmd_app_register(&context.commands, "info", "Show host, routes, ARP cache, and learned devices.", command_info, &context) || !cmd_app_register(&context.commands, "arp", "Resolve the local destination or next-hop gateway.", command_arp, &context) || !cmd_app_register(&context.commands, "arp-delete", "Remove one learned ARP neighbor.", command_arp_delete, &context) || !cmd_app_register(&context.commands, "rarp", "Request an IPv4 address for this host MAC.", command_rarp, &context) || !cmd_app_register(&context.commands, "dhcp", "Broadcast DHCP DISCOVER for IPv4 configuration.", command_dhcp, &context) || !cmd_app_register(&context.commands, "dns", "Query the configured DNS server for an IPv4 address.", command_dns, &context) || !cmd_app_register(&context.commands, "ping", "Send an ICMP Echo Request after ARP resolution.", command_ping, &context) || !cmd_app_register(&context.commands, "udp", "Send a UDP datagram after ARP resolution.", command_udp, &context) || !cmd_app_register(&context.commands, "tcp", "Send a base-header TCP segment after ARP resolution.", command_tcp, &context) || !cmd_app_register(&context.commands, "socket", "Control virtual TCP and UDP sockets.", command_socket, &context) || !cmd_app_start(&context.commands)) {
     fputs("Could not start the command application.\n", stderr);
     cmd_app_stop(&context.commands);
     thread_join(&thread);
