@@ -4,6 +4,7 @@ OSI/ISO layer: Layer 3; it routes IPv4 packets and resolves each egress next hop
 */
 
 #include <arp.h>
+#include <bgp.h>
 #include <arp_table.h>
 #include <cmd_app.h>
 #include <ethernet.h>
@@ -17,6 +18,7 @@ OSI/ISO layer: Layer 3; it routes IPv4 packets and resolves each egress next hop
 #include <rarp_table.h>
 #include <rip.h>
 #include <route_table.h>
+#include <socket.h>
 #include <udp.h>
 
 #include <signal.h>
@@ -34,6 +36,7 @@ OSI/ISO layer: Layer 3; it routes IPv4 packets and resolves each egress next hop
 #define ROUTER_ARP_CAPACITY       256
 #define ROUTER_RARP_CAPACITY      128
 #define ROUTER_PENDING_CAPACITY   64
+#define ROUTER_BGP_PEER_CAPACITY  16
 #define ROUTER_BUFFER_SIZE        8192
 #define SLEEP_INTERVAL_MS         5
 #define RIP_ROUTE_TIMEOUT_SECONDS 180
@@ -64,6 +67,28 @@ typedef struct router_pending_packet {
   bool active;
 } router_pending_packet_t;
 
+typedef struct router_context router_context_t;
+
+typedef struct router_socket_emit_argument {
+  router_context_t* context;
+  size_t interface_index;
+} router_socket_emit_argument_t;
+
+typedef struct router_bgp_peer {
+  ipv4_address_t address;
+  uint16_t local_as;
+  uint16_t remote_as;
+  size_t interface_index;
+  socket_handle_t socket;
+  uint32_t last_attempt;
+  uint32_t last_received;
+  uint32_t last_keepalive;
+  bool active;
+  bool open_sent;
+  bool open_received;
+  bool established;
+} router_bgp_peer_t;
+
 typedef struct router_context {
   interface_entry_t interface_entries[ROUTER_INTERFACE_CAPACITY];
   route_entry_t route_entries[ROUTER_ROUTE_CAPACITY];
@@ -75,6 +100,11 @@ typedef struct router_context {
   arp_table_t arp;
   rarp_table_t rarp;
   router_port_t ports[ROUTER_INTERFACE_CAPACITY];
+  socket_context_t sockets[ROUTER_INTERFACE_CAPACITY];
+  router_socket_emit_argument_t socket_arguments[ROUTER_INTERFACE_CAPACITY];
+  socket_handle_t bgp_listeners[ROUTER_INTERFACE_CAPACITY];
+  router_bgp_peer_t bgp_peers[ROUTER_BGP_PEER_CAPACITY];
+  size_t bgp_peer_count;
   router_dynamic_routing_mode_t dynamic_routing;
   uint32_t next_rip_update;
   uint32_t next_ospf_update;
@@ -86,6 +116,9 @@ static cmd_app_t* command_app;
 
 static const mac_address_t rip_multicast_mac = {0x01, 0x00, 0x5E, 0x00, 0x00, 0x09};
 static const mac_address_t ospf_multicast_mac = {0x01, 0x00, 0x5E, 0x00, 0x00, 0x05};
+
+static bool router_socket_emit(void* argument, ipv4_address_t destination, uint8_t protocol, const uint8_t* payload, uint16_t payload_length);
+static router_bgp_peer_t* find_bgp_peer(router_context_t* context, size_t interface_index, ipv4_address_t address);
 
 static const char* dynamic_routing_name(router_dynamic_routing_mode_t mode) {
   switch (mode) {
@@ -107,7 +140,7 @@ static void handle_signal(int sig) {
 }
 
 static void print_usage(void) {
-  fputs("Usage: router -i <file> <mac-address> <ip-address> <mask> [... ] [-r <network> <mask> <next-hop|direct> <interface> <metric> [...]] [-rarp <client-mac> <ip-address> [...]] [-dynamic-routing <off|rip|ospf>]\n", stderr);
+  fputs("Usage: router -i <file> <mac-address> <ip-address> <mask> [... ] [-r <network> <mask> <next-hop|direct> <interface> <metric> [...]] [-bgp <active|passive> <interface> <peer-ip> <local-as> <peer-as> [...]] [-rarp <client-mac> <ip-address> [...]] [-dynamic-routing <off|rip|ospf>]\n", stderr);
 }
 
 static bool append_frame(router_context_t* context, size_t interface_index, const ethernet_frame_data_t* frame) {
@@ -304,6 +337,38 @@ static bool forward_ipv4(router_context_t* context, size_t interface_index, cons
   return append_frame(context, interface_index, &frame);
 }
 
+static bool router_socket_emit(void* argument, ipv4_address_t destination, uint8_t protocol, const uint8_t* payload, uint16_t payload_length) {
+  router_socket_emit_argument_t* emit = argument;
+  if (!emit || !emit->context || !payload || !payload_length) return false;
+  router_context_t* context = emit->context;
+  const route_entry_t* route = route_table_lookup(&context->routes, destination);
+  if (!route || route->interface_index != emit->interface_index) return false;
+  const interface_entry_t* entry = interface_table_get(&context->interfaces, route->interface_index);
+  if (!entry || !entry->enabled) return false;
+  const ipv4_address_t next_hop = route->next_hop ? route->next_hop : destination;
+  const arp_entry_t* neighbor = arp_table_find(&context->arp, route->interface_index, next_hop);
+  if (!neighbor) {
+    write_arp_request(context, route->interface_index, next_hop);
+    return false;
+  }
+  ipv4_packet_data_t packet = {
+      .src_addr = entry->ip4,
+      .dst_addr = destination,
+      .protocol = protocol,
+      .data = payload,
+      .data_length = payload_length,
+  };
+  memcpy(packet.src_mac_addr, entry->mac, sizeof(packet.src_mac_addr));
+  memcpy(packet.dst_mac_addr, neighbor->mac, sizeof(packet.dst_mac_addr));
+  router_port_t* port = &context->ports[route->interface_index];
+  const long before = ftell(port->destination);
+  if (before < 0 || !ipv4_write_ethernet_packet(port->destination, &packet)) return false;
+  const long after = ftell(port->destination);
+  if (after < before || fflush(port->destination) != 0) return false;
+  port->injected_bytes += (size_t)(after - before);
+  return true;
+}
+
 static bool queue_packet(router_context_t* context, size_t egress_interface, ipv4_address_t next_hop, const ipv4_packet_view_t* packet) {
   for (size_t i = 0; i < ROUTER_PENDING_CAPACITY; ++i) {
     router_pending_packet_t* pending = &context->pending_packets[i];
@@ -325,8 +390,9 @@ static bool route_ipv4(router_context_t* context, size_t ingress_interface, cons
     fputs("Dropped IPv4 packet with expired TTL.\n", stderr);
     return true;
   }
-  if (interface_table_find_ip4(&context->interfaces, packet->header.dst_addr)) {
-    return true;
+  const interface_entry_t* local = interface_table_find_ip4(&context->interfaces, packet->header.dst_addr);
+  if (local) {
+    return packet->header.protocol != SOCKET_PROTOCOL_TCP || socket_receive_ipv4(&context->sockets[ingress_interface], packet);
   }
   const route_entry_t* route = route_table_lookup(&context->routes, packet->header.dst_addr);
   fputs("Router IPv4: src=", stdout);
@@ -443,6 +509,141 @@ static bool handle_ospf(router_context_t* context, size_t ingress_interface, con
   return true;
 }
 
+static router_bgp_peer_t* find_bgp_peer(router_context_t* context, size_t interface_index, ipv4_address_t address) {
+  for (size_t i = 0; i < context->bgp_peer_count; ++i) {
+    router_bgp_peer_t* peer = &context->bgp_peers[i];
+    if (peer->interface_index == interface_index && peer->address == address) return peer;
+  }
+  return NULL;
+}
+
+static bool bgp_send_open(router_context_t* context, router_bgp_peer_t* peer) {
+  uint8_t bytes[sizeof(bgp_open_t)] = {0};
+  uint16_t length = 0;
+  const interface_entry_t* entry = interface_table_get(&context->interfaces, peer->interface_index);
+  if (!entry || !bgp_write_open(peer->local_as, entry->ip4, bytes, sizeof(bytes), &length) || !socket_send(&context->sockets[peer->interface_index], peer->socket, bytes, length)) return false;
+  peer->open_sent = true;
+  return true;
+}
+
+static bool bgp_send_keepalive(router_context_t* context, router_bgp_peer_t* peer, uint32_t now) {
+  uint8_t bytes[BGP_HEADER_LENGTH] = {0};
+  uint16_t length = 0;
+  if (!bgp_write_keepalive(bytes, sizeof(bytes), &length) || !socket_send(&context->sockets[peer->interface_index], peer->socket, bytes, length)) return false;
+  peer->last_keepalive = now;
+  return true;
+}
+
+static bool bgp_advertise_routes(router_context_t* context, router_bgp_peer_t* peer) {
+  const interface_entry_t* entry = interface_table_get(&context->interfaces, peer->interface_index);
+  if (!entry) return false;
+  for (size_t i = 0; i < context->routes.count; ++i) {
+    const route_entry_t* route = &context->routes.entries[i];
+    if (route->source != ROUTE_SOURCE_CONNECTED && route->source != ROUTE_SOURCE_STATIC) continue;
+    uint8_t bytes[BGP_MAX_MESSAGE_LENGTH] = {0};
+    uint16_t length = 0;
+    if (!bgp_write_update(route->destination, route->mask, entry->ip4, peer->local_as, bytes, sizeof(bytes), &length) || !socket_send(&context->sockets[peer->interface_index], peer->socket, bytes, length)) return false;
+  }
+  return true;
+}
+
+static bool bgp_receive_messages(router_context_t* context, router_bgp_peer_t* peer, uint32_t now) {
+  uint8_t bytes[SOCKET_RECEIVE_CAPACITY] = {0};
+  const size_t byte_count = socket_receive(&context->sockets[peer->interface_index], peer->socket, bytes, sizeof(bytes), NULL, NULL);
+  for (size_t offset = 0; offset < byte_count;) {
+    bgp_message_view_t message = {0};
+    if (!bgp_parse_message(bytes + offset, byte_count - offset, &message)) return false;
+    peer->last_received = now;
+    if (message.header.type == BGP_MESSAGE_OPEN) {
+      const bgp_open_t* open = (const bgp_open_t*)(bytes + offset);
+      if (open->autonomous_system != peer->remote_as || !open->hold_time) return false;
+      peer->open_received = true;
+      if (!peer->open_sent && !bgp_send_open(context, peer)) return false;
+      if (!bgp_send_keepalive(context, peer, now)) return false;
+    } else if (message.header.type == BGP_MESSAGE_KEEPALIVE) {
+      if (!peer->open_sent || !peer->open_received) return false;
+      if (!peer->established) {
+        peer->established = true;
+        fputs("BGP established with ", stdout);
+        ipv4_address_print(stdout, peer->address);
+        fputs(".\n", stdout);
+        if (!bgp_advertise_routes(context, peer)) return false;
+      }
+    } else if (message.header.type == BGP_MESSAGE_UPDATE) {
+      bgp_update_t update = {0};
+      if (!peer->established || !bgp_parse_update(&message, &update) || update.autonomous_system != peer->remote_as || update.next_hop != peer->address || !route_table_learn_bgp(&context->routes, update.network, update.mask, peer->address, peer->interface_index, 0)) return false;
+      fputs("Learned BGP route ", stdout);
+      ipv4_address_print(stdout, update.network);
+      fputs("/", stdout);
+      ipv4_address_print(stdout, update.mask);
+      fputs(" from ", stdout);
+      ipv4_address_print(stdout, peer->address);
+      fputs(".\n", stdout);
+    } else {
+      return false;
+    }
+    offset += message.header.length;
+  }
+  return true;
+}
+
+static bool bgp_tick(router_context_t* context, uint32_t now) {
+  for (size_t interface_index = 0; interface_index < context->interfaces.count; ++interface_index) {
+    socket_context_t* sockets = &context->sockets[interface_index];
+    socket_handle_t listener = context->bgp_listeners[interface_index];
+    if (listener) {
+      socket_handle_t connection = SOCKET_INVALID_HANDLE;
+      while (socket_accept(sockets, listener, &connection)) {
+        const socket_entry_t* socket = socket_get(sockets, connection);
+        router_bgp_peer_t* peer = socket ? find_bgp_peer(context, interface_index, socket->remote_address) : NULL;
+        if (!peer || peer->active || peer->socket) {
+          socket_close(sockets, connection);
+        } else {
+          peer->socket = connection;
+          peer->last_received = now;
+        }
+      }
+    }
+  }
+  for (size_t i = 0; i < context->bgp_peer_count; ++i) {
+    router_bgp_peer_t* peer = &context->bgp_peers[i];
+    socket_context_t* sockets = &context->sockets[peer->interface_index];
+    const socket_entry_t* socket = peer->socket ? socket_get(sockets, peer->socket) : NULL;
+    if (socket && socket->state == SOCKET_STATE_CLOSE_WAIT) {
+      route_table_remove_bgp_peer(&context->routes, peer->address, peer->interface_index);
+      socket_close(sockets, peer->socket);
+      peer->socket = SOCKET_INVALID_HANDLE;
+      peer->open_sent = peer->open_received = peer->established = false;
+      socket = NULL;
+    }
+    if (peer->active && !socket && peer->last_attempt != now) {
+      peer->last_attempt = now;
+      if (socket_open(sockets, SOCKET_PROTOCOL_TCP, &peer->socket) && socket_connect(sockets, peer->socket, peer->address, BGP_TCP_PORT)) peer->last_received = now;
+      else {
+        if (peer->socket) socket_close(sockets, peer->socket);
+        peer->socket = SOCKET_INVALID_HANDLE;
+      }
+      socket = peer->socket ? socket_get(sockets, peer->socket) : NULL;
+    }
+    if (!socket) continue;
+    if (socket->state == SOCKET_STATE_ESTABLISHED) {
+      if (!peer->open_sent && !bgp_send_open(context, peer)) return false;
+      if (!bgp_receive_messages(context, peer, now)) return false;
+      if (peer->established && now - peer->last_keepalive >= BGP_KEEPALIVE_SECONDS && !bgp_send_keepalive(context, peer, now)) return false;
+      if (peer->last_received && now - peer->last_received >= BGP_HOLD_TIME_SECONDS) {
+        route_table_remove_bgp_peer(&context->routes, peer->address, peer->interface_index);
+        socket_close(sockets, peer->socket);
+        peer->socket = SOCKET_INVALID_HANDLE;
+        peer->open_sent = peer->open_received = peer->established = false;
+      }
+    }
+  }
+  for (size_t i = 0; i < context->interfaces.count; ++i) {
+    if (!socket_tick(&context->sockets[i], now)) return false;
+  }
+  return true;
+}
+
 static bool handle_ethernet(router_context_t* context, size_t ingress_interface, const uint8_t* bytes, size_t byte_count) {
   ethernet_frame_view_t frame = {0};
   if (!ethernet_parse_frame(bytes, byte_count, &frame) || frame.format != ETHERNET_FRAME_FORMAT_II) return true;
@@ -526,6 +727,13 @@ static void print_info(router_context_t* context) {
     else
       fputs("direct", stdout);
     fprintf(stdout, " dev %zu metric %u %s\n", route->interface_index + 1, route->metric, route_source_name(route->source));
+  }
+  fprintf(stdout, "BGP peers (%zu):\n", context->bgp_peer_count);
+  for (size_t i = 0; i < context->bgp_peer_count; ++i) {
+    const router_bgp_peer_t* peer = &context->bgp_peers[i];
+    fputs("  ", stdout);
+    ipv4_address_print(stdout, peer->address);
+    fprintf(stdout, "  dev %zu  AS %u -> %u  %s  %s\n", peer->interface_index + 1, peer->local_as, peer->remote_as, peer->active ? "active" : "passive", peer->established ? "established" : "idle");
   }
   fprintf(stdout, "ARP neighbors (%zu):\n", context->arp.count);
   for (size_t i = 0; i < context->arp.count; ++i) {
@@ -724,6 +932,21 @@ static bool parse_options(router_context_t* context, int argc, char** argv) {
       if (i + 1 >= argc || (strcmpi(argv[i + 1], "off") != 0 && strcmpi(argv[i + 1], "rip") != 0 && strcmpi(argv[i + 1], "ospf") != 0)) return false;
       context->dynamic_routing = strcmpi(argv[i + 1], "rip") == 0 ? ROUTER_DYNAMIC_ROUTING_RIP : strcmpi(argv[i + 1], "ospf") == 0 ? ROUTER_DYNAMIC_ROUTING_OSPF : ROUTER_DYNAMIC_ROUTING_OFF;
       i += 2;
+    } else if (strcmpi(argv[i], "-bgp") == 0) {
+      if (i + 5 >= argc || context->bgp_peer_count == ROUTER_BGP_PEER_CAPACITY) return false;
+      uint16_t interface_number = 0;
+      uint16_t local_as = 0;
+      uint16_t remote_as = 0;
+      ipv4_address_t address = 0;
+      if ((strcmpi(argv[i + 1], "active") != 0 && strcmpi(argv[i + 1], "passive") != 0) || !cmd_app_parse_uint16(argv[i + 2], &interface_number) || interface_number == 0 || interface_number > context->interfaces.count || !ipv4_parse_address(argv[i + 3], &address) || !cmd_app_parse_uint16(argv[i + 4], &local_as) || !cmd_app_parse_uint16(argv[i + 5], &remote_as) || !local_as || !remote_as || local_as == remote_as || find_bgp_peer(context, interface_number - 1, address)) return false;
+      context->bgp_peers[context->bgp_peer_count++] = (router_bgp_peer_t) {
+          .address = address,
+          .local_as = local_as,
+          .remote_as = remote_as,
+          .interface_index = interface_number - 1,
+          .active = strcmpi(argv[i + 1], "active") == 0,
+      };
+      i += 6;
     } else if (strcmpi(argv[i], "-rarp") == 0) {
       if (i + 2 >= argc || context->rarp.count == ROUTER_RARP_CAPACITY) return false;
       mac_address_t mac = {0};
@@ -764,6 +987,23 @@ int main(int argc, char** argv) {
     port->destination = fopen(context.interfaces.entries[i].path, "ab");
     if (!port->source || !port->destination || fseek(port->source, 0, SEEK_END) != 0) {
       fprintf(stderr, "Could not open router interface %zu.\n", i + 1);
+      status = EXIT_FAILURE;
+      goto cleanup;
+    }
+  }
+  for (size_t i = 0; i < context.interfaces.count; ++i) {
+    context.socket_arguments[i] = (router_socket_emit_argument_t){.context = &context, .interface_index = i};
+    if (!socket_context_init(&context.sockets[i], context.interfaces.entries[i].ip4, router_socket_emit, &context.socket_arguments[i])) {
+      fputs("Could not initialize router socket context.\n", stderr);
+      status = EXIT_FAILURE;
+      goto cleanup;
+    }
+  }
+  for (size_t i = 0; i < context.bgp_peer_count; ++i) {
+    const router_bgp_peer_t* peer = &context.bgp_peers[i];
+    socket_handle_t* listener = &context.bgp_listeners[peer->interface_index];
+    if (!peer->active && !*listener && (!socket_open(&context.sockets[peer->interface_index], SOCKET_PROTOCOL_TCP, listener) || !socket_bind(&context.sockets[peer->interface_index], *listener, BGP_TCP_PORT) || !socket_listen(&context.sockets[peer->interface_index], *listener))) {
+      fputs("Could not listen for BGP peers.\n", stderr);
       status = EXIT_FAILURE;
       goto cleanup;
     }
@@ -846,6 +1086,12 @@ int main(int argc, char** argv) {
         goto cleanup;
       }
       clearerr(port->source);
+    }
+    if (!bgp_tick(&context, router_now())) {
+      mutex_unlock(&context.mutex);
+      fputs("Could not advance BGP sessions.\n", stderr);
+      status = EXIT_FAILURE;
+      goto cleanup;
     }
     for (size_t i = 0; i < context.interfaces.count; ++i) {
       router_port_t* port = &context.ports[i];

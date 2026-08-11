@@ -61,7 +61,7 @@ bool socket_open(socket_context_t* context, socket_protocol_t protocol, socket_h
 bool socket_close(socket_context_t* context, socket_handle_t handle) {
   socket_entry_t* entry = socket_find(context, handle);
   if (!entry) return false;
-  if (entry->protocol == SOCKET_PROTOCOL_TCP && !socket_tcp_close(context, handle)) return false;
+  if (entry->protocol == SOCKET_PROTOCOL_TCP && entry->state == SOCKET_STATE_ESTABLISHED && !socket_tcp_close(context, handle)) return false;
   memset(entry, 0, sizeof(*entry));
   return true;
 }

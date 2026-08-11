@@ -66,7 +66,12 @@ bool socket_tcp_connect(socket_context_t* context, socket_handle_t handle, ipv4_
   entry->send_sequence = 1;
   entry->state = SOCKET_STATE_SYN_SENT;
   const uint32_t sequence_number = entry->send_sequence++;
-  return tcp_emit(context, entry, sequence_number, TCP_FLAG_SYN, NULL, 0);
+  if (tcp_emit(context, entry, sequence_number, TCP_FLAG_SYN, NULL, 0)) return true;
+  entry->remote_address = 0;
+  entry->remote_port = 0;
+  entry->send_sequence = 0;
+  entry->state = SOCKET_STATE_BOUND;
+  return false;
 }
 
 bool socket_tcp_listen(socket_context_t* context, socket_handle_t handle) {
