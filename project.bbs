@@ -8,7 +8,7 @@ targets(
     output(connect)
     stdver(c17)
     include_dirs(src/lib src/protocol src/tables src/targets)
-    units(src/targets/connect.c src/lib/*.c src/protocol/*.c src/tables/*.c)
+    units(src/targets/connect.c src/lib/*.c src/protocol/*.c src/protocol/rip.c src/tables/*.c)
   )
 
   console(
@@ -16,7 +16,7 @@ targets(
     output(host)
     stdver(c17)
     include_dirs(src/lib src/protocol src/tables src/targets)
-    units(src/targets/host.c src/lib/*.c src/protocol/*.c src/tables/*.c)
+    units(src/targets/host.c src/lib/*.c src/protocol/*.c src/protocol/rip.c src/tables/*.c)
   )
 
   console(
@@ -24,7 +24,7 @@ targets(
     output(hub)
     stdver(c17)
     include_dirs(src/lib src/protocol src/tables src/targets)
-    units(src/targets/hub.c src/lib/*.c src/protocol/*.c src/tables/*.c)
+    units(src/targets/hub.c src/lib/*.c src/protocol/*.c src/protocol/rip.c src/tables/*.c)
   )
 
   console(
@@ -32,7 +32,7 @@ targets(
     output(switch)
     stdver(c17)
     include_dirs(src/lib src/protocol src/tables src/targets)
-    units(src/targets/switch.c src/lib/*.c src/protocol/*.c src/tables/*.c)
+    units(src/targets/switch.c src/lib/*.c src/protocol/*.c src/protocol/rip.c src/tables/*.c)
   )
 
   console(
@@ -40,7 +40,7 @@ targets(
     output(router)
     stdver(c17)
     include_dirs(src/lib src/protocol src/tables src/targets)
-    units(src/targets/router.c src/lib/*.c src/protocol/*.c src/tables/*.c)
+    units(src/targets/router.c src/lib/*.c src/protocol/*.c src/protocol/rip.c src/tables/*.c)
   )
 
   console(
@@ -48,6 +48,6 @@ targets(
     output(watch)
     stdver(c17)
     include_dirs(src/lib src/protocol src/tables src/targets)
-    units(src/targets/watch.c src/lib/*.c src/protocol/*.c src/tables/*.c)
+    units(src/targets/watch.c src/lib/*.c src/protocol/*.c src/protocol/rip.c src/tables/*.c)
   )
 )

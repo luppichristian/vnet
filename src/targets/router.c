@@ -14,7 +14,9 @@ OSI/ISO layer: Layer 3; it routes IPv4 packets and resolves each egress next hop
 #include <mutex.h>
 #include <rarp.h>
 #include <rarp_table.h>
+#include <rip.h>
 #include <route_table.h>
+#include <udp.h>
 
 #include <signal.h>
 #include <stdbool.h>
@@ -23,6 +25,7 @@ OSI/ISO layer: Layer 3; it routes IPv4 packets and resolves each egress next hop
 #include <stdlib.h>
 #include <string.h>
 #include <thread.h>
+#include <time.h>
 #include <vnet.h>
 
 #define ROUTER_INTERFACE_CAPACITY 16
@@ -32,6 +35,8 @@ OSI/ISO layer: Layer 3; it routes IPv4 packets and resolves each egress next hop
 #define ROUTER_PENDING_CAPACITY   64
 #define ROUTER_BUFFER_SIZE        8192
 #define SLEEP_INTERVAL_MS         5
+#define RIP_ROUTE_TIMEOUT_SECONDS 180
+#define RIP_UPDATE_INTERVAL_SECONDS 30
 
 typedef struct router_port {
   FILE* source;
@@ -61,11 +66,19 @@ typedef struct router_context {
   arp_table_t arp;
   rarp_table_t rarp;
   router_port_t ports[ROUTER_INTERFACE_CAPACITY];
+  bool dynamic_routing;
+  uint32_t next_rip_update;
   mutex_t mutex;
   cmd_app_t commands;
 } router_context_t;
 
 static cmd_app_t* command_app;
+
+static const mac_address_t rip_multicast_mac = {0x01, 0x00, 0x5E, 0x00, 0x00, 0x09};
+
+static uint32_t router_now(void) {
+  return (uint32_t)time(NULL);
+}
 
 static void handle_signal(int sig) {
   if (sig == SIGINT && command_app) {
@@ -74,7 +87,7 @@ static void handle_signal(int sig) {
 }
 
 static void print_usage(void) {
-  fputs("Usage: router -i <file> <mac-address> <ip-address> <mask> [... ] [-r <network> <mask> <next-hop|direct> <interface> <metric> [...]] [-rarp <client-mac> <ip-address> [...]]\n", stderr);
+  fputs("Usage: router -i <file> <mac-address> <ip-address> <mask> [... ] [-r <network> <mask> <next-hop|direct> <interface> <metric> [...]] [-rarp <client-mac> <ip-address> [...]] [-dynamic-routing <on|off>]\n", stderr);
 }
 
 static bool append_frame(router_context_t* context, size_t interface_index, const ethernet_frame_data_t* frame) {
@@ -88,6 +101,68 @@ static bool append_frame(router_context_t* context, size_t interface_index, cons
     return false;
   }
   port->injected_bytes += (size_t)(after - before);
+  return true;
+}
+
+static bool write_rip_packet(router_context_t* context, size_t interface_index, uint8_t command, const rip_route_entry_t* entries, size_t entry_count) {
+  const interface_entry_t* entry = interface_table_get(&context->interfaces, interface_index);
+  if (!entry || !entry->enabled) return false;
+  uint8_t rip_bytes[sizeof(rip_header_t) + RIP_MAX_ENTRIES_PER_PACKET * sizeof(rip_route_entry_t)] = {0};
+  size_t rip_length = 0;
+  if (!rip_write_packet(command, entries, entry_count, rip_bytes, sizeof(rip_bytes), &rip_length)) return false;
+  udp_packet_data_t packet = {
+      .src_addr = entry->ip4,
+      .dst_addr = RIP_MULTICAST_ADDRESS,
+      .src_port = RIP_UDP_PORT,
+      .dst_port = RIP_UDP_PORT,
+      .data = rip_bytes,
+      .data_length = (uint16_t)rip_length,
+  };
+  memcpy(packet.src_mac_addr, entry->mac, sizeof(packet.src_mac_addr));
+  memcpy(packet.dst_mac_addr, rip_multicast_mac, sizeof(packet.dst_mac_addr));
+  router_port_t* port = &context->ports[interface_index];
+  const long before = ftell(port->destination);
+  if (before < 0 || !udp_write_ethernet_packet(port->destination, &packet)) return false;
+  const long after = ftell(port->destination);
+  if (after < before || fflush(port->destination) != 0) return false;
+  port->injected_bytes += (size_t)(after - before);
+  return true;
+}
+
+static bool write_rip_response(router_context_t* context, size_t interface_index) {
+  bool wrote = false;
+  size_t route_index = 0;
+  while (route_index < context->routes.count || !wrote) {
+    rip_route_entry_t entries[RIP_MAX_ENTRIES_PER_PACKET] = {0};
+    size_t entry_count = 0;
+    while (route_index < context->routes.count && entry_count < RIP_MAX_ENTRIES_PER_PACKET) {
+      const route_entry_t* route = &context->routes.entries[route_index++];
+      if (route->source == ROUTE_SOURCE_RIP && route->interface_index == interface_index) continue;
+      entries[entry_count++] = (rip_route_entry_t) {
+          .address_family = RIP_ADDRESS_FAMILY_IPV4,
+          .destination = route->destination,
+          .subnet_mask = route->mask,
+          .next_hop = 0,
+          .metric = route->metric == 0 ? RIP_METRIC_MIN : route->metric > RIP_METRIC_INFINITY ? RIP_METRIC_INFINITY : route->metric,
+      };
+    }
+    if (!write_rip_packet(context, interface_index, RIP_COMMAND_RESPONSE, entries, entry_count)) return false;
+    wrote = true;
+  }
+  return true;
+}
+
+static bool write_rip_updates(router_context_t* context) {
+  for (size_t i = 0; i < context->interfaces.count; ++i) {
+    if (!write_rip_response(context, i)) return false;
+  }
+  return true;
+}
+
+static bool write_rip_requests(router_context_t* context) {
+  for (size_t i = 0; i < context->interfaces.count; ++i) {
+    if (!write_rip_packet(context, i, RIP_COMMAND_REQUEST, NULL, 0)) return false;
+  }
   return true;
 }
 
@@ -277,6 +352,26 @@ static bool handle_rarp(router_context_t* context, size_t ingress_interface, con
   return true;
 }
 
+static bool handle_rip(router_context_t* context, size_t ingress_interface, const ipv4_packet_view_t* ipv4_packet) {
+  const interface_entry_t* ingress = interface_table_get(&context->interfaces, ingress_interface);
+  if (!context->dynamic_routing || !ingress || ipv4_packet->header.src_addr == ingress->ip4 || ipv4_packet->header.protocol != UDP_IPV4_PROTOCOL || !rip_is_multicast_address(ipv4_packet->header.dst_addr)) return true;
+  udp_packet_view_t udp_packet = {0};
+  rip_packet_view_t rip_packet = {0};
+  if (!udp_parse_packet(ipv4_packet->payload, ipv4_packet->payload_length, ipv4_packet->header.src_addr, ipv4_packet->header.dst_addr, &udp_packet) || udp_packet.header.src_port != RIP_UDP_PORT || udp_packet.header.dst_port != RIP_UDP_PORT || !rip_parse_packet(udp_packet.data, udp_packet.data_length, &rip_packet)) return true;
+  if (rip_packet.header.command == RIP_COMMAND_REQUEST) {
+    return write_rip_response(context, ingress_interface);
+  }
+  const uint32_t expires_at = router_now() + RIP_ROUTE_TIMEOUT_SECONDS;
+  for (size_t i = 0; i < rip_packet.entry_count; ++i) {
+    const rip_route_entry_t* advertised = &rip_packet.entries[i];
+    const uint32_t metric = advertised->metric == RIP_METRIC_INFINITY ? RIP_METRIC_INFINITY : advertised->metric + 1;
+    const ipv4_address_t next_hop = advertised->next_hop ? advertised->next_hop : ipv4_packet->header.src_addr;
+    if (!route_table_learn_rip(&context->routes, advertised->destination, advertised->subnet_mask, next_hop, ingress_interface, metric, expires_at)) return false;
+  }
+  fprintf(stdout, "Learned %zu RIP route%s on interface %zu.\n", rip_packet.entry_count, rip_packet.entry_count == 1 ? "" : "s", ingress_interface + 1);
+  return true;
+}
+
 static bool handle_ethernet(router_context_t* context, size_t ingress_interface, const uint8_t* bytes, size_t byte_count) {
   ethernet_frame_view_t frame = {0};
   if (!ethernet_parse_frame(bytes, byte_count, &frame) || frame.format != ETHERNET_FRAME_FORMAT_II) return true;
@@ -288,11 +383,14 @@ static bool handle_ethernet(router_context_t* context, size_t ingress_interface,
   ethernet_mac_print(stdout, frame.header.src_mac);
   fprintf(stdout, " EtherType=0x%04X\n", frame.header.type_or_length);
   const bool destination_is_interface = memcmp(frame.header.dst_mac, entry->mac, sizeof(entry->mac)) == 0;
+  const bool destination_is_rip_multicast = memcmp(frame.header.dst_mac, rip_multicast_mac, sizeof(rip_multicast_mac)) == 0;
   if (frame.header.type_or_length == ETHERNET_ETHERTYPE_ARP && (destination_is_interface || ethernet_mac_is_broadcast(frame.header.dst_mac))) return handle_arp(context, ingress_interface, &frame);
   if (frame.header.type_or_length == ETHERNET_ETHERTYPE_RARP && (destination_is_interface || ethernet_mac_is_broadcast(frame.header.dst_mac))) return handle_rarp(context, ingress_interface, &frame);
-  if (frame.header.type_or_length != ETHERNET_ETHERTYPE_IPV4 || !destination_is_interface) return true;
+  if (frame.header.type_or_length != ETHERNET_ETHERTYPE_IPV4 || (!destination_is_interface && !destination_is_rip_multicast)) return true;
   ipv4_packet_view_t packet = {0};
-  return ipv4_parse_packet(frame.data, frame.client_data_length, &packet) && route_ipv4(context, ingress_interface, &packet);
+  if (!ipv4_parse_packet(frame.data, frame.client_data_length, &packet)) return true;
+  if (destination_is_rip_multicast) return handle_rip(context, ingress_interface, &packet);
+  return route_ipv4(context, ingress_interface, &packet);
 }
 
 static bool process_port(router_context_t* context, size_t interface_index) {
@@ -331,6 +429,7 @@ static bool process_port(router_context_t* context, size_t interface_index) {
 
 static void print_info(router_context_t* context) {
   mutex_lock(&context->mutex);
+  fprintf(stdout, "Dynamic routing: %s%s\n", context->dynamic_routing ? "on" : "off", context->dynamic_routing ? " (RIP v2)" : "");
   fprintf(stdout, "Interfaces (%zu):\n", context->interfaces.count);
   for (size_t i = 0; i < context->interfaces.count; ++i) {
     const interface_entry_t* entry = &context->interfaces.entries[i];
@@ -353,7 +452,7 @@ static void print_info(router_context_t* context) {
     if (route->next_hop) ipv4_address_print(stdout, route->next_hop);
     else
       fputs("direct", stdout);
-    fprintf(stdout, " dev %zu metric %u\n", route->interface_index + 1, route->metric);
+    fprintf(stdout, " dev %zu metric %u %s\n", route->interface_index + 1, route->metric, route_source_name(route->source));
   }
   fprintf(stdout, "ARP neighbors (%zu):\n", context->arp.count);
   for (size_t i = 0; i < context->arp.count; ++i) {
@@ -416,6 +515,30 @@ static void command_interface(void* argument, char* arguments) {
   interface_table_set_enabled(&context->interfaces, index - 1, strcmpi(state, "up") == 0);
   mutex_unlock(&context->mutex);
   fprintf(stdout, "Interface %u is administratively %s.\n", index, state);
+}
+
+static void command_dynamic_routing(void* argument, char* arguments) {
+  router_context_t* context = argument;
+  char* state = cmd_app_next_argument(&arguments);
+  if (!state || cmd_app_next_argument(&arguments) || (strcmpi(state, "on") != 0 && strcmpi(state, "off") != 0)) {
+    fputs("Usage: dynamic-routing <on|off>\n", stderr);
+    return;
+  }
+  mutex_lock(&context->mutex);
+  const bool enabled = strcmpi(state, "on") == 0;
+  context->dynamic_routing = enabled;
+  if (enabled) {
+    context->next_rip_update = router_now() + RIP_UPDATE_INTERVAL_SECONDS;
+    if (!write_rip_requests(context) || !write_rip_updates(context)) {
+      mutex_unlock(&context->mutex);
+      fputs("Could not start RIP routing updates.\n", stderr);
+      return;
+    }
+  } else {
+    route_table_remove_rip(&context->routes);
+  }
+  mutex_unlock(&context->mutex);
+  fprintf(stdout, "Dynamic routing is %s.\n", enabled ? "on (RIP v2)" : "off");
 }
 
 static void command_route(void* argument, char* arguments) {
@@ -519,6 +642,10 @@ static bool parse_options(router_context_t* context, int argc, char** argv) {
       uint32_t metric = 0;
       if (!ipv4_parse_address(argv[i + 1], &network) || !ipv4_parse_address(argv[i + 2], &mask) || (strcmpi(argv[i + 3], "direct") != 0 && !ipv4_parse_address(argv[i + 3], &next_hop)) || !cmd_app_parse_uint16(argv[i + 4], &interface_number) || interface_number == 0 || interface_number > context->interfaces.count || !cmd_app_parse_uint32(argv[i + 5], &metric) || !route_table_add(&context->routes, network, mask, next_hop, interface_number - 1, metric)) return false;
       i += 6;
+    } else if (strcmpi(argv[i], "-dynamic-routing") == 0) {
+      if (i + 1 >= argc || (strcmpi(argv[i + 1], "on") != 0 && strcmpi(argv[i + 1], "off") != 0)) return false;
+      context->dynamic_routing = strcmpi(argv[i + 1], "on") == 0;
+      i += 2;
     } else if (strcmpi(argv[i], "-rarp") == 0) {
       if (i + 2 >= argc || context->rarp.count == ROUTER_RARP_CAPACITY) return false;
       mac_address_t mac = {0};
@@ -532,7 +659,7 @@ static bool parse_options(router_context_t* context, int argc, char** argv) {
   if (context->interfaces.count < 2) return false;
   for (size_t i = 0; i < context->interfaces.count; ++i) {
     const interface_entry_t* entry = &context->interfaces.entries[i];
-    if (!route_table_add(&context->routes, entry->ip4 & entry->mask, entry->mask, 0, i, 0)) return false;
+    if (!route_table_add_connected(&context->routes, entry->ip4 & entry->mask, entry->mask, i)) return false;
   }
   return true;
 }
@@ -564,12 +691,23 @@ int main(int argc, char** argv) {
     }
   }
   cmd_app_init(&context.commands);
-  if (!cmd_app_register(&context.commands, "info", "Show interfaces, routes, ARP neighbors, and RARP assignments.", command_info, &context) || !cmd_app_register(&context.commands, "arp", "Resolve an IPv4 neighbor on one interface.", command_arp, &context) || !cmd_app_register(&context.commands, "arp-delete", "Remove one learned ARP neighbor.", command_arp_delete, &context) || !cmd_app_register(&context.commands, "interface", "Administratively bring an interface up or down.", command_interface, &context) || !cmd_app_register(&context.commands, "route", "Add or delete a route in the forwarding table.", command_route, &context) || !cmd_app_register(&context.commands, "rarp-table", "Set or delete a static RARP assignment.", command_rarp_table, &context) || !cmd_app_start(&context.commands)) {
+  if (!cmd_app_register(&context.commands, "info", "Show router state, including RIP route sources.", command_info, &context) || !cmd_app_register(&context.commands, "arp", "Resolve an IPv4 neighbor on one interface.", command_arp, &context) || !cmd_app_register(&context.commands, "arp-delete", "Remove one learned ARP neighbor.", command_arp_delete, &context) || !cmd_app_register(&context.commands, "interface", "Administratively bring an interface up or down.", command_interface, &context) || !cmd_app_register(&context.commands, "dynamic-routing", "Enable or disable RIP v2 dynamic routing.", command_dynamic_routing, &context) || !cmd_app_register(&context.commands, "route", "Add or delete a route in the forwarding table.", command_route, &context) || !cmd_app_register(&context.commands, "rarp-table", "Set or delete a static RARP assignment.", command_rarp_table, &context) || !cmd_app_start(&context.commands)) {
     fputs("Could not start the command application.\n", stderr);
     status = EXIT_FAILURE;
     goto cleanup;
   }
   command_app = &context.commands;
+  if (context.dynamic_routing) {
+    context.next_rip_update = router_now() + RIP_UPDATE_INTERVAL_SECONDS;
+    mutex_lock(&context.mutex);
+    const bool started_rip = write_rip_requests(&context) && write_rip_updates(&context);
+    mutex_unlock(&context.mutex);
+    if (!started_rip) {
+      fputs("Could not start RIP routing updates.\n", stderr);
+      status = EXIT_FAILURE;
+      goto cleanup;
+    }
+  }
 
   while (cmd_app_is_running(&context.commands)) {
     long ends[ROUTER_INTERFACE_CAPACITY] = {0};
@@ -582,6 +720,19 @@ int main(int argc, char** argv) {
       }
     }
     mutex_lock(&context.mutex);
+    if (context.dynamic_routing) {
+      const uint32_t now = router_now();
+      route_table_expire_rip(&context.routes, now);
+      if (now >= context.next_rip_update) {
+        if (!write_rip_updates(&context)) {
+          mutex_unlock(&context.mutex);
+          fputs("Could not send RIP routing update.\n", stderr);
+          status = EXIT_FAILURE;
+          goto cleanup;
+        }
+        context.next_rip_update = now + RIP_UPDATE_INTERVAL_SECONDS;
+      }
+    }
     for (size_t i = 0; i < context.interfaces.count; ++i) {
       router_port_t* port = &context.ports[i];
       const long position = ftell(port->source);
