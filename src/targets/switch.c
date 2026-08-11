@@ -6,6 +6,7 @@ OSI/ISO layer: Layer 2 (data link); it learns and forwards by Ethernet MAC addre
 #include <cmd_app.h>
 #include <ethernet.h>
 #include <futils.h>
+#include <fdb_table.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -27,11 +28,6 @@ typedef struct switch_port {
   uint8_t buffer[SWITCH_BUFFER_SIZE];
   size_t buffer_length;
 } switch_port_t;
-
-typedef struct switch_device {
-  mac_address_t mac;
-  size_t port;
-} switch_device_t;
 
 typedef struct switch_context {
   const char* path;
@@ -59,46 +55,6 @@ static void command_info(void* argument, char* arguments) {
   }
 }
 
-static switch_device_t* device_find(switch_device_t* devices, size_t device_count, const mac_address_t mac) {
-  for (size_t i = 0; i < device_count; ++i) {
-    if (memcmp(devices[i].mac, mac, sizeof(devices[i].mac)) == 0) {
-      return &devices[i];
-    }
-  }
-  return NULL;
-}
-
-static void device_remove_port(switch_device_t* devices, size_t* device_count, size_t port) {
-  for (size_t i = 0; i < *device_count;) {
-    if (devices[i].port == port) {
-      devices[i] = devices[--*device_count];
-    } else {
-      ++i;
-    }
-  }
-}
-
-static void device_learn(switch_device_t* devices, size_t* device_count, const mac_address_t mac, size_t port) {
-  if (ethernet_mac_is_group(mac)) {
-    return;
-  }
-  switch_device_t* device = device_find(devices, *device_count, mac);
-  if (device) {
-    device->port = port;
-    return;
-  }
-  if (*device_count == SWITCH_DEVICE_CAPACITY) {
-    fputs("Switch device table is full; cannot learn another MAC address.\n", stderr);
-    return;
-  }
-  device = &devices[(*device_count)++];
-  memcpy(device->mac, mac, sizeof(device->mac));
-  device->port = port;
-  fputs("Learned ", stdout);
-  ethernet_mac_print(stdout, mac);
-  fprintf(stdout, " on port %zu.\n", port + 1);
-}
-
 static bool forward_frame(switch_port_t* ports, size_t port, const uint8_t* bytes, size_t byte_count, size_t* forwarded_bytes) {
   if (fwrite(bytes, 1, byte_count, ports[port].destination) != byte_count || fflush(ports[port].destination) != 0) {
     return false;
@@ -108,12 +64,19 @@ static bool forward_frame(switch_port_t* ports, size_t port, const uint8_t* byte
 }
 
 /* Broadcast, multicast, and unknown unicast are flooded; known unicast uses one learned port. */
-static bool forward_ethernet(switch_port_t* ports, size_t port_count, switch_device_t* devices, size_t* device_count, size_t* forwarded_bytes, size_t ingress_port, const uint8_t* bytes, size_t byte_count) {
+static bool forward_ethernet(switch_port_t* ports, size_t port_count, fdb_table_t* devices, size_t* forwarded_bytes, size_t ingress_port, const uint8_t* bytes, size_t byte_count) {
   ethernet_frame_view_t frame = {0};
   if (!ethernet_parse_frame(bytes, byte_count, &frame)) {
     return true;
   }
-  device_learn(devices, device_count, frame.header.src_mac, ingress_port);
+  const bool known_source = fdb_table_find(devices, frame.header.src_mac) != NULL;
+  if (!fdb_table_learn(devices, frame.header.src_mac, ingress_port) && !ethernet_mac_is_group(frame.header.src_mac)) {
+    fputs("Switch device table is full; cannot learn another MAC address.\n", stderr);
+  } else if (!known_source && !ethernet_mac_is_group(frame.header.src_mac)) {
+    fputs("Learned ", stdout);
+    ethernet_mac_print(stdout, frame.header.src_mac);
+    fprintf(stdout, " on port %zu.\n", ingress_port + 1);
+  }
 
   bool targets[SWITCH_DEVICE_CAPACITY] = {false};
   if (ethernet_mac_is_group(frame.header.dst_mac)) {
@@ -121,7 +84,7 @@ static bool forward_ethernet(switch_port_t* ports, size_t port_count, switch_dev
       targets[i] = i != ingress_port;
     }
   } else {
-    switch_device_t* destination = device_find(devices, *device_count, frame.header.dst_mac);
+    fdb_entry_t* destination = fdb_table_find(devices, frame.header.dst_mac);
     if (destination && destination->port != ingress_port) {
       targets[destination->port] = true;
     } else if (!destination) {
@@ -139,14 +102,14 @@ static bool forward_ethernet(switch_port_t* ports, size_t port_count, switch_dev
   return true;
 }
 
-static void handle_vnet(switch_device_t* devices, size_t* device_count, size_t port, const vnet_frame_header_t* control) {
+static void handle_vnet(fdb_table_t* devices, size_t port, const vnet_frame_header_t* control) {
   if (control->type == VNET_FRAME_CONNECTION_END) {
-    device_remove_port(devices, device_count, port);
+    fdb_table_remove_port(devices, port);
     fprintf(stdout, "Port %zu disconnected; removed its learned devices.\n", port + 1);
   }
 }
 
-static bool process_port(switch_port_t* ports, size_t port_count, switch_device_t* devices, size_t* device_count, size_t* forwarded_bytes, size_t port) {
+static bool process_port(switch_port_t* ports, size_t port_count, fdb_table_t* devices, size_t* forwarded_bytes, size_t port) {
   switch_port_t* source_port = &ports[port];
   size_t offset = 0;
   while (offset < source_port->buffer_length) {
@@ -154,7 +117,7 @@ static bool process_port(switch_port_t* ports, size_t port_count, switch_device_
     vnet_frame_header_t control = {0};
     if (remaining >= sizeof(control) && vnet_parse_frame(source_port->buffer + offset, sizeof(control), &control)) {
       if (strcmpi(control.destination_path, source_port->path) == 0) {
-        handle_vnet(devices, device_count, port, &control);
+        handle_vnet(devices, port, &control);
       }
       offset += sizeof(control);
       continue;
@@ -169,7 +132,7 @@ static bool process_port(switch_port_t* ports, size_t port_count, switch_device_
     }
     ethernet_frame_view_t frame = {0};
     if (ethernet_parse_frame(source_port->buffer + offset, end - offset, &frame)) {
-      if (!forward_ethernet(ports, port_count, devices, device_count, forwarded_bytes, port, source_port->buffer + offset, end - offset)) {
+      if (!forward_ethernet(ports, port_count, devices, forwarded_bytes, port, source_port->buffer + offset, end - offset)) {
         return false;
       }
       offset = end;
@@ -199,17 +162,18 @@ int main(int argc, char** argv) {
     return EXIT_FAILURE;
   }
   switch_port_t* ports = calloc(port_count, sizeof(*ports));
-  switch_device_t* devices = calloc(SWITCH_DEVICE_CAPACITY, sizeof(*devices));
+  fdb_entry_t* device_entries = calloc(SWITCH_DEVICE_CAPACITY, sizeof(*device_entries));
   long* source_ends = calloc(port_count, sizeof(*source_ends));
   size_t* forwarded_bytes = calloc(port_count, sizeof(*forwarded_bytes));
   FILE* switch_destination = NULL;
-  size_t device_count = 0;
+  fdb_table_t devices;
   int status = EXIT_SUCCESS;
-  if (!ports || !devices || !source_ends || !forwarded_bytes) {
+  if (!ports || !device_entries || !source_ends || !forwarded_bytes) {
     fputs("Could not allocate switch state.\n", stderr);
     status = EXIT_FAILURE;
     goto cleanup;
   }
+  fdb_table_init(&devices, device_entries, SWITCH_DEVICE_CAPACITY);
 
   signal(SIGINT, handle_signal);
   for (size_t i = 0; i < port_count; ++i) {
@@ -277,7 +241,7 @@ int main(int argc, char** argv) {
       const size_t read_count = fread(ports[i].buffer + ports[i].buffer_length, 1, requested, ports[i].source);
       if (read_count > 0) {
         ports[i].buffer_length += read_count;
-        if (!process_port(ports, port_count, devices, &device_count, forwarded_bytes, i)) {
+        if (!process_port(ports, port_count, &devices, forwarded_bytes, i)) {
           status = EXIT_FAILURE;
           goto cleanup;
         }
@@ -325,7 +289,7 @@ cleanup:
   if (switch_destination) fclose(switch_destination);
   free(forwarded_bytes);
   free(source_ends);
-  free(devices);
+  free(device_entries);
   free(ports);
   return status;
 }

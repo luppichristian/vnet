@@ -9,6 +9,7 @@ OSI/ISO layer: Layer 2 endpoint; optional IPv4 configuration supplies Layer 3 id
 #include <futils.h>
 #include <icmp.h>
 #include <ipv4.h>
+#include <arp_table.h>
 #include <mutex.h>
 #include <rarp.h>
 
@@ -21,23 +22,13 @@ OSI/ISO layer: Layer 2 endpoint; optional IPv4 configuration supplies Layer 3 id
 #include <thread.h>
 #include <udp.h>
 #include <vnet.h>
+#include <vnet_peer_table.h>
 
 #define HOST_DEVICE_CAPACITY  64
 #define HOST_ARP_CAPACITY     64
 #define HOST_BUFFER_SIZE      8192
 #define HOST_PENDING_DATA_MAX (ETHERNET_MAX_DATA_LEN - sizeof(ipv4_header_t) - sizeof(tcp_header_t))
 #define SLEEP_INTERVAL_MS     5
-
-typedef struct host_device {
-  mac_address_t mac;
-  char path[VNET_PATH_LEN];
-  bool has_mac;
-} host_device_t;
-
-typedef struct host_arp_entry {
-  ipv4_address_t ip4;
-  mac_address_t mac;
-} host_arp_entry_t;
 
 typedef enum host_pending_type {
   HOST_PENDING_NONE,
@@ -73,87 +64,21 @@ typedef struct host_context {
   FILE* source;
   mutex_t mutex;
   cmd_app_t commands;
-  host_device_t devices[HOST_DEVICE_CAPACITY];
-  size_t device_count;
-  host_arp_entry_t arp_entries[HOST_ARP_CAPACITY];
-  size_t arp_count;
+  vnet_peer_entry_t device_entries[HOST_DEVICE_CAPACITY];
+  vnet_peer_table_t devices;
+  arp_entry_t arp_entries[HOST_ARP_CAPACITY];
+  arp_table_t arp;
   host_pending_packet_t pending_packet;
 } host_context_t;
 
+typedef arp_entry_t host_arp_entry_t;
+
+static arp_entry_t* arp_find(host_context_t* context, ipv4_address_t address) {
+  return arp_table_find(&context->arp, 0, address);
+}
+
 static bool ip4_is_local(const host_context_t* context, ipv4_address_t address) {
   return ipv4_addresses_share_subnet(context->ip4, address, context->mask);
-}
-
-static host_device_t* device_find_path(host_context_t* context, const char* path) {
-  for (size_t i = 0; i < context->device_count; ++i) {
-    if (strcmpi(context->devices[i].path, path) == 0) {
-      return &context->devices[i];
-    }
-  }
-  return NULL;
-}
-
-static host_device_t* device_find_mac(host_context_t* context, const mac_address_t mac) {
-  for (size_t i = 0; i < context->device_count; ++i) {
-    if (context->devices[i].has_mac && memcmp(context->devices[i].mac, mac, sizeof(mac_address_t)) == 0) {
-      return &context->devices[i];
-    }
-  }
-  return NULL;
-}
-
-static void device_start(host_context_t* context, const char* path) {
-  if (device_find_path(context, path)) {
-    return;
-  }
-  if (context->device_count == HOST_DEVICE_CAPACITY) {
-    fprintf(stderr, "Device table is full; ignoring '%s'.\n", path);
-    return;
-  }
-  host_device_t* device = &context->devices[context->device_count++];
-  memset(device, 0, sizeof(*device));
-  strncpy(device->path, path, sizeof(device->path) - 1);
-}
-
-static void device_end(host_context_t* context, const char* path) {
-  for (size_t i = 0; i < context->device_count; ++i) {
-    if (strcmpi(context->devices[i].path, path) == 0) {
-      context->devices[i] = context->devices[--context->device_count];
-      return;
-    }
-  }
-}
-
-static void device_learn(host_context_t* context, const mac_address_t mac) {
-  host_device_t* device = device_find_mac(context, mac);
-  if (!device && context->device_count > 0) {
-    device = &context->devices[context->device_count - 1];
-  }
-  if (device) {
-    memcpy(device->mac, mac, sizeof(device->mac));
-    device->has_mac = true;
-  }
-}
-
-static host_arp_entry_t* arp_find(host_context_t* context, ipv4_address_t address) {
-  for (size_t i = 0; i < context->arp_count; ++i) {
-    if (context->arp_entries[i].ip4 == address) {
-      return &context->arp_entries[i];
-    }
-  }
-  return NULL;
-}
-
-static void arp_learn(host_context_t* context, ipv4_address_t address, const mac_address_t mac) {
-  host_arp_entry_t* entry = arp_find(context, address);
-  if (!entry) {
-    if (context->arp_count == HOST_ARP_CAPACITY) {
-      context->arp_entries[0] = context->arp_entries[--context->arp_count];
-    }
-    entry = &context->arp_entries[context->arp_count++];
-    entry->ip4 = address;
-  }
-  memcpy(entry->mac, mac, sizeof(entry->mac));
 }
 
 static bool write_arp_request(host_context_t* context, ipv4_address_t target) {
@@ -334,19 +259,19 @@ static void print_info(host_context_t* context) {
       fputc('\n', stdout);
     }
   }
-  fprintf(stdout, "ARP cache (%zu):\n", context->arp_count);
-  for (size_t i = 0; i < context->arp_count; ++i) {
+  fprintf(stdout, "ARP cache (%zu):\n", context->arp.count);
+  for (size_t i = 0; i < context->arp.count; ++i) {
     fputs("  ", stdout);
-    ipv4_address_print(stdout, context->arp_entries[i].ip4);
+    ipv4_address_print(stdout, context->arp.entries[i].ip4);
     fputs("  ", stdout);
-    ethernet_mac_print(stdout, context->arp_entries[i].mac);
+    ethernet_mac_print(stdout, context->arp.entries[i].mac);
     fputc('\n', stdout);
   }
-  fprintf(stdout, "Devices (%zu):\n", context->device_count);
-  for (size_t i = 0; i < context->device_count; ++i) {
-    fprintf(stdout, "  %-48s ", context->devices[i].path);
-    if (context->devices[i].has_mac) {
-      ethernet_mac_print(stdout, context->devices[i].mac);
+  fprintf(stdout, "Devices (%zu):\n", context->devices.count);
+  for (size_t i = 0; i < context->devices.count; ++i) {
+    fprintf(stdout, "  %-48s ", context->devices.entries[i].path);
+    if (context->devices.entries[i].has_mac) {
+      ethernet_mac_print(stdout, context->devices.entries[i].mac);
     } else {
       fputs("(MAC not learned)", stdout);
     }
@@ -362,10 +287,12 @@ static void handle_vnet(host_context_t* context, const vnet_frame_header_t* fram
   }
   mutex_lock(&context->mutex);
   if (frame->type == VNET_FRAME_CONNECTION_START) {
-    device_start(context, frame->source_path);
+    if (!vnet_peer_table_start(&context->devices, frame->source_path)) {
+      fprintf(stderr, "Device table is full; ignoring '%s'.\n", frame->source_path);
+    }
     fprintf(stdout, "Connected to '%s'.\n", frame->source_path);
   } else {
-    device_end(context, frame->source_path);
+    vnet_peer_table_end(&context->devices, frame->source_path);
     fprintf(stdout, "Disconnected from '%s'.\n", frame->source_path);
   }
   fflush(stdout);
@@ -378,7 +305,7 @@ static void handle_arp(host_context_t* context, const ethernet_frame_view_t* fra
     return;
   }
   mutex_lock(&context->mutex);
-  arp_learn(context, packet.sender_protocol_address, packet.sender_hardware_address);
+  arp_table_learn(&context->arp, 0, packet.sender_protocol_address, packet.sender_hardware_address);
   mutex_unlock(&context->mutex);
 
   if (context->has_ip4 && packet.operation == ARP_OPERATION_REQUEST && packet.target_protocol_address == context->ip4) {
@@ -450,7 +377,7 @@ static void handle_ethernet(host_context_t* context, const uint8_t* bytes, size_
   }
 
   mutex_lock(&context->mutex);
-  device_learn(context, frame.header.src_mac);
+  vnet_peer_table_learn_mac(&context->devices, frame.header.src_mac);
   fputs("Received ", stdout);
   group ? fputs(ethernet_mac_is_broadcast(frame.header.dst_mac) ? "broadcast" : "multicast", stdout) : fputs("unicast", stdout);
   fputs(" frame from ", stdout);
@@ -792,6 +719,8 @@ int main(int argc, char** argv) {
     fclose(context.source);
     return EXIT_FAILURE;
   }
+  vnet_peer_table_init(&context.devices, context.device_entries, HOST_DEVICE_CAPACITY);
+  arp_table_init(&context.arp, context.arp_entries, HOST_ARP_CAPACITY);
   cmd_app_init(&context.commands);
   thread_t thread;
   if (!thread_start(&thread, receiver_thread, &context)) {
