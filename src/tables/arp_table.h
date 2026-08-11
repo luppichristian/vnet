@@ -39,3 +39,6 @@ const arp_entry_t* arp_table_find_const(const arp_table_t* table, size_t interfa
 
 /* Learns or refreshes an ARP mapping, replacing one existing entry when the table is full. */
 void arp_table_learn(arp_table_t* table, size_t interface_index, ipv4_address_t ip4, const mac_address_t mac);
+
+/* Removes one resolved neighbor mapping. Returns false when it is absent. */
+bool arp_table_remove(arp_table_t* table, size_t interface_index, ipv4_address_t ip4);

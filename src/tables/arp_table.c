@@ -39,3 +39,10 @@ void arp_table_learn(arp_table_t* table, size_t interface_index, ipv4_address_t 
   }
   memcpy(entry->mac, mac, sizeof(entry->mac));
 }
+
+bool arp_table_remove(arp_table_t* table, size_t interface_index, ipv4_address_t ip4) {
+  arp_entry_t* entry = arp_table_find(table, interface_index, ip4);
+  if (!entry) return false;
+  *entry = table->entries[--table->count];
+  return true;
+}

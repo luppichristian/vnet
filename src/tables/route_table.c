@@ -40,3 +40,9 @@ const route_entry_t* route_table_lookup(const route_table_t* table, ipv4_address
   }
   return best;
 }
+
+bool route_table_remove(route_table_t* table, size_t index) {
+  if (index >= table->count) return false;
+  table->entries[index] = table->entries[--table->count];
+  return true;
+}

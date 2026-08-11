@@ -33,6 +33,7 @@ typedef struct switch_context {
   const char* path;
   const switch_port_t* ports;
   size_t port_count;
+  fdb_table_t* devices;
 } switch_context_t;
 
 static cmd_app_t* command_app;
@@ -53,6 +54,33 @@ static void command_info(void* argument, char* arguments) {
   for (size_t i = 0; i < context->port_count; ++i) {
     fprintf(stdout, "  %zu: %s\n", i + 1, context->ports[i].path);
   }
+}
+
+static void command_fdb(void* argument, char* arguments) {
+  switch_context_t* context = argument;
+  char* cursor = arguments;
+  char* action = cmd_app_next_argument(&cursor);
+  if (!action || strcmpi(action, "show") == 0) {
+    if (action && cmd_app_next_argument(&cursor)) {
+      fputs("Usage: fdb [show|delete <mac-address>]\n", stderr);
+      return;
+    }
+    fprintf(stdout, "Forwarding database (%zu):\n", context->devices->count);
+    for (size_t i = 0; i < context->devices->count; ++i) {
+      fputs("  ", stdout);
+      ethernet_mac_print(stdout, context->devices->entries[i].mac);
+      fprintf(stdout, "  port %zu (%s)\n", context->devices->entries[i].port + 1, context->ports[context->devices->entries[i].port].path);
+    }
+    return;
+  }
+  char* mac_text = cmd_app_next_argument(&cursor);
+  mac_address_t mac = {0};
+  if (strcmpi(action, "delete") != 0 || !mac_text || cmd_app_next_argument(&cursor) || !ethernet_mac_parse(mac_text, mac)) {
+    fputs("Usage: fdb [show|delete <mac-address>]\n", stderr);
+    return;
+  }
+  const bool removed = fdb_table_remove(context->devices, mac);
+  fputs(removed ? "FDB entry removed.\n" : "No such FDB entry.\n", removed ? stdout : stderr);
 }
 
 static bool forward_frame(switch_port_t* ports, size_t port, const uint8_t* bytes, size_t byte_count, size_t* forwarded_bytes) {
@@ -93,6 +121,24 @@ static bool forward_ethernet(switch_port_t* ports, size_t port_count, fdb_table_
       }
     }
   }
+
+  fputs("Switch frame: ingress=", stdout);
+  fprintf(stdout, "%zu bytes=%zu dst=", ingress_port + 1, byte_count);
+  ethernet_mac_print(stdout, frame.header.dst_mac);
+  fputs(" src=", stdout);
+  ethernet_mac_print(stdout, frame.header.src_mac);
+  if (frame.format == ETHERNET_FRAME_FORMAT_II) fprintf(stdout, " EtherType=0x%04X", frame.header.type_or_length);
+  else
+    fprintf(stdout, " IEEE802.3-length=%u", frame.header.type_or_length);
+  fputs(" egress=", stdout);
+  bool first_target = true;
+  for (size_t i = 0; i < port_count; ++i) {
+    if (targets[i]) {
+      fprintf(stdout, "%s%zu", first_target ? "" : ",", i + 1);
+      first_target = false;
+    }
+  }
+  fputs(first_target ? "drop\n" : "\n", stdout);
 
   for (size_t i = 0; i < port_count; ++i) {
     if (targets[i] && !forward_frame(ports, i, bytes, byte_count, &forwarded_bytes[i])) {
@@ -216,7 +262,7 @@ int main(int argc, char** argv) {
 
   cmd_app_t commands;
   cmd_app_init(&commands);
-  if (!cmd_app_register(&commands, "info", "Show the switch file and connected port files.", command_info, &(switch_context_t) {.path = switch_path, .ports = ports, .port_count = port_count}) || !cmd_app_start(&commands)) {
+  if (!cmd_app_register(&commands, "info", "Show the switch file and connected port files.", command_info, &(switch_context_t) {.path = switch_path, .ports = ports, .port_count = port_count, .devices = &devices}) || !cmd_app_register(&commands, "fdb", "Show or delete learned MAC-to-port mappings.", command_fdb, &(switch_context_t) {.path = switch_path, .ports = ports, .port_count = port_count, .devices = &devices}) || !cmd_app_start(&commands)) {
     fputs("Could not start the command application.\n", stderr);
     status = EXIT_FAILURE;
     goto cleanup;

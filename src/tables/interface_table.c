@@ -41,3 +41,9 @@ bool interface_table_add(interface_table_t* table, const char* path, const mac_a
   entry->enabled = true;
   return true;
 }
+
+bool interface_table_set_enabled(interface_table_t* table, size_t index, bool enabled) {
+  if (index >= table->count) return false;
+  table->entries[index].enabled = enabled;
+  return true;
+}

@@ -380,9 +380,14 @@ static void handle_ethernet(host_context_t* context, const uint8_t* bytes, size_
   vnet_peer_table_learn_mac(&context->devices, frame.header.src_mac);
   fputs("Received ", stdout);
   group ? fputs(ethernet_mac_is_broadcast(frame.header.dst_mac) ? "broadcast" : "multicast", stdout) : fputs("unicast", stdout);
-  fputs(" frame from ", stdout);
+  fputs(" Ethernet frame: dst=", stdout);
+  ethernet_mac_print(stdout, frame.header.dst_mac);
+  fputs(" src=", stdout);
   ethernet_mac_print(stdout, frame.header.src_mac);
-  fprintf(stdout, " (%zu bytes).\n", byte_count);
+  if (frame.format == ETHERNET_FRAME_FORMAT_II) fprintf(stdout, " EtherType=0x%04X", frame.header.type_or_length);
+  else
+    fprintf(stdout, " IEEE802.3-length=%u", frame.header.type_or_length);
+  fprintf(stdout, " bytes=%zu.\n", byte_count);
   fflush(stdout);
   mutex_unlock(&context->mutex);
 
@@ -529,6 +534,19 @@ static void command_arp(void* context_argument, char* argument) {
     }
     fputs(".\n", stdout);
   }
+}
+
+static void command_arp_delete(void* context_argument, char* argument) {
+  host_context_t* context = context_argument;
+  ipv4_address_t address = 0;
+  if (!ipv4_parse_address(argument, &address)) {
+    fputs("Usage: arp-delete <ip-address>\n", stderr);
+    return;
+  }
+  mutex_lock(&context->mutex);
+  const bool removed = arp_table_remove(&context->arp, 0, address);
+  mutex_unlock(&context->mutex);
+  fputs(removed ? "ARP neighbor removed.\n" : "No such ARP neighbor.\n", removed ? stdout : stderr);
 }
 
 static void command_rarp(void* context_argument, char* argument) {
@@ -730,7 +748,7 @@ int main(int argc, char** argv) {
     return EXIT_FAILURE;
   }
 
-  if (!cmd_app_register(&context.commands, "info", "Show host, routes, ARP cache, and learned devices.", command_info, &context) || !cmd_app_register(&context.commands, "arp", "Resolve the local destination or next-hop gateway.", command_arp, &context) || !cmd_app_register(&context.commands, "rarp", "Request an IPv4 address for this host MAC.", command_rarp, &context) || !cmd_app_register(&context.commands, "ping", "Send an ICMP Echo Request after ARP resolution.", command_ping, &context) || !cmd_app_register(&context.commands, "udp", "Send a UDP datagram after ARP resolution.", command_udp, &context) || !cmd_app_register(&context.commands, "tcp", "Send a base-header TCP segment after ARP resolution.", command_tcp, &context) || !cmd_app_start(&context.commands)) {
+  if (!cmd_app_register(&context.commands, "info", "Show host, routes, ARP cache, and learned devices.", command_info, &context) || !cmd_app_register(&context.commands, "arp", "Resolve the local destination or next-hop gateway.", command_arp, &context) || !cmd_app_register(&context.commands, "arp-delete", "Remove one learned ARP neighbor.", command_arp_delete, &context) || !cmd_app_register(&context.commands, "rarp", "Request an IPv4 address for this host MAC.", command_rarp, &context) || !cmd_app_register(&context.commands, "ping", "Send an ICMP Echo Request after ARP resolution.", command_ping, &context) || !cmd_app_register(&context.commands, "udp", "Send a UDP datagram after ARP resolution.", command_udp, &context) || !cmd_app_register(&context.commands, "tcp", "Send a base-header TCP segment after ARP resolution.", command_tcp, &context) || !cmd_app_start(&context.commands)) {
     fputs("Could not start the command application.\n", stderr);
     cmd_app_stop(&context.commands);
     thread_join(&thread);

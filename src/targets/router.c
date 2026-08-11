@@ -199,6 +199,11 @@ static bool route_ipv4(router_context_t* context, size_t ingress_interface, cons
     return true;
   }
   const route_entry_t* route = route_table_lookup(&context->routes, packet->header.dst_addr);
+  fputs("Router IPv4: src=", stdout);
+  ipv4_address_print(stdout, packet->header.src_addr);
+  fputs(" dst=", stdout);
+  ipv4_address_print(stdout, packet->header.dst_addr);
+  fprintf(stdout, " ttl=%u protocol=%u payload=%u bytes\n", packet->header.ttl, packet->header.protocol, packet->payload_length);
   if (!route) {
     fputs("Dropped IPv4 packet without a route.\n", stderr);
     return true;
@@ -277,6 +282,11 @@ static bool handle_ethernet(router_context_t* context, size_t ingress_interface,
   if (!ethernet_parse_frame(bytes, byte_count, &frame) || frame.format != ETHERNET_FRAME_FORMAT_II) return true;
   const interface_entry_t* entry = interface_table_get(&context->interfaces, ingress_interface);
   if (!entry) return false;
+  fprintf(stdout, "Router frame: ingress=%zu bytes=%zu dst=", ingress_interface + 1, byte_count);
+  ethernet_mac_print(stdout, frame.header.dst_mac);
+  fputs(" src=", stdout);
+  ethernet_mac_print(stdout, frame.header.src_mac);
+  fprintf(stdout, " EtherType=0x%04X\n", frame.header.type_or_length);
   const bool destination_is_interface = memcmp(frame.header.dst_mac, entry->mac, sizeof(entry->mac)) == 0;
   if (frame.header.type_or_length == ETHERNET_ETHERTYPE_ARP && (destination_is_interface || ethernet_mac_is_broadcast(frame.header.dst_mac))) return handle_arp(context, ingress_interface, &frame);
   if (frame.header.type_or_length == ETHERNET_ETHERTYPE_RARP && (destination_is_interface || ethernet_mac_is_broadcast(frame.header.dst_mac))) return handle_rarp(context, ingress_interface, &frame);
@@ -392,6 +402,105 @@ static void command_arp(void* argument, char* arguments) {
   }
 }
 
+static void command_interface(void* argument, char* arguments) {
+  router_context_t* context = argument;
+  char* cursor = arguments;
+  char* state = cmd_app_next_argument(&cursor);
+  char* number = cmd_app_next_argument(&cursor);
+  uint16_t index = 0;
+  if (!state || !number || cmd_app_next_argument(&cursor) || !cmd_app_parse_uint16(number, &index) || index == 0 || index > context->interfaces.count || (strcmpi(state, "up") != 0 && strcmpi(state, "down") != 0)) {
+    fputs("Usage: interface <up|down> <number>\n", stderr);
+    return;
+  }
+  mutex_lock(&context->mutex);
+  interface_table_set_enabled(&context->interfaces, index - 1, strcmpi(state, "up") == 0);
+  mutex_unlock(&context->mutex);
+  fprintf(stdout, "Interface %u is administratively %s.\n", index, state);
+}
+
+static void command_route(void* argument, char* arguments) {
+  router_context_t* context = argument;
+  char* cursor = arguments;
+  char* action = cmd_app_next_argument(&cursor);
+  if (action && strcmpi(action, "delete") == 0) {
+    char* index_text = cmd_app_next_argument(&cursor);
+    uint16_t index = 0;
+    if (!index_text || cmd_app_next_argument(&cursor) || !cmd_app_parse_uint16(index_text, &index) || index == 0) {
+      fputs("Usage: route delete <number>\n", stderr);
+      return;
+    }
+    mutex_lock(&context->mutex);
+    const bool removed = route_table_remove(&context->routes, index - 1);
+    mutex_unlock(&context->mutex);
+    fputs(removed ? "Route removed.\n" : "No such route.\n", removed ? stdout : stderr);
+    return;
+  }
+  char* network_text = cmd_app_next_argument(&cursor);
+  char* mask_text = cmd_app_next_argument(&cursor);
+  char* next_hop_text = cmd_app_next_argument(&cursor);
+  char* interface_text = cmd_app_next_argument(&cursor);
+  char* metric_text = cmd_app_next_argument(&cursor);
+  ipv4_address_t network = 0;
+  ipv4_address_t mask = 0;
+  ipv4_address_t next_hop = 0;
+  uint16_t interface_number = 0;
+  uint32_t metric = 0;
+  if (!action || strcmpi(action, "add") != 0 || !network_text || !mask_text || !next_hop_text || !interface_text || !metric_text || cmd_app_next_argument(&cursor) || !ipv4_parse_address(network_text, &network) || !ipv4_parse_address(mask_text, &mask) || (strcmpi(next_hop_text, "direct") != 0 && !ipv4_parse_address(next_hop_text, &next_hop)) || !cmd_app_parse_uint16(interface_text, &interface_number) || interface_number == 0 || interface_number > context->interfaces.count || !cmd_app_parse_uint32(metric_text, &metric)) {
+    fputs("Usage: route add <network> <mask> <next-hop|direct> <interface> <metric> | route delete <number>\n", stderr);
+    return;
+  }
+  mutex_lock(&context->mutex);
+  const bool added = route_table_add(&context->routes, network, mask, next_hop, interface_number - 1, metric);
+  mutex_unlock(&context->mutex);
+  fputs(added ? "Route added.\n" : "Could not add route (invalid prefix or table full).\n", added ? stdout : stderr);
+}
+
+static void command_rarp_table(void* argument, char* arguments) {
+  router_context_t* context = argument;
+  char* cursor = arguments;
+  char* action = cmd_app_next_argument(&cursor);
+  char* mac_text = cmd_app_next_argument(&cursor);
+  mac_address_t mac = {0};
+  if (!action || !mac_text || !ethernet_mac_parse(mac_text, mac)) {
+    fputs("Usage: rarp-table <set|delete> <mac-address> [ip-address]\n", stderr);
+    return;
+  }
+  if (strcmpi(action, "delete") == 0 && !cmd_app_next_argument(&cursor)) {
+    mutex_lock(&context->mutex);
+    const bool removed = rarp_table_remove(&context->rarp, mac);
+    mutex_unlock(&context->mutex);
+    fputs(removed ? "RARP assignment removed.\n" : "No such RARP assignment.\n", removed ? stdout : stderr);
+    return;
+  }
+  char* ip4_text = cmd_app_next_argument(&cursor);
+  ipv4_address_t ip4 = 0;
+  if (strcmpi(action, "set") != 0 || !ip4_text || cmd_app_next_argument(&cursor) || !ipv4_parse_address(ip4_text, &ip4)) {
+    fputs("Usage: rarp-table <set|delete> <mac-address> [ip-address]\n", stderr);
+    return;
+  }
+  mutex_lock(&context->mutex);
+  const bool set = rarp_table_set(&context->rarp, mac, ip4);
+  mutex_unlock(&context->mutex);
+  fputs(set ? "RARP assignment set.\n" : "RARP table is full.\n", set ? stdout : stderr);
+}
+
+static void command_arp_delete(void* argument, char* arguments) {
+  router_context_t* context = argument;
+  char* cursor = arguments;
+  char* interface_text = cmd_app_next_argument(&cursor);
+  char* ip4_text = cmd_app_next_argument(&cursor);
+  uint16_t interface_number = 0;
+  ipv4_address_t ip4 = 0;
+  if (!interface_text || !ip4_text || cmd_app_next_argument(&cursor) || !cmd_app_parse_uint16(interface_text, &interface_number) || interface_number == 0 || interface_number > context->interfaces.count || !ipv4_parse_address(ip4_text, &ip4)) {
+    fputs("Usage: arp-delete <interface> <ip-address>\n", stderr);
+    return;
+  }
+  mutex_lock(&context->mutex);
+  const bool removed = arp_table_remove(&context->arp, interface_number - 1, ip4);
+  mutex_unlock(&context->mutex);
+  fputs(removed ? "ARP neighbor removed.\n" : "No such ARP neighbor.\n", removed ? stdout : stderr);
+}
+
 static bool parse_options(router_context_t* context, int argc, char** argv) {
   for (int i = 1; i < argc;) {
     if (strcmpi(argv[i], "-i") == 0) {
@@ -455,7 +564,7 @@ int main(int argc, char** argv) {
     }
   }
   cmd_app_init(&context.commands);
-  if (!cmd_app_register(&context.commands, "info", "Show interfaces, routes, ARP neighbors, and RARP assignments.", command_info, &context) || !cmd_app_register(&context.commands, "arp", "Resolve an IPv4 neighbor on one interface.", command_arp, &context) || !cmd_app_start(&context.commands)) {
+  if (!cmd_app_register(&context.commands, "info", "Show interfaces, routes, ARP neighbors, and RARP assignments.", command_info, &context) || !cmd_app_register(&context.commands, "arp", "Resolve an IPv4 neighbor on one interface.", command_arp, &context) || !cmd_app_register(&context.commands, "arp-delete", "Remove one learned ARP neighbor.", command_arp_delete, &context) || !cmd_app_register(&context.commands, "interface", "Administratively bring an interface up or down.", command_interface, &context) || !cmd_app_register(&context.commands, "route", "Add or delete a route in the forwarding table.", command_route, &context) || !cmd_app_register(&context.commands, "rarp-table", "Set or delete a static RARP assignment.", command_rarp_table, &context) || !cmd_app_start(&context.commands)) {
     fputs("Could not start the command application.\n", stderr);
     status = EXIT_FAILURE;
     goto cleanup;

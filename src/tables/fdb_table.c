@@ -51,3 +51,10 @@ void fdb_table_remove_port(fdb_table_t* table, size_t port) {
     }
   }
 }
+
+bool fdb_table_remove(fdb_table_t* table, const mac_address_t mac) {
+  fdb_entry_t* entry = fdb_table_find(table, mac);
+  if (!entry) return false;
+  *entry = table->entries[--table->count];
+  return true;
+}

@@ -41,3 +41,6 @@ bool fdb_table_learn(fdb_table_t* table, const mac_address_t mac, size_t port);
 
 /* Removes every learned MAC mapping on port. */
 void fdb_table_remove_port(fdb_table_t* table, size_t port);
+
+/* Removes one learned unicast MAC mapping. Returns false when it is absent. */
+bool fdb_table_remove(fdb_table_t* table, const mac_address_t mac);

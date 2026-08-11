@@ -36,3 +36,10 @@ bool rarp_table_set(rarp_table_t* table, const mac_address_t mac, ipv4_address_t
   entry->ip4 = ip4;
   return true;
 }
+
+bool rarp_table_remove(rarp_table_t* table, const mac_address_t mac) {
+  rarp_entry_t* entry = rarp_table_find(table, mac);
+  if (!entry) return false;
+  *entry = table->entries[--table->count];
+  return true;
+}

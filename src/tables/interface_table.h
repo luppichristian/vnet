@@ -45,3 +45,6 @@ const interface_entry_t* interface_table_get(const interface_table_t* table, siz
 
 /* Adds an enabled interface. Returns false for duplicate paths, invalid masks, or a full table. */
 bool interface_table_add(interface_table_t* table, const char* path, const mac_address_t mac, ipv4_address_t ip4, ipv4_address_t mask);
+
+/* Changes the administrative state of an existing interface. */
+bool interface_table_set_enabled(interface_table_t* table, size_t index, bool enabled);

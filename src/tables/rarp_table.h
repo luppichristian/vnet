@@ -39,3 +39,6 @@ const rarp_entry_t* rarp_table_find_const(const rarp_table_t* table, const mac_a
 
 /* Adds or replaces a static MAC-to-IPv4 assignment. Returns false for a full table. */
 bool rarp_table_set(rarp_table_t* table, const mac_address_t mac, ipv4_address_t ip4);
+
+/* Removes one static MAC-to-IPv4 assignment. */
+bool rarp_table_remove(rarp_table_t* table, const mac_address_t mac);

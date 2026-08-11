@@ -42,3 +42,6 @@ bool route_table_add(route_table_t* table, ipv4_address_t destination, ipv4_addr
 
 /* Returns the longest-prefix matching route, preferring the lower metric on equal prefixes. */
 const route_entry_t* route_table_lookup(const route_table_t* table, ipv4_address_t destination);
+
+/* Removes the route at index, retaining the remaining entries. */
+bool route_table_remove(route_table_t* table, size_t index);
