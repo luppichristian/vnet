@@ -1,43 +1,4 @@
-/*
-Utility program to simulate a shared hub medium for multiple network files.
-OSI/ISO layer: Layer 1 (physical); it repeats opaque bytes without inspecting MAC addresses.
-Only data written after the hub opens is repeated to every other port.
-*/
-
-#include <cmd_app.h>
-#include <futils.h>
-#include <signal.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <thread.h>
-#include <vnet.h>
-
-#define SLEEP_INTERVAL_MS 5
-
-typedef struct hub_port {
-  const char* path;
-  FILE* source;
-  FILE* destination;
-  FILE* hub_source;
-  bool started;
-} hub_port_t;
-
-typedef struct hub_context {
-  const char* path;
-  const hub_port_t* ports;
-  size_t port_count;
-} hub_context_t;
-
-static cmd_app_t* command_app;
-
-static void handle_signal(int sig) {
-  if (sig == SIGINT && command_app) {
-    cmd_app_stop(command_app);
-  }
-}
+#include "hub.h"
 
 static void command_info(void* argument, char* arguments) {
   const hub_context_t* context = argument;
@@ -71,13 +32,14 @@ int main(int argc, char** argv) {
   size_t* forwarded_bytes = calloc(port_count, sizeof(*forwarded_bytes));
   FILE* hub_destination = NULL;
   int status = EXIT_SUCCESS;
+  cmd_app_t commands = {0};
+  bool commands_started = false;
   if (!ports || !port_ends || !hub_ends || !received_bytes || !forwarded_bytes) {
     fprintf(stderr, "Could not allocate hub ports.\n");
     status = EXIT_FAILURE;
     goto cleanup;
   }
 
-  signal(SIGINT, handle_signal);
   for (size_t i = 0; i < port_count; ++i) {
     ports[i].path = argv[i + 3];
     if (ports[i].path[0] == '-' || strcmpi(ports[i].path, hub_path) == 0) {
@@ -124,14 +86,13 @@ int main(int argc, char** argv) {
     goto cleanup;
   }
 
-  cmd_app_t commands;
   cmd_app_init(&commands);
   if (!cmd_app_register(&commands, "info", "Show the hub file and connected port files.", command_info, &(hub_context_t) {.path = hub_path, .ports = ports, .port_count = port_count}) || !cmd_app_start(&commands)) {
     fputs("Could not start the command application.\n", stderr);
     status = EXIT_FAILURE;
     goto cleanup;
   }
-  command_app = &commands;
+  commands_started = true;
 
   while (cmd_app_is_running(&commands)) {
     memset(received_bytes, 0, port_count * sizeof(*received_bytes));
@@ -177,10 +138,9 @@ int main(int argc, char** argv) {
   }
 
 cleanup:
-  if (command_app) {
-    cmd_app_stop(command_app);
-    cmd_app_join(command_app);
-    command_app = NULL;
+  if (commands_started) {
+    cmd_app_stop(&commands);
+    cmd_app_join(&commands);
   }
   if (hub_destination) {
     for (size_t i = 0; i < port_count; ++i) {

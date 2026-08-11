@@ -1,96 +1,6 @@
-/*
-Interactive Ethernet host attached to one append-only VNet traffic file.
-OSI/ISO layer: Layer 2 endpoint; optional IPv4 configuration supplies Layer 3 identity.
-*/
-
-#include <arp.h>
-#include <cmd_app.h>
-#include <dhcp.h>
-#include <dns.h>
-#include <ethernet.h>
-#include <futils.h>
-#include <icmp.h>
-#include <ipv4.h>
-#include <arp_table.h>
-#include <mutex.h>
-#include <rarp.h>
-#include <socket.h>
-
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <tcp.h>
-#include <thread.h>
-#include <udp.h>
-#include <vnet.h>
-#include <vnet_peer_table.h>
-
-#define HOST_DEVICE_CAPACITY  64
-#define HOST_ARP_CAPACITY     64
-#define HOST_BUFFER_SIZE      8192
-#define HOST_PENDING_DATA_MAX (ETHERNET_MAX_DATA_LEN - sizeof(ipv4_header_t) - sizeof(tcp_header_t))
-#define SLEEP_INTERVAL_MS     5
-
-typedef enum host_pending_type {
-  HOST_PENDING_NONE,
-  HOST_PENDING_PING,
-  HOST_PENDING_UDP,
-  HOST_PENDING_TCP,
-  HOST_PENDING_DNS,
-} host_pending_type_t;
-
-typedef struct host_pending_packet {
-  ipv4_address_t destination;
-  ipv4_address_t next_hop;
-  host_pending_type_t type;
-  uint16_t src_port;
-  uint16_t dst_port;
-  uint32_t sequence_number;
-  uint32_t acknowledgement_number;
-  uint16_t flags;
-  uint16_t window_size;
-  uint8_t data[HOST_PENDING_DATA_MAX];
-  uint16_t data_length;
-  bool active;
-} host_pending_packet_t;
-
-typedef struct host_context {
-  const char* path;
-  mac_address_t mac;
-  ipv4_address_t ip4;
-  ipv4_address_t mask;
-  ipv4_address_t gateway;
-  bool has_ip4;
-  bool has_gateway;
-  ipv4_address_t dns_server;
-  ipv4_address_t dhcp_server;
-  bool has_dns_server;
-  bool has_dhcp_server;
-  uint16_t next_transaction_id;
-  uint16_t dns_transaction_id;
-  uint16_t dhcp_transaction_id;
-  host_pending_packet_t dns_pending_packet;
-  uint16_t ping_sequence;
-  FILE* source;
-  mutex_t mutex;
-  cmd_app_t commands;
-  vnet_peer_entry_t device_entries[HOST_DEVICE_CAPACITY];
-  vnet_peer_table_t devices;
-  arp_entry_t arp_entries[HOST_ARP_CAPACITY];
-  arp_table_t arp;
-  socket_context_t sockets;
-  host_pending_packet_t pending_packet;
-} host_context_t;
-
-typedef arp_entry_t host_arp_entry_t;
+#include "host.h"
 
 static void command_transport(host_context_t* context, host_pending_packet_t* pending);
-
-static arp_entry_t* arp_find(host_context_t* context, ipv4_address_t address) {
-  return arp_table_find(&context->arp, 0, address);
-}
 
 static bool ip4_is_local(const host_context_t* context, ipv4_address_t address) {
   return ipv4_addresses_share_subnet(context->ip4, address, context->mask);
@@ -145,7 +55,7 @@ static bool write_dhcp_message(host_context_t* context, const dhcp_message_t* me
   FILE* destination = fopen(context->path, "ab");
   if (!destination) return false;
   const udp_packet_data_t packet = {
-      .dst_mac_addr = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
+      .dst_mac_addr = {           0xFF,            0xFF,            0xFF,            0xFF,            0xFF,            0xFF},
       .src_mac_addr = {context->mac[0], context->mac[1], context->mac[2], context->mac[3], context->mac[4], context->mac[5]},
       .src_addr = 0,
       .dst_addr = IPV4_ADDRESS(255, 255, 255, 255),
@@ -281,7 +191,7 @@ static bool host_socket_emit(void* argument, ipv4_address_t destination_address,
   host_context_t* context = argument;
   ipv4_address_t next_hop = 0;
   if (!context->has_ip4 || !route_next_hop(context, destination_address, &next_hop)) return false;
-  const arp_entry_t* neighbor = arp_find(context, next_hop);
+  const arp_entry_t* neighbor = arp_table_find(&context->arp, 0, next_hop);
   if (!neighbor) return false;
   FILE* destination = fopen(context->path, "ab");
   if (!destination) return false;
@@ -460,7 +370,8 @@ static void handle_ipv4(host_context_t* context, const ethernet_frame_view_t* fr
     udp_packet_view_t udp = {0};
     if (!udp_parse_packet(packet.payload, packet.payload_length, packet.header.src_addr, packet.header.dst_addr, &udp)) return;
     if (packet.header.dst_addr == IPV4_ADDRESS(255, 255, 255, 255) || !context->has_ip4) handle_dhcp(context, &udp);
-    else if (packet.header.dst_addr == context->ip4) handle_dns(context, &udp);
+    else if (packet.header.dst_addr == context->ip4)
+      handle_dns(context, &udp);
   }
   if (!context->has_ip4 || packet.header.dst_addr != context->ip4) return;
   if (packet.header.protocol == SOCKET_PROTOCOL_TCP || packet.header.protocol == SOCKET_PROTOCOL_UDP) {
@@ -592,10 +503,6 @@ static void receiver_thread(void* argument) {
     }
     thread_sleep(SLEEP_INTERVAL_MS);
   }
-}
-
-static void print_usage(void) {
-  fputs("Usage: host <file> <mac-address> [-ip4 <address> [-mask <address>] [-gateway <address>] [-dns <address>] [-dhcp <address>]]\n", stderr);
 }
 
 static bool parse_options(host_context_t* context, int argc, char** argv) {
@@ -745,7 +652,7 @@ static void command_ping(void* context_argument, char* argument) {
     fputs("Destination is outside the local subnet and no default gateway is configured.\n", stderr);
   } else {
     mutex_lock(&context->mutex);
-    host_arp_entry_t* entry = arp_find(context, next_hop);
+    host_arp_entry_t* entry = arp_table_find(&context->arp, 0, next_hop);
     mac_address_t mac = {0};
     if (entry) {
       memcpy(mac, entry->mac, sizeof(mac));
@@ -811,7 +718,7 @@ static void command_transport(host_context_t* context, host_pending_packet_t* pe
     fputs("Destination is outside the local subnet and no default gateway is configured.\n", stderr);
   } else {
     mutex_lock(&context->mutex);
-    host_arp_entry_t* entry = arp_find(context, next_hop);
+    host_arp_entry_t* entry = arp_table_find(&context->arp, 0, next_hop);
     mac_address_t mac = {0};
     if (entry) {
       memcpy(mac, entry->mac, sizeof(mac));
@@ -902,37 +809,47 @@ static void command_socket(void* context_argument, char* argument) {
       if (entry) fprintf(stdout, "  %zu  %s  state=%d local=%u remote=%u\n", i + 1, entry->protocol == SOCKET_PROTOCOL_TCP ? "tcp" : "udp", entry->state, entry->local_port, entry->remote_port);
     }
   } else if (strcmpi(action, "udp-open") == 0 && first && !second) {
-    uint16_t port = 0; socket_handle_t handle = 0;
+    uint16_t port = 0;
+    socket_handle_t handle = 0;
     if (!cmd_app_parse_uint16(first, &port) || !socket_open(&context->sockets, SOCKET_PROTOCOL_UDP, &handle) || !socket_bind(&context->sockets, handle, port)) goto usage_locked;
     fprintf(stdout, "Socket %u opened for UDP port %u.\n", handle, socket_get(&context->sockets, handle)->local_port);
   } else if (strcmpi(action, "tcp-listen") == 0 && first && !second) {
-    uint16_t port = 0; socket_handle_t handle = 0;
+    uint16_t port = 0;
+    socket_handle_t handle = 0;
     if (!cmd_app_parse_uint16(first, &port) || !socket_open(&context->sockets, SOCKET_PROTOCOL_TCP, &handle) || !socket_bind(&context->sockets, handle, port) || !socket_listen(&context->sockets, handle)) goto usage_locked;
     fprintf(stdout, "Socket %u listening on TCP port %u.\n", handle, port);
   } else if (strcmpi(action, "tcp-connect") == 0 && first && second && !third) {
-    ipv4_address_t address = 0; uint16_t port = 0; socket_handle_t handle = 0;
+    ipv4_address_t address = 0;
+    uint16_t port = 0;
+    socket_handle_t handle = 0;
     if (!ipv4_parse_address(first, &address) || !cmd_app_parse_uint16(second, &port) || !socket_open(&context->sockets, SOCKET_PROTOCOL_TCP, &handle) || !socket_connect(&context->sockets, handle, address, port)) goto usage_locked;
     fprintf(stdout, "Socket %u connecting to TCP port %u.\n", handle, port);
   } else if (strcmpi(action, "udp-send") == 0 && first && second && third) {
     char* data = cmd_app_next_argument(&cursor);
-    uint16_t handle = 0, port = 0; ipv4_address_t address = 0;
+    uint16_t handle = 0, port = 0;
+    ipv4_address_t address = 0;
     if (!data || cmd_app_next_argument(&cursor) || !cmd_app_parse_uint16(first, &handle) || !ipv4_parse_address(second, &address) || !cmd_app_parse_uint16(third, &port) || !socket_send_to(&context->sockets, handle, address, port, data, (uint16_t)strlen(data))) goto usage_locked;
   } else if (strcmpi(action, "send") == 0 && first && second && !third) {
     uint16_t handle = 0;
     if (!cmd_app_parse_uint16(first, &handle) || !socket_send(&context->sockets, handle, second, (uint16_t)strlen(second))) goto usage_locked;
   } else if (strcmpi(action, "accept") == 0 && first && !second) {
-    uint16_t listener = 0; socket_handle_t connection = 0;
+    uint16_t listener = 0;
+    socket_handle_t connection = 0;
     if (!cmd_app_parse_uint16(first, &listener) || !socket_accept(&context->sockets, listener, &connection)) goto usage_locked;
     fprintf(stdout, "Accepted TCP socket %u.\n", connection);
   } else if (strcmpi(action, "receive") == 0 && first && !second) {
-    uint16_t handle = 0; uint8_t bytes[SOCKET_RECEIVE_CAPACITY + 1] = {0};
+    uint16_t handle = 0;
+    uint8_t bytes[SOCKET_RECEIVE_CAPACITY + 1] = {0};
     if (!cmd_app_parse_uint16(first, &handle)) goto usage_locked;
     const size_t length = socket_receive(&context->sockets, handle, bytes, SOCKET_RECEIVE_CAPACITY, NULL, NULL);
-    if (!length) fputs("No socket data.\n", stdout); else fprintf(stdout, "Received %zu bytes: %.*s\n", length, (int)length, bytes);
+    if (!length) fputs("No socket data.\n", stdout);
+    else
+      fprintf(stdout, "Received %zu bytes: %.*s\n", length, (int)length, bytes);
   } else if (strcmpi(action, "close") == 0 && first && !second) {
     uint16_t handle = 0;
     if (!cmd_app_parse_uint16(first, &handle) || !socket_close(&context->sockets, handle)) goto usage_locked;
-  } else goto usage_locked;
+  } else
+    goto usage_locked;
   mutex_unlock(&context->mutex);
   return;
 usage_locked:
@@ -943,12 +860,12 @@ usage:
 
 int main(int argc, char** argv) {
   if (argc < 3 || ((argc - 3) % 2) != 0) {
-    print_usage();
+    fputs("Usage: host <file> <mac-address> [-ip4 <address> [-mask <address>] [-gateway <address>] [-dns <address>] [-dhcp <address>]]\n", stderr);
     return EXIT_FAILURE;
   }
   host_context_t context = {.path = argv[1]};
   if (!ethernet_mac_parse(argv[2], context.mac) || !parse_options(&context, argc, argv) || (context.has_gateway && !ip4_is_local(&context, context.gateway))) {
-    print_usage();
+    fputs("Usage: host <file> <mac-address> [-ip4 <address> [-mask <address>] [-gateway <address>] [-dns <address>] [-dhcp <address>]]\n", stderr);
     return EXIT_FAILURE;
   }
   context.source = fopen(context.path, "rb");

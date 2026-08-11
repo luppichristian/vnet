@@ -1,29 +1,4 @@
-/* Interactive authoritative DNS A-record server on one VNet Ethernet LAN. */
-
-#include <arp.h>
-#include <cmd_app.h>
-#include <dns.h>
-#include <ethernet.h>
-#include <futils.h>
-#include <ipv4.h>
-#include <thread.h>
-#include <udp.h>
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-#define DNS_SERVER_BUFFER_SIZE 8192
-
-typedef struct dns_server_context {
-  const char* path;
-  mac_address_t mac;
-  ipv4_address_t address;
-  char name[DNS_NAME_MAX + 1];
-  ipv4_address_t record_address;
-  FILE* source;
-  cmd_app_t commands;
-} dns_server_context_t;
+#include "dns_server.h"
 
 static void command_info(void* argument, char* arguments) {
   dns_server_context_t* context = argument;
@@ -90,7 +65,7 @@ int main(int argc, char** argv) {
     return EXIT_FAILURE;
   }
   dns_server_context_t context = {.path = argv[1]};
-  if (!ethernet_mac_parse(argv[2], context.mac) || !ipv4_parse_address(argv[3], &context.address) || !dns_write_query(1, argv[4], &(dns_message_t){0}) || !ipv4_parse_address(argv[5], &context.record_address)) return EXIT_FAILURE;
+  if (!ethernet_mac_parse(argv[2], context.mac) || !ipv4_parse_address(argv[3], &context.address) || !dns_write_query(1, argv[4], &(dns_message_t) {0}) || !ipv4_parse_address(argv[5], &context.record_address)) return EXIT_FAILURE;
   memcpy(context.name, argv[4], strlen(argv[4]) + 1);
   context.source = fopen(context.path, "rb");
   if (!context.source || fseek(context.source, 0, SEEK_END) != 0) return EXIT_FAILURE;

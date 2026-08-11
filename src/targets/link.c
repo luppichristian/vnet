@@ -1,35 +1,4 @@
-/*
-Utility program to establish a "connection" between 2 network files.
-Only data written after the connection opens is forwarded to the other file.
-This supports both uni-directional and bi-directional connections.
-*/
-
-#include <cmd_app.h>
-#include <futils.h>
-#include <signal.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <thread.h>
-#include <vnet.h>
-
-#define SLEEP_INTERVAL_MS 5
-
-typedef struct connect_context {
-  const char* source_path;
-  const char* destination_path;
-  bool bidirectional;
-} connect_context_t;
-
-static cmd_app_t* command_app;
-
-static void handle_signal(int sig) {
-  if (sig == SIGINT && command_app) {
-    cmd_app_stop(command_app);
-  }
-}
+#include "link.h"
 
 static void command_info(void* argument, char* arguments) {
   const connect_context_t* context = argument;
@@ -46,9 +15,6 @@ int main(int argc, char** argv) {
     fprintf(stderr, "Usage: <source> <dest> (optional -b)\n");
     return (EXIT_FAILURE);
   }
-
-  /* Setup signal handler for interrupt */
-  signal(SIGINT, handle_signal);
 
   /* Parse command line arguments */
   const char* src_f = NULL;
@@ -100,6 +66,8 @@ int main(int argc, char** argv) {
   FILE* source_b = NULL;
   FILE* destination_b = NULL;
   int status = EXIT_SUCCESS;
+  cmd_app_t commands = {0};
+  bool commands_started = false;
   bool started_a = false;
   bool started_b = false;
   source_a = fopen(src_f, "rb");
@@ -137,14 +105,13 @@ int main(int argc, char** argv) {
     goto cleanup;
   }
 
-  cmd_app_t commands;
   cmd_app_init(&commands);
   if (!cmd_app_register(&commands, "info", "Show the connection endpoints and forwarding mode.", command_info, &(connect_context_t) {.source_path = src_f, .destination_path = dst_f, .bidirectional = bidirectional}) || !cmd_app_start(&commands)) {
     fputs("Could not start the command application.\n", stderr);
     status = EXIT_FAILURE;
     goto cleanup;
   }
-  command_app = &commands;
+  commands_started = true;
 
   /* Loop */
   while (cmd_app_is_running(&commands)) {
@@ -176,10 +143,9 @@ int main(int argc, char** argv) {
 
   /* Cleanup */
 cleanup:
-  if (command_app) {
-    cmd_app_stop(command_app);
-    cmd_app_join(command_app);
-    command_app = NULL;
+  if (commands_started) {
+    cmd_app_stop(&commands);
+    cmd_app_join(&commands);
   }
   /* Notify each destination that forwarding from its source has stopped */
   if (started_a && !vnet_frame_write(destination_a, VNET_FRAME_CONNECTION_END, src_f, dst_f)) {

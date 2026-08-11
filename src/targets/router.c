@@ -1,195 +1,15 @@
-/*
-Interactive IPv4 router connecting multiple append-only VNet media.
-OSI/ISO layer: Layer 3; it routes IPv4 packets and resolves each egress next hop through ARP.
-*/
-
-#include <arp.h>
-#include <bgp.h>
-#include <arp_table.h>
-#include <cmd_app.h>
-#include <ethernet.h>
-#include <futils.h>
-#include <interface_table.h>
-#include <ipv4.h>
-#include <math.h>
-#include <mutex.h>
-#include <ospf.h>
-#include <rarp.h>
-#include <rarp_table.h>
-#include <rip.h>
-#include <route_table.h>
-#include <socket.h>
-#include <tcp.h>
-#include <udp.h>
-
-#include <signal.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <thread.h>
-#include <time.h>
-#include <vnet.h>
-
-#define ROUTER_INTERFACE_CAPACITY 16
-#define ROUTER_ROUTE_CAPACITY     128
-#define ROUTER_ARP_CAPACITY       256
-#define ROUTER_RARP_CAPACITY      128
-#define ROUTER_PENDING_CAPACITY   64
-#define ROUTER_BGP_PEER_CAPACITY  16
-#define ROUTER_NAT_CAPACITY       128
-#define ROUTER_BUFFER_SIZE        8192
-#define SLEEP_INTERVAL_MS         5
-#define RIP_ROUTE_TIMEOUT_SECONDS 180
-#define RIP_UPDATE_INTERVAL_SECONDS 30
-#define OSPF_ROUTE_TIMEOUT_SECONDS 40
-#define OSPF_UPDATE_INTERVAL_SECONDS 10
-
-typedef enum router_dynamic_routing_mode {
-  ROUTER_DYNAMIC_ROUTING_OFF,
-  ROUTER_DYNAMIC_ROUTING_RIP,
-  ROUTER_DYNAMIC_ROUTING_OSPF,
-} router_dynamic_routing_mode_t;
-
-typedef struct router_port {
-  FILE* source;
-  FILE* destination;
-  uint8_t buffer[ROUTER_BUFFER_SIZE];
-  size_t buffer_length;
-  size_t injected_bytes;
-} router_port_t;
-
-typedef struct router_pending_packet {
-  ipv4_header_t header;
-  uint8_t payload[ETHERNET_MAX_DATA_LEN - sizeof(ipv4_header_t)];
-  ipv4_address_t next_hop;
-  size_t egress_interface;
-  uint16_t payload_length;
-  bool active;
-} router_pending_packet_t;
-
-typedef struct router_context router_context_t;
-
-typedef struct router_socket_emit_argument {
-  router_context_t* context;
-  size_t interface_index;
-} router_socket_emit_argument_t;
-
-typedef struct router_bgp_peer {
-  ipv4_address_t address;
-  uint16_t local_as;
-  uint16_t remote_as;
-  size_t interface_index;
-  socket_handle_t socket;
-  uint32_t last_attempt;
-  uint32_t last_received;
-  uint32_t last_keepalive;
-  bool active;
-  bool open_sent;
-  bool open_received;
-  bool established;
-} router_bgp_peer_t;
-
-/* One dynamically learned NAPT binding for an inside UDP or TCP endpoint. */
-typedef struct router_nat_entry {
-  ipv4_address_t inside_address;
-  ipv4_address_t remote_address;
-  uint16_t inside_port;
-  uint16_t outside_port;
-  uint16_t remote_port;
-  uint8_t protocol;
-  bool active;
-} router_nat_entry_t;
-
-typedef struct router_context {
-  interface_entry_t interface_entries[ROUTER_INTERFACE_CAPACITY];
-  route_entry_t route_entries[ROUTER_ROUTE_CAPACITY];
-  arp_entry_t arp_entries[ROUTER_ARP_CAPACITY];
-  rarp_entry_t rarp_entries[ROUTER_RARP_CAPACITY];
-  router_pending_packet_t pending_packets[ROUTER_PENDING_CAPACITY];
-  interface_table_t interfaces;
-  route_table_t routes;
-  arp_table_t arp;
-  rarp_table_t rarp;
-  router_port_t ports[ROUTER_INTERFACE_CAPACITY];
-  socket_context_t sockets[ROUTER_INTERFACE_CAPACITY];
-  router_socket_emit_argument_t socket_arguments[ROUTER_INTERFACE_CAPACITY];
-  socket_handle_t bgp_listeners[ROUTER_INTERFACE_CAPACITY];
-  router_bgp_peer_t bgp_peers[ROUTER_BGP_PEER_CAPACITY];
-  router_nat_entry_t nat_entries[ROUTER_NAT_CAPACITY];
-  size_t nat_inside_interface;
-  size_t nat_outside_interface;
-  uint16_t nat_next_port;
-  bool nat_enabled;
-  size_t bgp_peer_count;
-  router_dynamic_routing_mode_t dynamic_routing;
-  uint32_t next_rip_update;
-  uint32_t next_ospf_update;
-  mutex_t mutex;
-  cmd_app_t commands;
-} router_context_t;
-
-static cmd_app_t* command_app;
+#include "router.h"
 
 static const mac_address_t rip_multicast_mac = {0x01, 0x00, 0x5E, 0x00, 0x00, 0x09};
 static const mac_address_t ospf_multicast_mac = {0x01, 0x00, 0x5E, 0x00, 0x00, 0x05};
 
-static bool router_socket_emit(void* argument, ipv4_address_t destination, uint8_t protocol, const uint8_t* payload, uint16_t payload_length);
-static router_bgp_peer_t* find_bgp_peer(router_context_t* context, size_t interface_index, ipv4_address_t address);
-
 static const char* dynamic_routing_name(router_dynamic_routing_mode_t mode) {
   switch (mode) {
-    case ROUTER_DYNAMIC_ROUTING_OFF: return "off";
-    case ROUTER_DYNAMIC_ROUTING_RIP: return "rip";
+    case ROUTER_DYNAMIC_ROUTING_OFF:  return "off";
+    case ROUTER_DYNAMIC_ROUTING_RIP:  return "rip";
     case ROUTER_DYNAMIC_ROUTING_OSPF: return "ospf";
   }
   return "off";
-}
-
-static uint32_t router_now(void) {
-  return (uint32_t)time(NULL);
-}
-
-static router_nat_entry_t* nat_find_outbound(router_context_t* context, uint8_t protocol, ipv4_address_t inside_address, uint16_t inside_port, ipv4_address_t remote_address, uint16_t remote_port) {
-  for (size_t i = 0; i < ROUTER_NAT_CAPACITY; ++i) {
-    router_nat_entry_t* entry = &context->nat_entries[i];
-    if (entry->active && entry->protocol == protocol && entry->inside_address == inside_address && entry->inside_port == inside_port && entry->remote_address == remote_address && entry->remote_port == remote_port) return entry;
-  }
-  return NULL;
-}
-
-static router_nat_entry_t* nat_find_inbound(router_context_t* context, uint8_t protocol, uint16_t outside_port, ipv4_address_t remote_address, uint16_t remote_port) {
-  for (size_t i = 0; i < ROUTER_NAT_CAPACITY; ++i) {
-    router_nat_entry_t* entry = &context->nat_entries[i];
-    if (entry->active && entry->protocol == protocol && entry->outside_port == outside_port && entry->remote_address == remote_address && entry->remote_port == remote_port) return entry;
-  }
-  return NULL;
-}
-
-static router_nat_entry_t* nat_open(router_context_t* context, uint8_t protocol, ipv4_address_t inside_address, uint16_t inside_port, ipv4_address_t remote_address, uint16_t remote_port) {
-  router_nat_entry_t* entry = nat_find_outbound(context, protocol, inside_address, inside_port, remote_address, remote_port);
-  if (entry) return entry;
-  for (size_t i = 0; i < ROUTER_NAT_CAPACITY; ++i) {
-    entry = &context->nat_entries[i];
-    if (!entry->active) {
-      const uint16_t outside_port = context->nat_next_port < SOCKET_EPHEMERAL_MIN ? SOCKET_EPHEMERAL_MIN : context->nat_next_port;
-      context->nat_next_port = outside_port == UINT16_MAX ? SOCKET_EPHEMERAL_MIN : outside_port + 1;
-      *entry = (router_nat_entry_t) {.inside_address = inside_address, .inside_port = inside_port, .remote_address = remote_address, .remote_port = remote_port, .outside_port = outside_port, .protocol = protocol, .active = true};
-      return entry;
-    }
-  }
-  return NULL;
-}
-
-static void handle_signal(int sig) {
-  if (sig == SIGINT && command_app) {
-    cmd_app_stop(command_app);
-  }
-}
-
-static void print_usage(void) {
-  fputs("Usage: router -i <file> <mac-address> <ip-address> <mask> [... ] [-r <network> <mask> <next-hop|direct> <interface> <metric> [...]] [-bgp <active|passive> <interface> <peer-ip> <local-as> <peer-as> [...]] [-rarp <client-mac> <ip-address> [...]] [-dynamic-routing <off|rip|ospf>] [-nat <inside-interface> <outside-interface>]\n", stderr);
 }
 
 static bool append_frame(router_context_t* context, size_t interface_index, const ethernet_frame_data_t* frame) {
@@ -245,7 +65,8 @@ static bool write_rip_response(router_context_t* context, size_t interface_index
           .destination = route->destination,
           .subnet_mask = route->mask,
           .next_hop = 0,
-          .metric = route->metric == 0 ? RIP_METRIC_MIN : route->metric > RIP_METRIC_INFINITY ? RIP_METRIC_INFINITY : route->metric,
+          .metric = route->metric == 0 ? RIP_METRIC_MIN : route->metric > RIP_METRIC_INFINITY ? RIP_METRIC_INFINITY
+                                                                                              : route->metric,
       };
     }
     if (!write_rip_packet(context, interface_index, RIP_COMMAND_RESPONSE, entries, entry_count)) return false;
@@ -366,34 +187,6 @@ static bool write_rarp_reply(router_context_t* context, size_t interface_index, 
   return rarp_write_ethernet_reply(context->ports[interface_index].destination, &reply) && fflush(context->ports[interface_index].destination) == 0;
 }
 
-static bool nat_rewrite_transport(const ipv4_packet_view_t* packet, ipv4_address_t source_address, ipv4_address_t destination_address, uint16_t source_port, uint16_t destination_port, uint8_t* payload, uint16_t* payload_length) {
-  if (packet->header.protocol == UDP_IPV4_PROTOCOL) {
-    udp_packet_view_t udp = {0};
-    udp_packet_data_t rewritten = {.src_addr = source_address, .dst_addr = destination_address};
-    if (!udp_parse_packet(packet->payload, packet->payload_length, packet->header.src_addr, packet->header.dst_addr, &udp)) return false;
-    rewritten.src_port = source_port;
-    rewritten.dst_port = destination_port;
-    rewritten.data = udp.data;
-    rewritten.data_length = udp.data_length;
-    return udp_serialize_packet(&rewritten, payload, ETHERNET_MAX_DATA_LEN - sizeof(ipv4_header_t), payload_length);
-  }
-  if (packet->header.protocol == TCP_IPV4_PROTOCOL) {
-    tcp_packet_view_t tcp = {0};
-    tcp_packet_data_t rewritten = {.src_addr = source_address, .dst_addr = destination_address};
-    if (!tcp_parse_packet(packet->payload, packet->payload_length, packet->header.src_addr, packet->header.dst_addr, &tcp)) return false;
-    rewritten.src_port = source_port;
-    rewritten.dst_port = destination_port;
-    rewritten.sequence_number = tcp.header.sequence_number;
-    rewritten.acknowledgement_number = tcp.header.acknowledgement_number;
-    rewritten.window_size = tcp.header.window_size;
-    rewritten.flags = (tcp.header.fin ? TCP_FLAG_FIN : 0) | (tcp.header.syn ? TCP_FLAG_SYN : 0) | (tcp.header.rst ? TCP_FLAG_RST : 0) | (tcp.header.psh ? TCP_FLAG_PSH : 0) | (tcp.header.ack ? TCP_FLAG_ACK : 0) | (tcp.header.urg ? TCP_FLAG_URG : 0) | (tcp.header.ece ? TCP_FLAG_ECE : 0) | (tcp.header.cwr ? TCP_FLAG_CWR : 0) | (tcp.header.ns ? TCP_FLAG_NS : 0);
-    rewritten.data = tcp.data;
-    rewritten.data_length = tcp.data_length;
-    return tcp_serialize_packet(&rewritten, payload, ETHERNET_MAX_DATA_LEN - sizeof(ipv4_header_t), payload_length);
-  }
-  return false;
-}
-
 static bool forward_ipv4(router_context_t* context, size_t interface_index, const ipv4_header_t* header, const uint8_t* payload, uint16_t payload_length, const mac_address_t destination_mac) {
   const interface_entry_t* entry = interface_table_get(&context->interfaces, interface_index);
   if (!entry || header->ttl <= 1) return false;
@@ -481,13 +274,13 @@ static bool route_ipv4(router_context_t* context, size_t ingress_interface, cons
       destination_port = tcp.header.dst_port;
     }
     const interface_entry_t* outside = interface_table_get(&context->interfaces, context->nat_outside_interface);
-    router_nat_entry_t* nat = outside && packet->header.dst_addr == outside->ip4 ? nat_find_inbound(context, packet->header.protocol, destination_port, packet->header.src_addr, source_port) : NULL;
+    nat_entry_t* nat = outside && packet->header.dst_addr == outside->ip4 ? nat_table_find_inbound(&context->nat, packet->header.protocol, destination_port, packet->header.src_addr, source_port) : NULL;
     if (!nat) {
       fputs("Dropped unsolicited NAT packet.\n", stderr);
       return true;
     }
     uint16_t translated_length = 0;
-    if (!nat_rewrite_transport(packet, packet->header.src_addr, nat->inside_address, source_port, nat->inside_port, translated_payload, &translated_length)) return false;
+    if (!nat_rewrite_transport(packet, packet->header.src_addr, nat->inside_address, source_port, nat->inside_port, translated_payload, sizeof(translated_payload), &translated_length)) return false;
     translated_header = packet->header;
     translated_header.dst_addr = nat->inside_address;
     translated_packet = (ipv4_packet_view_t) {.header = translated_header, .payload = translated_payload, .payload_length = translated_length};
@@ -541,9 +334,9 @@ static bool route_ipv4(router_context_t* context, size_t ingress_interface, cons
         source_port = tcp.header.src_port;
         destination_port = tcp.header.dst_port;
       }
-      router_nat_entry_t* nat = nat_open(context, packet->header.protocol, packet->header.src_addr, source_port, packet->header.dst_addr, destination_port);
+      nat_entry_t* nat = nat_table_open(&context->nat, packet->header.protocol, packet->header.src_addr, source_port, packet->header.dst_addr, destination_port);
       const interface_entry_t* outside = interface_table_get(&context->interfaces, context->nat_outside_interface);
-      if (!nat || !outside || !nat_rewrite_transport(packet, outside->ip4, packet->header.dst_addr, nat->outside_port, destination_port, forwarded_payload, &forwarded_length)) return false;
+      if (!nat || !outside || !nat_rewrite_transport(packet, outside->ip4, packet->header.dst_addr, nat->outside_port, destination_port, forwarded_payload, sizeof(forwarded_payload), &forwarded_length)) return false;
       forwarded_header.src_addr = outside->ip4;
       forwarded_data = forwarded_payload;
       fputs("NAT source: ", stdout);
@@ -622,7 +415,7 @@ static bool handle_rip(router_context_t* context, size_t ingress_interface, cons
   if (rip_packet.header.command == RIP_COMMAND_REQUEST) {
     return write_rip_response(context, ingress_interface);
   }
-  const uint32_t expires_at = router_now() + RIP_ROUTE_TIMEOUT_SECONDS;
+  const uint32_t expires_at = (uint32_t)time(NULL) + RIP_ROUTE_TIMEOUT_SECONDS;
   for (size_t i = 0; i < rip_packet.entry_count; ++i) {
     const rip_route_entry_t* advertised = &rip_packet.entries[i];
     const uint32_t metric = advertised->metric == RIP_METRIC_INFINITY ? RIP_METRIC_INFINITY : advertised->metric + 1;
@@ -638,7 +431,7 @@ static bool handle_ospf(router_context_t* context, size_t ingress_interface, con
   if (context->dynamic_routing != ROUTER_DYNAMIC_ROUTING_OSPF || !ingress || ipv4_packet->header.src_addr == ingress->ip4 || ipv4_packet->header.protocol != OSPF_IPV4_PROTOCOL || !ospf_is_all_spf_routers(ipv4_packet->header.dst_addr)) return true;
   ospf_packet_view_t packet = {0};
   if (!ospf_parse_router_update(ipv4_packet->payload, ipv4_packet->payload_length, &packet)) return true;
-  const uint32_t expires_at = router_now() + OSPF_ROUTE_TIMEOUT_SECONDS;
+  const uint32_t expires_at = (uint32_t)time(NULL) + OSPF_ROUTE_TIMEOUT_SECONDS;
   for (size_t i = 0; i < packet.link_count; ++i) {
     const ospf_router_link_t* link = &packet.links[i];
     if (!route_table_learn_ospf(&context->routes, link->network, link->mask, ipv4_packet->header.src_addr, ingress_interface, link->metric, expires_at)) return false;
@@ -887,9 +680,10 @@ static void print_info(router_context_t* context) {
   if (context->nat_enabled) {
     fprintf(stdout, "NAT: inside dev %zu, outside dev %zu\n", context->nat_inside_interface + 1, context->nat_outside_interface + 1);
     for (size_t i = 0; i < ROUTER_NAT_CAPACITY; ++i) {
-      const router_nat_entry_t* entry = &context->nat_entries[i];
+      const nat_entry_t* entry = &context->nat_entries[i];
       if (!entry->active) continue;
-      fputs("  ", stdout); ipv4_address_print(stdout, entry->inside_address);
+      fputs("  ", stdout);
+      ipv4_address_print(stdout, entry->inside_address);
       fprintf(stdout, ":%u -> outside:%u  ", entry->inside_port, entry->outside_port);
       ipv4_address_print(stdout, entry->remote_address);
       fprintf(stdout, ":%u  %s\n", entry->remote_port, entry->protocol == TCP_IPV4_PROTOCOL ? "tcp" : "udp");
@@ -956,12 +750,13 @@ static void command_dynamic_routing(void* argument, char* arguments) {
     fputs("Usage: dynamic-routing <off|rip|ospf>\n", stderr);
     return;
   }
-  const router_dynamic_routing_mode_t mode = strcmpi(mode_text, "rip") == 0 ? ROUTER_DYNAMIC_ROUTING_RIP : strcmpi(mode_text, "ospf") == 0 ? ROUTER_DYNAMIC_ROUTING_OSPF : ROUTER_DYNAMIC_ROUTING_OFF;
+  const router_dynamic_routing_mode_t mode = strcmpi(mode_text, "rip") == 0 ? ROUTER_DYNAMIC_ROUTING_RIP : strcmpi(mode_text, "ospf") == 0 ? ROUTER_DYNAMIC_ROUTING_OSPF
+                                                                                                                                           : ROUTER_DYNAMIC_ROUTING_OFF;
   mutex_lock(&context->mutex);
   route_table_remove_rip(&context->routes);
   route_table_remove_ospf(&context->routes);
   context->dynamic_routing = mode;
-  const uint32_t now = router_now();
+  const uint32_t now = (uint32_t)time(NULL);
   bool started = true;
   if (mode == ROUTER_DYNAMIC_ROUTING_RIP) {
     context->next_rip_update = now + RIP_UPDATE_INTERVAL_SECONDS;
@@ -1081,7 +876,8 @@ static bool parse_options(router_context_t* context, int argc, char** argv) {
       i += 6;
     } else if (strcmpi(argv[i], "-dynamic-routing") == 0) {
       if (i + 1 >= argc || (strcmpi(argv[i + 1], "off") != 0 && strcmpi(argv[i + 1], "rip") != 0 && strcmpi(argv[i + 1], "ospf") != 0)) return false;
-      context->dynamic_routing = strcmpi(argv[i + 1], "rip") == 0 ? ROUTER_DYNAMIC_ROUTING_RIP : strcmpi(argv[i + 1], "ospf") == 0 ? ROUTER_DYNAMIC_ROUTING_OSPF : ROUTER_DYNAMIC_ROUTING_OFF;
+      context->dynamic_routing = strcmpi(argv[i + 1], "rip") == 0 ? ROUTER_DYNAMIC_ROUTING_RIP : strcmpi(argv[i + 1], "ospf") == 0 ? ROUTER_DYNAMIC_ROUTING_OSPF
+                                                                                                                                   : ROUTER_DYNAMIC_ROUTING_OFF;
       i += 2;
     } else if (strcmpi(argv[i], "-nat") == 0) {
       uint16_t inside = 0;
@@ -1130,9 +926,9 @@ int main(int argc, char** argv) {
   route_table_init(&context.routes, context.route_entries, ROUTER_ROUTE_CAPACITY);
   arp_table_init(&context.arp, context.arp_entries, ROUTER_ARP_CAPACITY);
   rarp_table_init(&context.rarp, context.rarp_entries, ROUTER_RARP_CAPACITY);
-  context.nat_next_port = SOCKET_EPHEMERAL_MIN;
+  nat_table_init(&context.nat, context.nat_entries, ROUTER_NAT_CAPACITY, NAT_EPHEMERAL_PORT_MIN);
   if (!parse_options(&context, argc, argv)) {
-    print_usage();
+    fputs("Usage: router -i <file> <mac-address> <ip-address> <mask> [... ] [-r <network> <mask> <next-hop|direct> <interface> <metric> [...]] [-bgp <active|passive> <interface> <peer-ip> <local-as> <peer-as> [...]] [-rarp <client-mac> <ip-address> [...]] [-dynamic-routing <off|rip|ospf>] [-nat <inside-interface> <outside-interface>]\n", stderr);
     return EXIT_FAILURE;
   }
   if (!mutex_init(&context.mutex)) {
@@ -1140,7 +936,7 @@ int main(int argc, char** argv) {
     return EXIT_FAILURE;
   }
   int status = EXIT_SUCCESS;
-  signal(SIGINT, handle_signal);
+  bool commands_started = false;
   for (size_t i = 0; i < context.interfaces.count; ++i) {
     router_port_t* port = &context.ports[i];
     port->source = fopen(context.interfaces.entries[i].path, "rb");
@@ -1152,7 +948,7 @@ int main(int argc, char** argv) {
     }
   }
   for (size_t i = 0; i < context.interfaces.count; ++i) {
-    context.socket_arguments[i] = (router_socket_emit_argument_t){.context = &context, .interface_index = i};
+    context.socket_arguments[i] = (router_socket_emit_argument_t) {.context = &context, .interface_index = i};
     if (!socket_context_init(&context.sockets[i], context.interfaces.entries[i].ip4, router_socket_emit, &context.socket_arguments[i])) {
       fputs("Could not initialize router socket context.\n", stderr);
       status = EXIT_FAILURE;
@@ -1174,9 +970,9 @@ int main(int argc, char** argv) {
     status = EXIT_FAILURE;
     goto cleanup;
   }
-  command_app = &context.commands;
+  commands_started = true;
   if (context.dynamic_routing != ROUTER_DYNAMIC_ROUTING_OFF) {
-    const uint32_t now = router_now();
+    const uint32_t now = (uint32_t)time(NULL);
     mutex_lock(&context.mutex);
     const bool started = context.dynamic_routing == ROUTER_DYNAMIC_ROUTING_RIP ? (context.next_rip_update = now + RIP_UPDATE_INTERVAL_SECONDS, write_rip_requests(&context) && write_rip_updates(&context)) : (context.next_ospf_update = now + OSPF_UPDATE_INTERVAL_SECONDS, write_ospf_updates(&context));
     mutex_unlock(&context.mutex);
@@ -1199,7 +995,7 @@ int main(int argc, char** argv) {
     }
     mutex_lock(&context.mutex);
     if (context.dynamic_routing == ROUTER_DYNAMIC_ROUTING_RIP) {
-      const uint32_t now = router_now();
+      const uint32_t now = (uint32_t)time(NULL);
       route_table_expire_rip(&context.routes, now);
       if (now >= context.next_rip_update) {
         if (!write_rip_updates(&context)) {
@@ -1211,7 +1007,7 @@ int main(int argc, char** argv) {
         context.next_rip_update = now + RIP_UPDATE_INTERVAL_SECONDS;
       }
     } else if (context.dynamic_routing == ROUTER_DYNAMIC_ROUTING_OSPF) {
-      const uint32_t now = router_now();
+      const uint32_t now = (uint32_t)time(NULL);
       route_table_expire_ospf(&context.routes, now);
       if (now >= context.next_ospf_update) {
         if (!write_ospf_updates(&context)) {
@@ -1247,7 +1043,7 @@ int main(int argc, char** argv) {
       }
       clearerr(port->source);
     }
-    if (!bgp_tick(&context, router_now())) {
+    if (!bgp_tick(&context, (uint32_t)time(NULL))) {
       mutex_unlock(&context.mutex);
       fputs("Could not advance BGP sessions.\n", stderr);
       status = EXIT_FAILURE;
@@ -1267,10 +1063,9 @@ int main(int argc, char** argv) {
   }
 
 cleanup:
-  if (command_app) {
-    cmd_app_stop(command_app);
-    cmd_app_join(command_app);
-    command_app = NULL;
+  if (commands_started) {
+    cmd_app_stop(&context.commands);
+    cmd_app_join(&context.commands);
   }
   for (size_t i = 0; i < context.interfaces.count; ++i) {
     if (context.ports[i].source) fclose(context.ports[i].source);

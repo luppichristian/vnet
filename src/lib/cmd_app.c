@@ -5,6 +5,14 @@
 
 #define CMD_APP_INPUT_MAX 2048
 
+static cmd_app_t* signal_app;
+
+static void handle_signal(int sig) {
+  if (sig == SIGINT && signal_app) {
+    signal_app->running = false;
+  }
+}
+
 static bool command_name_is_valid(const char* name) {
   if (!name || !((*name >= 'A' && *name <= 'Z') || (*name >= 'a' && *name <= 'z'))) {
     return false;
@@ -86,7 +94,15 @@ bool cmd_app_register(cmd_app_t* app, const char* name, const char* description,
 }
 
 bool cmd_app_start(cmd_app_t* app) {
-  return app && app->running && thread_start(&app->thread, command_thread, app);
+  if (!app || !app->running || (signal_app && signal_app != app && cmd_app_is_running(signal_app))) {
+    return false;
+  }
+  signal_app = app;
+  if (signal(SIGINT, handle_signal) == SIG_ERR || !thread_start(&app->thread, command_thread, app)) {
+    signal_app = NULL;
+    return false;
+  }
+  return true;
 }
 
 void cmd_app_join(cmd_app_t* app) {
@@ -96,6 +112,9 @@ void cmd_app_join(cmd_app_t* app) {
 void cmd_app_stop(cmd_app_t* app) {
   if (app) {
     app->running = false;
+    if (signal_app == app) {
+      signal_app = NULL;
+    }
   }
 }
 

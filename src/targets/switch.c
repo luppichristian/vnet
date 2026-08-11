@@ -1,48 +1,4 @@
-/*
-Learning Ethernet switch for append-only VNet traffic files.
-OSI/ISO layer: Layer 2 (data link); it learns and forwards by Ethernet MAC address.
-*/
-
-#include <cmd_app.h>
-#include <ethernet.h>
-#include <futils.h>
-#include <fdb_table.h>
-#include <signal.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <thread.h>
-#include <vnet.h>
-
-#define SWITCH_DEVICE_CAPACITY 256
-#define SWITCH_BUFFER_SIZE     8192
-#define SLEEP_INTERVAL_MS      5
-
-typedef struct switch_port {
-  const char* path;
-  FILE* source;
-  FILE* destination;
-  bool started;
-  uint8_t buffer[SWITCH_BUFFER_SIZE];
-  size_t buffer_length;
-} switch_port_t;
-
-typedef struct switch_context {
-  const char* path;
-  const switch_port_t* ports;
-  size_t port_count;
-  fdb_table_t* devices;
-} switch_context_t;
-
-static cmd_app_t* command_app;
-
-static void handle_signal(int sig) {
-  if (sig == SIGINT && command_app) {
-    cmd_app_stop(command_app);
-  }
-}
+#include "switch.h"
 
 static void command_info(void* argument, char* arguments) {
   const switch_context_t* context = argument;
@@ -148,13 +104,6 @@ static bool forward_ethernet(switch_port_t* ports, size_t port_count, fdb_table_
   return true;
 }
 
-static void handle_vnet(fdb_table_t* devices, size_t port, const vnet_frame_header_t* control) {
-  if (control->type == VNET_FRAME_CONNECTION_END) {
-    fdb_table_remove_port(devices, port);
-    fprintf(stdout, "Port %zu disconnected; removed its learned devices.\n", port + 1);
-  }
-}
-
 static bool process_port(switch_port_t* ports, size_t port_count, fdb_table_t* devices, size_t* forwarded_bytes, size_t port) {
   switch_port_t* source_port = &ports[port];
   size_t offset = 0;
@@ -163,7 +112,10 @@ static bool process_port(switch_port_t* ports, size_t port_count, fdb_table_t* d
     vnet_frame_header_t control = {0};
     if (remaining >= sizeof(control) && vnet_parse_frame(source_port->buffer + offset, sizeof(control), &control)) {
       if (strcmpi(control.destination_path, source_port->path) == 0) {
-        handle_vnet(devices, port, &control);
+        if (control.type == VNET_FRAME_CONNECTION_END) {
+          fdb_table_remove_port(devices, port);
+          fprintf(stdout, "Port %zu disconnected; removed its learned devices.\n", port + 1);
+        }
       }
       offset += sizeof(control);
       continue;
@@ -214,6 +166,8 @@ int main(int argc, char** argv) {
   FILE* switch_destination = NULL;
   fdb_table_t devices;
   int status = EXIT_SUCCESS;
+  cmd_app_t commands = {0};
+  bool commands_started = false;
   if (!ports || !device_entries || !source_ends || !forwarded_bytes) {
     fputs("Could not allocate switch state.\n", stderr);
     status = EXIT_FAILURE;
@@ -221,7 +175,6 @@ int main(int argc, char** argv) {
   }
   fdb_table_init(&devices, device_entries, SWITCH_DEVICE_CAPACITY);
 
-  signal(SIGINT, handle_signal);
   for (size_t i = 0; i < port_count; ++i) {
     ports[i].path = argv[i + 3];
     if (ports[i].path[0] == '-' || strcmpi(ports[i].path, switch_path) == 0) {
@@ -260,14 +213,13 @@ int main(int argc, char** argv) {
     fprintf(stdout, "Opened bilateral connection between switch '%s' and '%s' on port %zu.\n", switch_path, ports[i].path, i + 1);
   }
 
-  cmd_app_t commands;
   cmd_app_init(&commands);
   if (!cmd_app_register(&commands, "info", "Show the switch file and connected port files.", command_info, &(switch_context_t) {.path = switch_path, .ports = ports, .port_count = port_count, .devices = &devices}) || !cmd_app_register(&commands, "fdb", "Show or delete learned MAC-to-port mappings.", command_fdb, &(switch_context_t) {.path = switch_path, .ports = ports, .port_count = port_count, .devices = &devices}) || !cmd_app_start(&commands)) {
     fputs("Could not start the command application.\n", stderr);
     status = EXIT_FAILURE;
     goto cleanup;
   }
-  command_app = &commands;
+  commands_started = true;
 
   while (cmd_app_is_running(&commands)) {
     for (size_t i = 0; i < port_count; ++i) {
@@ -314,10 +266,9 @@ int main(int argc, char** argv) {
   }
 
 cleanup:
-  if (command_app) {
-    cmd_app_stop(command_app);
-    cmd_app_join(command_app);
-    command_app = NULL;
+  if (commands_started) {
+    cmd_app_stop(&commands);
+    cmd_app_join(&commands);
   }
   if (switch_destination) {
     for (size_t i = 0; i < port_count; ++i) {
