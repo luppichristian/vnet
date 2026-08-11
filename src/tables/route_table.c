@@ -20,6 +20,8 @@ static unsigned int administrative_distance(route_source_t source) {
       return 1;
     case ROUTE_SOURCE_RIP:
       return 120;
+    case ROUTE_SOURCE_OSPF:
+      return 110;
   }
   return UINT_MAX;
 }
@@ -75,6 +77,34 @@ bool route_table_learn_rip(route_table_t* table, ipv4_address_t destination, ipv
   return metric == 16 || route_table_add_source(table, destination, mask, next_hop, interface_index, metric, ROUTE_SOURCE_RIP, expires_at);
 }
 
+bool route_table_learn_ospf(route_table_t* table, ipv4_address_t destination, ipv4_address_t mask, ipv4_address_t next_hop, size_t interface_index, uint32_t metric, uint32_t expires_at) {
+  if (metric == 0 || !route_is_valid(destination, mask)) return false;
+  for (size_t i = 0; i < table->count; ++i) {
+    route_entry_t* route = &table->entries[i];
+    if (route->source == ROUTE_SOURCE_OSPF && route->destination == destination && route->mask == mask && route->next_hop == next_hop && route->interface_index == interface_index) {
+      route->metric = metric;
+      route->expires_at = expires_at;
+      return true;
+    }
+  }
+  return route_table_add_source(table, destination, mask, next_hop, interface_index, metric, ROUTE_SOURCE_OSPF, expires_at);
+}
+
+void route_table_remove_ospf(route_table_t* table) {
+  for (size_t i = 0; i < table->count;) {
+    if (table->entries[i].source == ROUTE_SOURCE_OSPF) route_table_remove(table, i);
+    else ++i;
+  }
+}
+
+void route_table_expire_ospf(route_table_t* table, uint32_t now) {
+  for (size_t i = 0; i < table->count;) {
+    const route_entry_t* route = &table->entries[i];
+    if (route->source == ROUTE_SOURCE_OSPF && route->expires_at <= now) route_table_remove(table, i);
+    else ++i;
+  }
+}
+
 void route_table_remove_rip(route_table_t* table) {
   for (size_t i = 0; i < table->count;) {
     if (table->entries[i].source == ROUTE_SOURCE_RIP) {
@@ -127,6 +157,8 @@ const char* route_source_name(route_source_t source) {
       return "static";
     case ROUTE_SOURCE_RIP:
       return "rip";
+    case ROUTE_SOURCE_OSPF:
+      return "ospf";
   }
   return "unknown";
 }

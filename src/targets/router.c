@@ -12,6 +12,7 @@ OSI/ISO layer: Layer 3; it routes IPv4 packets and resolves each egress next hop
 #include <ipv4.h>
 #include <math.h>
 #include <mutex.h>
+#include <ospf.h>
 #include <rarp.h>
 #include <rarp_table.h>
 #include <rip.h>
@@ -37,6 +38,14 @@ OSI/ISO layer: Layer 3; it routes IPv4 packets and resolves each egress next hop
 #define SLEEP_INTERVAL_MS         5
 #define RIP_ROUTE_TIMEOUT_SECONDS 180
 #define RIP_UPDATE_INTERVAL_SECONDS 30
+#define OSPF_ROUTE_TIMEOUT_SECONDS 40
+#define OSPF_UPDATE_INTERVAL_SECONDS 10
+
+typedef enum router_dynamic_routing_mode {
+  ROUTER_DYNAMIC_ROUTING_OFF,
+  ROUTER_DYNAMIC_ROUTING_RIP,
+  ROUTER_DYNAMIC_ROUTING_OSPF,
+} router_dynamic_routing_mode_t;
 
 typedef struct router_port {
   FILE* source;
@@ -66,8 +75,9 @@ typedef struct router_context {
   arp_table_t arp;
   rarp_table_t rarp;
   router_port_t ports[ROUTER_INTERFACE_CAPACITY];
-  bool dynamic_routing;
+  router_dynamic_routing_mode_t dynamic_routing;
   uint32_t next_rip_update;
+  uint32_t next_ospf_update;
   mutex_t mutex;
   cmd_app_t commands;
 } router_context_t;
@@ -75,6 +85,16 @@ typedef struct router_context {
 static cmd_app_t* command_app;
 
 static const mac_address_t rip_multicast_mac = {0x01, 0x00, 0x5E, 0x00, 0x00, 0x09};
+static const mac_address_t ospf_multicast_mac = {0x01, 0x00, 0x5E, 0x00, 0x00, 0x05};
+
+static const char* dynamic_routing_name(router_dynamic_routing_mode_t mode) {
+  switch (mode) {
+    case ROUTER_DYNAMIC_ROUTING_OFF: return "off";
+    case ROUTER_DYNAMIC_ROUTING_RIP: return "rip";
+    case ROUTER_DYNAMIC_ROUTING_OSPF: return "ospf";
+  }
+  return "off";
+}
 
 static uint32_t router_now(void) {
   return (uint32_t)time(NULL);
@@ -87,7 +107,7 @@ static void handle_signal(int sig) {
 }
 
 static void print_usage(void) {
-  fputs("Usage: router -i <file> <mac-address> <ip-address> <mask> [... ] [-r <network> <mask> <next-hop|direct> <interface> <metric> [...]] [-rarp <client-mac> <ip-address> [...]] [-dynamic-routing <on|off>]\n", stderr);
+  fputs("Usage: router -i <file> <mac-address> <ip-address> <mask> [... ] [-r <network> <mask> <next-hop|direct> <interface> <metric> [...]] [-rarp <client-mac> <ip-address> [...]] [-dynamic-routing <off|rip|ospf>]\n", stderr);
 }
 
 static bool append_frame(router_context_t* context, size_t interface_index, const ethernet_frame_data_t* frame) {
@@ -162,6 +182,41 @@ static bool write_rip_updates(router_context_t* context) {
 static bool write_rip_requests(router_context_t* context) {
   for (size_t i = 0; i < context->interfaces.count; ++i) {
     if (!write_rip_packet(context, i, RIP_COMMAND_REQUEST, NULL, 0)) return false;
+  }
+  return true;
+}
+
+static bool write_ospf_updates(router_context_t* context) {
+  ospf_router_link_t links[ROUTER_INTERFACE_CAPACITY] = {0};
+  for (size_t i = 0; i < context->interfaces.count; ++i) {
+    const interface_entry_t* entry = &context->interfaces.entries[i];
+    links[i] = (ospf_router_link_t) {
+        .network = entry->ip4 & entry->mask,
+        .mask = entry->mask,
+        .metric = 10,
+    };
+  }
+  uint8_t ospf_bytes[sizeof(ospf_header_t) + ROUTER_INTERFACE_CAPACITY * sizeof(ospf_router_link_t)] = {0};
+  size_t ospf_length = 0;
+  if (!ospf_write_router_update(context->interfaces.entries[0].ip4, links, context->interfaces.count, ospf_bytes, sizeof(ospf_bytes), &ospf_length)) return false;
+  for (size_t i = 0; i < context->interfaces.count; ++i) {
+    const interface_entry_t* entry = &context->interfaces.entries[i];
+    if (!entry->enabled) continue;
+    ipv4_packet_data_t packet = {
+        .src_addr = entry->ip4,
+        .dst_addr = OSPF_ALL_SPF_ROUTERS,
+        .protocol = OSPF_IPV4_PROTOCOL,
+        .data = ospf_bytes,
+        .data_length = (uint16_t)ospf_length,
+    };
+    memcpy(packet.src_mac_addr, entry->mac, sizeof(packet.src_mac_addr));
+    memcpy(packet.dst_mac_addr, ospf_multicast_mac, sizeof(packet.dst_mac_addr));
+    router_port_t* port = &context->ports[i];
+    const long before = ftell(port->destination);
+    if (before < 0 || !ipv4_write_ethernet_packet(port->destination, &packet)) return false;
+    const long after = ftell(port->destination);
+    if (after < before || fflush(port->destination) != 0) return false;
+    port->injected_bytes += (size_t)(after - before);
   }
   return true;
 }
@@ -354,7 +409,7 @@ static bool handle_rarp(router_context_t* context, size_t ingress_interface, con
 
 static bool handle_rip(router_context_t* context, size_t ingress_interface, const ipv4_packet_view_t* ipv4_packet) {
   const interface_entry_t* ingress = interface_table_get(&context->interfaces, ingress_interface);
-  if (!context->dynamic_routing || !ingress || ipv4_packet->header.src_addr == ingress->ip4 || ipv4_packet->header.protocol != UDP_IPV4_PROTOCOL || !rip_is_multicast_address(ipv4_packet->header.dst_addr)) return true;
+  if (context->dynamic_routing != ROUTER_DYNAMIC_ROUTING_RIP || !ingress || ipv4_packet->header.src_addr == ingress->ip4 || ipv4_packet->header.protocol != UDP_IPV4_PROTOCOL || !rip_is_multicast_address(ipv4_packet->header.dst_addr)) return true;
   udp_packet_view_t udp_packet = {0};
   rip_packet_view_t rip_packet = {0};
   if (!udp_parse_packet(ipv4_packet->payload, ipv4_packet->payload_length, ipv4_packet->header.src_addr, ipv4_packet->header.dst_addr, &udp_packet) || udp_packet.header.src_port != RIP_UDP_PORT || udp_packet.header.dst_port != RIP_UDP_PORT || !rip_parse_packet(udp_packet.data, udp_packet.data_length, &rip_packet)) return true;
@@ -372,6 +427,22 @@ static bool handle_rip(router_context_t* context, size_t ingress_interface, cons
   return true;
 }
 
+static bool handle_ospf(router_context_t* context, size_t ingress_interface, const ipv4_packet_view_t* ipv4_packet) {
+  const interface_entry_t* ingress = interface_table_get(&context->interfaces, ingress_interface);
+  if (context->dynamic_routing != ROUTER_DYNAMIC_ROUTING_OSPF || !ingress || ipv4_packet->header.src_addr == ingress->ip4 || ipv4_packet->header.protocol != OSPF_IPV4_PROTOCOL || !ospf_is_all_spf_routers(ipv4_packet->header.dst_addr)) return true;
+  ospf_packet_view_t packet = {0};
+  if (!ospf_parse_router_update(ipv4_packet->payload, ipv4_packet->payload_length, &packet)) return true;
+  const uint32_t expires_at = router_now() + OSPF_ROUTE_TIMEOUT_SECONDS;
+  for (size_t i = 0; i < packet.link_count; ++i) {
+    const ospf_router_link_t* link = &packet.links[i];
+    if (!route_table_learn_ospf(&context->routes, link->network, link->mask, ipv4_packet->header.src_addr, ingress_interface, link->metric, expires_at)) return false;
+  }
+  fprintf(stdout, "Learned %zu OSPF route%s from router ", packet.link_count, packet.link_count == 1 ? "" : "s");
+  ipv4_address_print(stdout, packet.header.router_id);
+  fputs(".\n", stdout);
+  return true;
+}
+
 static bool handle_ethernet(router_context_t* context, size_t ingress_interface, const uint8_t* bytes, size_t byte_count) {
   ethernet_frame_view_t frame = {0};
   if (!ethernet_parse_frame(bytes, byte_count, &frame) || frame.format != ETHERNET_FRAME_FORMAT_II) return true;
@@ -384,12 +455,14 @@ static bool handle_ethernet(router_context_t* context, size_t ingress_interface,
   fprintf(stdout, " EtherType=0x%04X\n", frame.header.type_or_length);
   const bool destination_is_interface = memcmp(frame.header.dst_mac, entry->mac, sizeof(entry->mac)) == 0;
   const bool destination_is_rip_multicast = memcmp(frame.header.dst_mac, rip_multicast_mac, sizeof(rip_multicast_mac)) == 0;
+  const bool destination_is_ospf_multicast = memcmp(frame.header.dst_mac, ospf_multicast_mac, sizeof(ospf_multicast_mac)) == 0;
   if (frame.header.type_or_length == ETHERNET_ETHERTYPE_ARP && (destination_is_interface || ethernet_mac_is_broadcast(frame.header.dst_mac))) return handle_arp(context, ingress_interface, &frame);
   if (frame.header.type_or_length == ETHERNET_ETHERTYPE_RARP && (destination_is_interface || ethernet_mac_is_broadcast(frame.header.dst_mac))) return handle_rarp(context, ingress_interface, &frame);
-  if (frame.header.type_or_length != ETHERNET_ETHERTYPE_IPV4 || (!destination_is_interface && !destination_is_rip_multicast)) return true;
+  if (frame.header.type_or_length != ETHERNET_ETHERTYPE_IPV4 || (!destination_is_interface && !destination_is_rip_multicast && !destination_is_ospf_multicast)) return true;
   ipv4_packet_view_t packet = {0};
   if (!ipv4_parse_packet(frame.data, frame.client_data_length, &packet)) return true;
   if (destination_is_rip_multicast) return handle_rip(context, ingress_interface, &packet);
+  if (destination_is_ospf_multicast) return handle_ospf(context, ingress_interface, &packet);
   return route_ipv4(context, ingress_interface, &packet);
 }
 
@@ -429,7 +502,7 @@ static bool process_port(router_context_t* context, size_t interface_index) {
 
 static void print_info(router_context_t* context) {
   mutex_lock(&context->mutex);
-  fprintf(stdout, "Dynamic routing: %s%s\n", context->dynamic_routing ? "on" : "off", context->dynamic_routing ? " (RIP v2)" : "");
+  fprintf(stdout, "Dynamic routing: %s\n", dynamic_routing_name(context->dynamic_routing));
   fprintf(stdout, "Interfaces (%zu):\n", context->interfaces.count);
   for (size_t i = 0; i < context->interfaces.count; ++i) {
     const interface_entry_t* entry = &context->interfaces.entries[i];
@@ -519,26 +592,31 @@ static void command_interface(void* argument, char* arguments) {
 
 static void command_dynamic_routing(void* argument, char* arguments) {
   router_context_t* context = argument;
-  char* state = cmd_app_next_argument(&arguments);
-  if (!state || cmd_app_next_argument(&arguments) || (strcmpi(state, "on") != 0 && strcmpi(state, "off") != 0)) {
-    fputs("Usage: dynamic-routing <on|off>\n", stderr);
+  char* mode_text = cmd_app_next_argument(&arguments);
+  if (!mode_text || cmd_app_next_argument(&arguments) || (strcmpi(mode_text, "off") != 0 && strcmpi(mode_text, "rip") != 0 && strcmpi(mode_text, "ospf") != 0)) {
+    fputs("Usage: dynamic-routing <off|rip|ospf>\n", stderr);
     return;
   }
+  const router_dynamic_routing_mode_t mode = strcmpi(mode_text, "rip") == 0 ? ROUTER_DYNAMIC_ROUTING_RIP : strcmpi(mode_text, "ospf") == 0 ? ROUTER_DYNAMIC_ROUTING_OSPF : ROUTER_DYNAMIC_ROUTING_OFF;
   mutex_lock(&context->mutex);
-  const bool enabled = strcmpi(state, "on") == 0;
-  context->dynamic_routing = enabled;
-  if (enabled) {
-    context->next_rip_update = router_now() + RIP_UPDATE_INTERVAL_SECONDS;
-    if (!write_rip_requests(context) || !write_rip_updates(context)) {
-      mutex_unlock(&context->mutex);
-      fputs("Could not start RIP routing updates.\n", stderr);
-      return;
-    }
-  } else {
-    route_table_remove_rip(&context->routes);
+  route_table_remove_rip(&context->routes);
+  route_table_remove_ospf(&context->routes);
+  context->dynamic_routing = mode;
+  const uint32_t now = router_now();
+  bool started = true;
+  if (mode == ROUTER_DYNAMIC_ROUTING_RIP) {
+    context->next_rip_update = now + RIP_UPDATE_INTERVAL_SECONDS;
+    started = write_rip_requests(context) && write_rip_updates(context);
+  } else if (mode == ROUTER_DYNAMIC_ROUTING_OSPF) {
+    context->next_ospf_update = now + OSPF_UPDATE_INTERVAL_SECONDS;
+    started = write_ospf_updates(context);
   }
   mutex_unlock(&context->mutex);
-  fprintf(stdout, "Dynamic routing is %s.\n", enabled ? "on (RIP v2)" : "off");
+  if (!started) {
+    fputs("Could not start selected dynamic routing protocol.\n", stderr);
+    return;
+  }
+  fprintf(stdout, "Dynamic routing: %s.\n", dynamic_routing_name(mode));
 }
 
 static void command_route(void* argument, char* arguments) {
@@ -643,8 +721,8 @@ static bool parse_options(router_context_t* context, int argc, char** argv) {
       if (!ipv4_parse_address(argv[i + 1], &network) || !ipv4_parse_address(argv[i + 2], &mask) || (strcmpi(argv[i + 3], "direct") != 0 && !ipv4_parse_address(argv[i + 3], &next_hop)) || !cmd_app_parse_uint16(argv[i + 4], &interface_number) || interface_number == 0 || interface_number > context->interfaces.count || !cmd_app_parse_uint32(argv[i + 5], &metric) || !route_table_add(&context->routes, network, mask, next_hop, interface_number - 1, metric)) return false;
       i += 6;
     } else if (strcmpi(argv[i], "-dynamic-routing") == 0) {
-      if (i + 1 >= argc || (strcmpi(argv[i + 1], "on") != 0 && strcmpi(argv[i + 1], "off") != 0)) return false;
-      context->dynamic_routing = strcmpi(argv[i + 1], "on") == 0;
+      if (i + 1 >= argc || (strcmpi(argv[i + 1], "off") != 0 && strcmpi(argv[i + 1], "rip") != 0 && strcmpi(argv[i + 1], "ospf") != 0)) return false;
+      context->dynamic_routing = strcmpi(argv[i + 1], "rip") == 0 ? ROUTER_DYNAMIC_ROUTING_RIP : strcmpi(argv[i + 1], "ospf") == 0 ? ROUTER_DYNAMIC_ROUTING_OSPF : ROUTER_DYNAMIC_ROUTING_OFF;
       i += 2;
     } else if (strcmpi(argv[i], "-rarp") == 0) {
       if (i + 2 >= argc || context->rarp.count == ROUTER_RARP_CAPACITY) return false;
@@ -691,19 +769,19 @@ int main(int argc, char** argv) {
     }
   }
   cmd_app_init(&context.commands);
-  if (!cmd_app_register(&context.commands, "info", "Show router state, including RIP route sources.", command_info, &context) || !cmd_app_register(&context.commands, "arp", "Resolve an IPv4 neighbor on one interface.", command_arp, &context) || !cmd_app_register(&context.commands, "arp-delete", "Remove one learned ARP neighbor.", command_arp_delete, &context) || !cmd_app_register(&context.commands, "interface", "Administratively bring an interface up or down.", command_interface, &context) || !cmd_app_register(&context.commands, "dynamic-routing", "Enable or disable RIP v2 dynamic routing.", command_dynamic_routing, &context) || !cmd_app_register(&context.commands, "route", "Add or delete a route in the forwarding table.", command_route, &context) || !cmd_app_register(&context.commands, "rarp-table", "Set or delete a static RARP assignment.", command_rarp_table, &context) || !cmd_app_start(&context.commands)) {
+  if (!cmd_app_register(&context.commands, "info", "Show router state, including dynamic route sources.", command_info, &context) || !cmd_app_register(&context.commands, "arp", "Resolve an IPv4 neighbor on one interface.", command_arp, &context) || !cmd_app_register(&context.commands, "arp-delete", "Remove one learned ARP neighbor.", command_arp_delete, &context) || !cmd_app_register(&context.commands, "interface", "Administratively bring an interface up or down.", command_interface, &context) || !cmd_app_register(&context.commands, "dynamic-routing", "Select off, RIP v2, or OSPF dynamic routing.", command_dynamic_routing, &context) || !cmd_app_register(&context.commands, "route", "Add or delete a route in the forwarding table.", command_route, &context) || !cmd_app_register(&context.commands, "rarp-table", "Set or delete a static RARP assignment.", command_rarp_table, &context) || !cmd_app_start(&context.commands)) {
     fputs("Could not start the command application.\n", stderr);
     status = EXIT_FAILURE;
     goto cleanup;
   }
   command_app = &context.commands;
-  if (context.dynamic_routing) {
-    context.next_rip_update = router_now() + RIP_UPDATE_INTERVAL_SECONDS;
+  if (context.dynamic_routing != ROUTER_DYNAMIC_ROUTING_OFF) {
+    const uint32_t now = router_now();
     mutex_lock(&context.mutex);
-    const bool started_rip = write_rip_requests(&context) && write_rip_updates(&context);
+    const bool started = context.dynamic_routing == ROUTER_DYNAMIC_ROUTING_RIP ? (context.next_rip_update = now + RIP_UPDATE_INTERVAL_SECONDS, write_rip_requests(&context) && write_rip_updates(&context)) : (context.next_ospf_update = now + OSPF_UPDATE_INTERVAL_SECONDS, write_ospf_updates(&context));
     mutex_unlock(&context.mutex);
-    if (!started_rip) {
-      fputs("Could not start RIP routing updates.\n", stderr);
+    if (!started) {
+      fputs("Could not start selected dynamic routing protocol.\n", stderr);
       status = EXIT_FAILURE;
       goto cleanup;
     }
@@ -720,7 +798,7 @@ int main(int argc, char** argv) {
       }
     }
     mutex_lock(&context.mutex);
-    if (context.dynamic_routing) {
+    if (context.dynamic_routing == ROUTER_DYNAMIC_ROUTING_RIP) {
       const uint32_t now = router_now();
       route_table_expire_rip(&context.routes, now);
       if (now >= context.next_rip_update) {
@@ -731,6 +809,18 @@ int main(int argc, char** argv) {
           goto cleanup;
         }
         context.next_rip_update = now + RIP_UPDATE_INTERVAL_SECONDS;
+      }
+    } else if (context.dynamic_routing == ROUTER_DYNAMIC_ROUTING_OSPF) {
+      const uint32_t now = router_now();
+      route_table_expire_ospf(&context.routes, now);
+      if (now >= context.next_ospf_update) {
+        if (!write_ospf_updates(&context)) {
+          mutex_unlock(&context.mutex);
+          fputs("Could not send OSPF routing update.\n", stderr);
+          status = EXIT_FAILURE;
+          goto cleanup;
+        }
+        context.next_ospf_update = now + OSPF_UPDATE_INTERVAL_SECONDS;
       }
     }
     for (size_t i = 0; i < context.interfaces.count; ++i) {
