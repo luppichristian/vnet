@@ -4,13 +4,14 @@ OSI/ISO layer: Layer 2 endpoint; optional IPv4 configuration supplies Layer 3 id
 */
 
 #include <arp.h>
+#include <cmd_app.h>
 #include <ethernet.h>
 #include <futils.h>
 #include <icmp.h>
 #include <ipv4.h>
 #include <mutex.h>
 #include <rarp.h>
-#include <signal.h>
+
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -21,11 +22,11 @@ OSI/ISO layer: Layer 2 endpoint; optional IPv4 configuration supplies Layer 3 id
 #include <udp.h>
 #include <vnet.h>
 
-#define HOST_DEVICE_CAPACITY 64
-#define HOST_ARP_CAPACITY    64
-#define HOST_BUFFER_SIZE     8192
+#define HOST_DEVICE_CAPACITY  64
+#define HOST_ARP_CAPACITY     64
+#define HOST_BUFFER_SIZE      8192
 #define HOST_PENDING_DATA_MAX (ETHERNET_MAX_DATA_LEN - sizeof(ipv4_header_t) - sizeof(tcp_header_t))
-#define SLEEP_INTERVAL_MS    5
+#define SLEEP_INTERVAL_MS     5
 
 typedef struct host_device {
   mac_address_t mac;
@@ -69,9 +70,9 @@ typedef struct host_context {
   bool has_ip4;
   bool has_gateway;
   uint16_t ping_sequence;
-  volatile sig_atomic_t running;
   FILE* source;
   mutex_t mutex;
+  cmd_app_t commands;
   host_device_t devices[HOST_DEVICE_CAPACITY];
   size_t device_count;
   host_arp_entry_t arp_entries[HOST_ARP_CAPACITY];
@@ -291,10 +292,13 @@ static bool write_tcp(host_context_t* context, const host_pending_packet_t* pend
 static bool send_pending_packet(host_context_t* context, const host_pending_packet_t* pending, const mac_address_t destination_mac) {
   bool written = false;
   if (pending->type == HOST_PENDING_PING) written = write_ping(context, pending->destination, destination_mac);
-  else if (pending->type == HOST_PENDING_UDP) written = write_udp(context, pending, destination_mac);
-  else if (pending->type == HOST_PENDING_TCP) written = write_tcp(context, pending, destination_mac);
+  else if (pending->type == HOST_PENDING_UDP)
+    written = write_udp(context, pending, destination_mac);
+  else if (pending->type == HOST_PENDING_TCP)
+    written = write_tcp(context, pending, destination_mac);
   if (written) {
-    fprintf(stdout, "Sent %s to ", pending->type == HOST_PENDING_PING ? "ping" : pending->type == HOST_PENDING_UDP ? "UDP datagram" : "TCP segment");
+    fprintf(stdout, "Sent %s to ", pending->type == HOST_PENDING_PING ? "ping" : pending->type == HOST_PENDING_UDP ? "UDP datagram"
+                                                                                                                   : "TCP segment");
     ipv4_address_print(stdout, pending->destination);
     fputs(".\n", stdout);
   }
@@ -506,14 +510,14 @@ static void receiver_thread(void* argument) {
   host_context_t* context = argument;
   uint8_t buffer[HOST_BUFFER_SIZE] = {0};
   size_t buffer_length = 0;
-  while (context->running) {
+  while (cmd_app_is_running(&context->commands)) {
     long end = 0;
     const long position = ftell(context->source);
     if (position < 0 || !get_file_end(context->source, &end)) {
       mutex_lock(&context->mutex);
       fputs("Could not read the network file.\n", stderr);
       mutex_unlock(&context->mutex);
-      context->running = false;
+      cmd_app_stop(&context->commands);
       break;
     }
     if (position < end) {
@@ -523,7 +527,7 @@ static void receiver_thread(void* argument) {
         mutex_lock(&context->mutex);
         fputs("Could not read the network file.\n", stderr);
         mutex_unlock(&context->mutex);
-        context->running = false;
+        cmd_app_stop(&context->commands);
         break;
       }
       buffer_length += read_count;
@@ -537,10 +541,6 @@ static void receiver_thread(void* argument) {
     }
     thread_sleep(SLEEP_INTERVAL_MS);
   }
-}
-
-static void print_help(void) {
-  fputs("Commands:\n  help              Show this command list.\n  info              Show host, routes, ARP cache, and learned devices.\n  arp <ip-address>  Resolve the local destination or next-hop gateway.\n  rarp              Request an IPv4 address for this host MAC.\n  ping <ip-address> Send an ICMP Echo Request after ARP resolution.\n  udp <src_port> <dst_port> <dst_ip> -d <data>\n                    Send a UDP datagram after ARP resolution.\n  tcp <src_port> <dst_port> <dst_ip> -d <data> [-seq <number>] [-ack <number>]\n      [-window <number>] [-flags <syn,ack,...>]\n                    Send a base-header TCP segment after ARP resolution.\n  quit              Stop the receiver and exit.\n", stdout);
 }
 
 static void print_usage(void) {
@@ -574,7 +574,16 @@ static bool parse_options(host_context_t* context, int argc, char** argv) {
   return context->has_ip4 || (!context->has_gateway && context->mask == IPV4_ADDRESS(255, 255, 255, 0));
 }
 
-static void command_arp(host_context_t* context, const char* argument) {
+static void command_info(void* argument, char* arguments) {
+  if (!cmd_app_arguments_empty(arguments)) {
+    fputs("Usage: info\n", stderr);
+    return;
+  }
+  print_info(argument);
+}
+
+static void command_arp(void* context_argument, char* argument) {
+  host_context_t* context = context_argument;
   ipv4_address_t destination = 0;
   ipv4_address_t next_hop = 0;
   if (!context->has_ip4) {
@@ -595,8 +604,9 @@ static void command_arp(host_context_t* context, const char* argument) {
   }
 }
 
-static void command_rarp(host_context_t* context, const char* argument) {
-  if (*argument != '\0') {
+static void command_rarp(void* context_argument, char* argument) {
+  host_context_t* context = context_argument;
+  if (!cmd_app_arguments_empty(argument)) {
     fputs("Usage: rarp\n", stderr);
   } else if (context->has_ip4) {
     fputs("RARP requires a host without an IPv4 address.\n", stderr);
@@ -607,7 +617,8 @@ static void command_rarp(host_context_t* context, const char* argument) {
   }
 }
 
-static void command_ping(host_context_t* context, const char* argument) {
+static void command_ping(void* context_argument, char* argument) {
+  host_context_t* context = context_argument;
   ipv4_address_t destination = 0;
   ipv4_address_t next_hop = 0;
   if (!context->has_ip4) {
@@ -623,7 +634,7 @@ static void command_ping(host_context_t* context, const char* argument) {
     if (entry) {
       memcpy(mac, entry->mac, sizeof(mac));
     } else {
-      context->pending_packet = (host_pending_packet_t){
+      context->pending_packet = (host_pending_packet_t) {
           .destination = destination,
           .next_hop = next_hop,
           .type = HOST_PENDING_PING,
@@ -644,30 +655,6 @@ static void command_ping(host_context_t* context, const char* argument) {
   }
 }
 
-static bool parse_uint16(const char* text, uint16_t* value) {
-  uint64_t parsed = 0;
-  if (*text == '\0') return false;
-  for (; *text; ++text) {
-    if (*text < '0' || *text > '9') return false;
-    parsed = parsed * 10 + (uint64_t)(*text - '0');
-    if (parsed > UINT16_MAX) return false;
-  }
-  *value = (uint16_t)parsed;
-  return true;
-}
-
-static bool parse_uint32(const char* text, uint32_t* value) {
-  uint64_t parsed = 0;
-  if (*text == '\0') return false;
-  for (; *text; ++text) {
-    if (*text < '0' || *text > '9') return false;
-    parsed = parsed * 10 + (uint64_t)(*text - '0');
-    if (parsed > UINT32_MAX) return false;
-  }
-  *value = (uint32_t)parsed;
-  return true;
-}
-
 static bool parse_tcp_flags(char* text, uint16_t* flags) {
   *flags = 0;
   char* flag = text;
@@ -675,29 +662,29 @@ static bool parse_tcp_flags(char* text, uint16_t* flags) {
     char* next = strchr(flag, ',');
     if (next) *next = '\0';
     if (strcmpi(flag, "fin") == 0) *flags |= TCP_FLAG_FIN;
-    else if (strcmpi(flag, "syn") == 0) *flags |= TCP_FLAG_SYN;
-    else if (strcmpi(flag, "rst") == 0) *flags |= TCP_FLAG_RST;
-    else if (strcmpi(flag, "psh") == 0) *flags |= TCP_FLAG_PSH;
-    else if (strcmpi(flag, "ack") == 0) *flags |= TCP_FLAG_ACK;
-    else if (strcmpi(flag, "urg") == 0) *flags |= TCP_FLAG_URG;
-    else if (strcmpi(flag, "ece") == 0) *flags |= TCP_FLAG_ECE;
-    else if (strcmpi(flag, "cwr") == 0) *flags |= TCP_FLAG_CWR;
-    else if (strcmpi(flag, "ns") == 0) *flags |= TCP_FLAG_NS;
-    else return false;
+    else if (strcmpi(flag, "syn") == 0)
+      *flags |= TCP_FLAG_SYN;
+    else if (strcmpi(flag, "rst") == 0)
+      *flags |= TCP_FLAG_RST;
+    else if (strcmpi(flag, "psh") == 0)
+      *flags |= TCP_FLAG_PSH;
+    else if (strcmpi(flag, "ack") == 0)
+      *flags |= TCP_FLAG_ACK;
+    else if (strcmpi(flag, "urg") == 0)
+      *flags |= TCP_FLAG_URG;
+    else if (strcmpi(flag, "ece") == 0)
+      *flags |= TCP_FLAG_ECE;
+    else if (strcmpi(flag, "cwr") == 0)
+      *flags |= TCP_FLAG_CWR;
+    else if (strcmpi(flag, "ns") == 0)
+      *flags |= TCP_FLAG_NS;
+    else
+      return false;
     if (!next) break;
     flag = next + 1;
     if (*flag == '\0') return false;
   }
   return true;
-}
-
-static char* next_token(char** text) {
-  while (**text == ' ') ++*text;
-  if (**text == '\0') return NULL;
-  char* token = *text;
-  while (**text != '\0' && **text != ' ') ++*text;
-  if (**text == ' ') *(*text)++ = '\0';
-  return token;
 }
 
 static void command_transport(host_context_t* context, host_pending_packet_t* pending) {
@@ -728,20 +715,21 @@ static void command_transport(host_context_t* context, host_pending_packet_t* pe
   }
 }
 
-static void command_udp(host_context_t* context, char* argument) {
+static void command_udp(void* context_argument, char* argument) {
+  host_context_t* context = context_argument;
   char* cursor = argument;
-  char* src_port = next_token(&cursor);
-  char* dst_port = next_token(&cursor);
-  char* dst_ip = next_token(&cursor);
-  char* data_marker = next_token(&cursor);
-  char* data = next_token(&cursor);
-  if (!src_port || !dst_port || !dst_ip || !data_marker || !data || next_token(&cursor) || strcmpi(data_marker, "-d") != 0) {
+  char* src_port = cmd_app_next_argument(&cursor);
+  char* dst_port = cmd_app_next_argument(&cursor);
+  char* dst_ip = cmd_app_next_argument(&cursor);
+  char* data_marker = cmd_app_next_argument(&cursor);
+  char* data = cmd_app_next_argument(&cursor);
+  if (!src_port || !dst_port || !dst_ip || !data_marker || !data || cmd_app_next_argument(&cursor) || strcmpi(data_marker, "-d") != 0) {
     fputs("Usage: udp <src_port> <dst_port> <dst_ip> -d <data>\n", stderr);
     return;
   }
   host_pending_packet_t pending = {.type = HOST_PENDING_UDP};
   const size_t data_length = strlen(data);
-  if (!parse_uint16(src_port, &pending.src_port) || !parse_uint16(dst_port, &pending.dst_port) || !ipv4_parse_address(dst_ip, &pending.destination) || data_length > HOST_PENDING_DATA_MAX) {
+  if (!cmd_app_parse_uint16(src_port, &pending.src_port) || !cmd_app_parse_uint16(dst_port, &pending.dst_port) || !ipv4_parse_address(dst_ip, &pending.destination) || data_length > HOST_PENDING_DATA_MAX) {
     fputs("Invalid UDP ports, destination, or data (maximum 1460 bytes).\n", stderr);
     return;
   }
@@ -750,31 +738,29 @@ static void command_udp(host_context_t* context, char* argument) {
   command_transport(context, &pending);
 }
 
-static void command_tcp(host_context_t* context, char* argument) {
+static void command_tcp(void* context_argument, char* argument) {
+  host_context_t* context = context_argument;
   char* cursor = argument;
-  char* src_port = next_token(&cursor);
-  char* dst_port = next_token(&cursor);
-  char* dst_ip = next_token(&cursor);
+  char* src_port = cmd_app_next_argument(&cursor);
+  char* dst_port = cmd_app_next_argument(&cursor);
+  char* dst_ip = cmd_app_next_argument(&cursor);
   host_pending_packet_t pending = {.type = HOST_PENDING_TCP, .sequence_number = 1, .window_size = UINT16_MAX, .flags = TCP_FLAG_PSH | TCP_FLAG_ACK};
   char* data = NULL;
-  if (!src_port || !dst_port || !dst_ip || !parse_uint16(src_port, &pending.src_port) || !parse_uint16(dst_port, &pending.dst_port) || !ipv4_parse_address(dst_ip, &pending.destination)) goto usage;
-  for (char* option = next_token(&cursor); option; option = next_token(&cursor)) {
-    char* value = next_token(&cursor);
+  if (!src_port || !dst_port || !dst_ip || !cmd_app_parse_uint16(src_port, &pending.src_port) || !cmd_app_parse_uint16(dst_port, &pending.dst_port) || !ipv4_parse_address(dst_ip, &pending.destination)) goto usage;
+  for (char* option = cmd_app_next_argument(&cursor); option; option = cmd_app_next_argument(&cursor)) {
+    char* value = cmd_app_next_argument(&cursor);
     if (!value) goto usage;
     if (strcmpi(option, "-d") == 0) data = value;
     else if (strcmpi(option, "-seq") == 0) {
-      if (!parse_uint32(value, &pending.sequence_number)) goto usage;
-    }
-    else if (strcmpi(option, "-ack") == 0) {
-      if (!parse_uint32(value, &pending.acknowledgement_number)) goto usage;
-    }
-    else if (strcmpi(option, "-window") == 0) {
-      if (!parse_uint16(value, &pending.window_size)) goto usage;
-    }
-    else if (strcmpi(option, "-flags") == 0) {
+      if (!cmd_app_parse_uint32(value, &pending.sequence_number)) goto usage;
+    } else if (strcmpi(option, "-ack") == 0) {
+      if (!cmd_app_parse_uint32(value, &pending.acknowledgement_number)) goto usage;
+    } else if (strcmpi(option, "-window") == 0) {
+      if (!cmd_app_parse_uint16(value, &pending.window_size)) goto usage;
+    } else if (strcmpi(option, "-flags") == 0) {
       if (!parse_tcp_flags(value, &pending.flags)) goto usage;
-    }
-    else if (strcmpi(option, "-d") != 0) goto usage;
+    } else if (strcmpi(option, "-d") != 0)
+      goto usage;
   }
   if (!data || strlen(data) > HOST_PENDING_DATA_MAX) goto usage;
   memcpy(pending.data, data, strlen(data));
@@ -790,7 +776,7 @@ int main(int argc, char** argv) {
     print_usage();
     return EXIT_FAILURE;
   }
-  host_context_t context = {.path = argv[1], .running = true};
+  host_context_t context = {.path = argv[1]};
   if (!ethernet_mac_parse(argv[2], context.mac) || !parse_options(&context, argc, argv) || (context.has_gateway && !ip4_is_local(&context, context.gateway))) {
     print_usage();
     return EXIT_FAILURE;
@@ -806,6 +792,7 @@ int main(int argc, char** argv) {
     fclose(context.source);
     return EXIT_FAILURE;
   }
+  cmd_app_init(&context.commands);
   thread_t thread;
   if (!thread_start(&thread, receiver_thread, &context)) {
     fprintf(stderr, "Could not start the packet receiver thread.\n");
@@ -814,41 +801,17 @@ int main(int argc, char** argv) {
     return EXIT_FAILURE;
   }
 
-  print_help();
-  char command[HOST_PENDING_DATA_MAX + 256] = {0};
-  while (context.running && fputs("> ", stdout) >= 0 && fflush(stdout) == 0 && fgets(command, sizeof(command), stdin)) {
-    command[strcspn(command, "\r\n")] = '\0';
-    char* argument = command;
-    while (*argument != '\0' && *argument != ' ') {
-      ++argument;
-    }
-    if (*argument != '\0') {
-      *argument++ = '\0';
-      while (*argument == ' ') {
-        ++argument;
-      }
-    }
-    if (strcmpi(command, "help") == 0) {
-      print_help();
-    } else if (strcmpi(command, "info") == 0) {
-      print_info(&context);
-    } else if (strcmpi(command, "arp") == 0) {
-      command_arp(&context, argument);
-    } else if (strcmpi(command, "rarp") == 0) {
-      command_rarp(&context, argument);
-    } else if (strcmpi(command, "ping") == 0) {
-      command_ping(&context, argument);
-    } else if (strcmpi(command, "udp") == 0) {
-      command_udp(&context, argument);
-    } else if (strcmpi(command, "tcp") == 0) {
-      command_tcp(&context, argument);
-    } else if (strcmpi(command, "quit") == 0) {
-      context.running = false;
-    } else if (command[0] != '\0') {
-      fputs("Unknown command. Type 'help'.\n", stderr);
-    }
+  if (!cmd_app_register(&context.commands, "info", "Show host, routes, ARP cache, and learned devices.", command_info, &context) || !cmd_app_register(&context.commands, "arp", "Resolve the local destination or next-hop gateway.", command_arp, &context) || !cmd_app_register(&context.commands, "rarp", "Request an IPv4 address for this host MAC.", command_rarp, &context) || !cmd_app_register(&context.commands, "ping", "Send an ICMP Echo Request after ARP resolution.", command_ping, &context) || !cmd_app_register(&context.commands, "udp", "Send a UDP datagram after ARP resolution.", command_udp, &context) || !cmd_app_register(&context.commands, "tcp", "Send a base-header TCP segment after ARP resolution.", command_tcp, &context) || !cmd_app_start(&context.commands)) {
+    fputs("Could not start the command application.\n", stderr);
+    cmd_app_stop(&context.commands);
+    thread_join(&thread);
+    mutex_destroy(&context.mutex);
+    fclose(context.source);
+    return EXIT_FAILURE;
   }
-  context.running = false;
+
+  cmd_app_join(&context.commands);
+  cmd_app_stop(&context.commands);
   thread_join(&thread);
   mutex_destroy(&context.mutex);
   fclose(context.source);

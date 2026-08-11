@@ -1,0 +1,45 @@
+id(vnet)
+name("Virtual Network")
+ver(0.1.0)
+
+targets(
+  console(
+    id(connect)
+    output(connect)
+    stdver(c17)
+    include_dirs(src/lib src/protocol src/targets)
+    units(src/targets/connect.c src/lib/*.c src/protocol/*.c)
+  )
+
+  console(
+    id(host)
+    output(host)
+    stdver(c17)
+    include_dirs(src/lib src/protocol src/targets)
+    units(src/targets/host.c src/lib/*.c src/protocol/*.c)
+  )
+
+  console(
+    id(hub)
+    output(hub)
+    stdver(c17)
+    include_dirs(src/lib src/protocol src/targets)
+    units(src/targets/hub.c src/lib/*.c src/protocol/*.c)
+  )
+
+  console(
+    id(switch)
+    output(switch)
+    stdver(c17)
+    include_dirs(src/lib src/protocol src/targets)
+    units(src/targets/switch.c src/lib/*.c src/protocol/*.c)
+  )
+
+  console(
+    id(watch)
+    output(watch)
+    stdver(c17)
+    include_dirs(src/lib src/protocol src/targets)
+    units(src/targets/watch.c src/lib/*.c src/protocol/*.c)
+  )
+)

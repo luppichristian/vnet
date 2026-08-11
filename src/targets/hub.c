@@ -4,6 +4,7 @@ OSI/ISO layer: Layer 1 (physical); it repeats opaque bytes without inspecting MA
 Only data written after the hub opens is repeated to every other port.
 */
 
+#include <cmd_app.h>
 #include <futils.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -16,8 +17,6 @@ Only data written after the hub opens is repeated to every other port.
 
 #define SLEEP_INTERVAL_MS 5
 
-static volatile sig_atomic_t running = true;
-
 typedef struct hub_port {
   const char* path;
   FILE* source;
@@ -26,9 +25,29 @@ typedef struct hub_port {
   bool started;
 } hub_port_t;
 
+typedef struct hub_context {
+  const char* path;
+  const hub_port_t* ports;
+  size_t port_count;
+} hub_context_t;
+
+static cmd_app_t* command_app;
+
 static void handle_signal(int sig) {
-  if (sig == SIGINT) {
-    running = false;
+  if (sig == SIGINT && command_app) {
+    cmd_app_stop(command_app);
+  }
+}
+
+static void command_info(void* argument, char* arguments) {
+  const hub_context_t* context = argument;
+  if (!cmd_app_arguments_empty(arguments)) {
+    fputs("Usage: info\n", stderr);
+    return;
+  }
+  fprintf(stdout, "Hub file: %s\nPorts (%zu):\n", context->path, context->port_count);
+  for (size_t i = 0; i < context->port_count; ++i) {
+    fprintf(stdout, "  %zu: %s\n", i + 1, context->ports[i].path);
   }
 }
 
@@ -105,7 +124,16 @@ int main(int argc, char** argv) {
     goto cleanup;
   }
 
-  while (running) {
+  cmd_app_t commands;
+  cmd_app_init(&commands);
+  if (!cmd_app_register(&commands, "info", "Show the hub file and connected port files.", command_info, &(hub_context_t) {.path = hub_path, .ports = ports, .port_count = port_count}) || !cmd_app_start(&commands)) {
+    fputs("Could not start the command application.\n", stderr);
+    status = EXIT_FAILURE;
+    goto cleanup;
+  }
+  command_app = &commands;
+
+  while (cmd_app_is_running(&commands)) {
     memset(received_bytes, 0, port_count * sizeof(*received_bytes));
     memset(forwarded_bytes, 0, port_count * sizeof(*forwarded_bytes));
     for (size_t i = 0; i < port_count; ++i) {
@@ -149,6 +177,11 @@ int main(int argc, char** argv) {
   }
 
 cleanup:
+  if (command_app) {
+    cmd_app_stop(command_app);
+    cmd_app_join(command_app);
+    command_app = NULL;
+  }
   if (hub_destination) {
     for (size_t i = 0; i < port_count; ++i) {
       if (!ports[i].started) {

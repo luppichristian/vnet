@@ -4,6 +4,7 @@ Only data written after the connection opens is forwarded to the other file.
 This supports both uni-directional and bi-directional connections.
 */
 
+#include <cmd_app.h>
 #include <futils.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -16,12 +17,27 @@ This supports both uni-directional and bi-directional connections.
 
 #define SLEEP_INTERVAL_MS 5
 
-static volatile sig_atomic_t running = true;
+typedef struct connect_context {
+  const char* source_path;
+  const char* destination_path;
+  bool bidirectional;
+} connect_context_t;
+
+static cmd_app_t* command_app;
 
 static void handle_signal(int sig) {
-  if (sig == SIGINT) {
-    running = false;
+  if (sig == SIGINT && command_app) {
+    cmd_app_stop(command_app);
   }
+}
+
+static void command_info(void* argument, char* arguments) {
+  const connect_context_t* context = argument;
+  if (!cmd_app_arguments_empty(arguments)) {
+    fputs("Usage: info\n", stderr);
+    return;
+  }
+  fprintf(stdout, "Source: %s\nDestination: %s\nMode: %s\n", context->source_path, context->destination_path, context->bidirectional ? "bidirectional" : "unidirectional");
 }
 
 int main(int argc, char** argv) {
@@ -121,8 +137,17 @@ int main(int argc, char** argv) {
     goto cleanup;
   }
 
+  cmd_app_t commands;
+  cmd_app_init(&commands);
+  if (!cmd_app_register(&commands, "info", "Show the connection endpoints and forwarding mode.", command_info, &(connect_context_t) {.source_path = src_f, .destination_path = dst_f, .bidirectional = bidirectional}) || !cmd_app_start(&commands)) {
+    fputs("Could not start the command application.\n", stderr);
+    status = EXIT_FAILURE;
+    goto cleanup;
+  }
+  command_app = &commands;
+
   /* Loop */
-  while (running) {
+  while (cmd_app_is_running(&commands)) {
     long source_a_end = 0;
     long source_b_end = 0;
     size_t forwarded_a = 0;
@@ -151,6 +176,11 @@ int main(int argc, char** argv) {
 
   /* Cleanup */
 cleanup:
+  if (command_app) {
+    cmd_app_stop(command_app);
+    cmd_app_join(command_app);
+    command_app = NULL;
+  }
   /* Notify each destination that forwarding from its source has stopped */
   if (started_a && !vnet_frame_write(destination_a, VNET_FRAME_CONNECTION_END, src_f, dst_f)) {
     status = EXIT_FAILURE;

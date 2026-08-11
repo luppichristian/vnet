@@ -3,6 +3,7 @@ Learning Ethernet switch for append-only VNet traffic files.
 OSI/ISO layer: Layer 2 (data link); it learns and forwards by Ethernet MAC address.
 */
 
+#include <cmd_app.h>
 #include <ethernet.h>
 #include <futils.h>
 #include <signal.h>
@@ -32,11 +33,29 @@ typedef struct switch_device {
   size_t port;
 } switch_device_t;
 
-static volatile sig_atomic_t running = true;
+typedef struct switch_context {
+  const char* path;
+  const switch_port_t* ports;
+  size_t port_count;
+} switch_context_t;
+
+static cmd_app_t* command_app;
 
 static void handle_signal(int sig) {
-  if (sig == SIGINT) {
-    running = false;
+  if (sig == SIGINT && command_app) {
+    cmd_app_stop(command_app);
+  }
+}
+
+static void command_info(void* argument, char* arguments) {
+  const switch_context_t* context = argument;
+  if (!cmd_app_arguments_empty(arguments)) {
+    fputs("Usage: info\n", stderr);
+    return;
+  }
+  fprintf(stdout, "Switch file: %s\nPorts (%zu):\n", context->path, context->port_count);
+  for (size_t i = 0; i < context->port_count; ++i) {
+    fprintf(stdout, "  %zu: %s\n", i + 1, context->ports[i].path);
   }
 }
 
@@ -231,7 +250,16 @@ int main(int argc, char** argv) {
     fprintf(stdout, "Opened bilateral connection between switch '%s' and '%s' on port %zu.\n", switch_path, ports[i].path, i + 1);
   }
 
-  while (running) {
+  cmd_app_t commands;
+  cmd_app_init(&commands);
+  if (!cmd_app_register(&commands, "info", "Show the switch file and connected port files.", command_info, &(switch_context_t) {.path = switch_path, .ports = ports, .port_count = port_count}) || !cmd_app_start(&commands)) {
+    fputs("Could not start the command application.\n", stderr);
+    status = EXIT_FAILURE;
+    goto cleanup;
+  }
+  command_app = &commands;
+
+  while (cmd_app_is_running(&commands)) {
     for (size_t i = 0; i < port_count; ++i) {
       if (!get_file_end(ports[i].source, &source_ends[i])) {
         fprintf(stderr, "Could not snapshot switch port %zu.\n", i + 1);
@@ -276,6 +304,11 @@ int main(int argc, char** argv) {
   }
 
 cleanup:
+  if (command_app) {
+    cmd_app_stop(command_app);
+    cmd_app_join(command_app);
+    command_app = NULL;
+  }
   if (switch_destination) {
     for (size_t i = 0; i < port_count; ++i) {
       if (ports && ports[i].started) {

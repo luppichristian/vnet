@@ -4,6 +4,7 @@ We send data by appending to the file and receive data by reading it periodicall
 */
 
 #include <arp.h>
+#include <cmd_app.h>
 #include <ethernet.h>
 #include <icmp.h>
 #include <ipv4.h>
@@ -20,6 +21,19 @@ We send data by appending to the file and receive data by reading it periodicall
 
 /* Max amount of bytes that can be read at each iteration*/
 #define MAX_READ 4096
+
+typedef struct watch_context {
+  const char* path;
+} watch_context_t;
+
+static void command_info(void* argument, char* arguments) {
+  const watch_context_t* context = argument;
+  if (!cmd_app_arguments_empty(arguments)) {
+    fputs("Usage: info\n", stderr);
+    return;
+  }
+  fprintf(stdout, "Watching file: %s\n", context->path);
+}
 
 static void print_data(const char* label, const uint8_t* data, size_t data_length) {
   fprintf(stdout, "    %s: %zu bytes", label, data_length);
@@ -94,8 +108,19 @@ static void print_udp_packet(const ipv4_packet_view_t* ip4) {
 }
 
 static void print_tcp_flags(const tcp_header_t* header) {
-  const struct { uint16_t flag; const char* name; } flags[] = {
-      {TCP_FLAG_NS, "NS"}, {TCP_FLAG_CWR, "CWR"}, {TCP_FLAG_ECE, "ECE"}, {TCP_FLAG_URG, "URG"}, {TCP_FLAG_ACK, "ACK"}, {TCP_FLAG_PSH, "PSH"}, {TCP_FLAG_RST, "RST"}, {TCP_FLAG_SYN, "SYN"}, {TCP_FLAG_FIN, "FIN"},
+  const struct {
+    uint16_t flag;
+    const char* name;
+  } flags[] = {
+      { TCP_FLAG_NS,  "NS"},
+      {TCP_FLAG_CWR, "CWR"},
+      {TCP_FLAG_ECE, "ECE"},
+      {TCP_FLAG_URG, "URG"},
+      {TCP_FLAG_ACK, "ACK"},
+      {TCP_FLAG_PSH, "PSH"},
+      {TCP_FLAG_RST, "RST"},
+      {TCP_FLAG_SYN, "SYN"},
+      {TCP_FLAG_FIN, "FIN"},
   };
   bool first = true;
   fputs("    Flags:          ", stdout);
@@ -170,17 +195,22 @@ static bool print_ethernet_frame(const uint8_t* bytes, size_t byte_count) {
   } else {
     const char* ether_type_name = "unknown";
     if (header->type_or_length == ETHERNET_ETHERTYPE_IPV4) ether_type_name = "IPv4";
-    else if (header->type_or_length == ETHERNET_ETHERTYPE_ARP) ether_type_name = "ARP";
-    else if (header->type_or_length == ETHERNET_ETHERTYPE_RARP) ether_type_name = "RARP";
-    else if (header->type_or_length == ETHERNET_ETHERTYPE_IPV6) ether_type_name = "IPv6";
+    else if (header->type_or_length == ETHERNET_ETHERTYPE_ARP)
+      ether_type_name = "ARP";
+    else if (header->type_or_length == ETHERNET_ETHERTYPE_RARP)
+      ether_type_name = "RARP";
+    else if (header->type_or_length == ETHERNET_ETHERTYPE_IPV6)
+      ether_type_name = "IPv6";
     fprintf(stdout, "    EtherType:       0x%04X (%s)\n", header->type_or_length, ether_type_name);
     fprintf(stdout, "    Data field:      %u bytes (may include padding)\n", frame.data_length);
   }
   fprintf(stdout, "    FCS:             %08X (valid)\n", footer->crc);
   if (frame.format == ETHERNET_FRAME_FORMAT_II) {
     if (header->type_or_length == ETHERNET_ETHERTYPE_IPV4) print_ipv4_packet(frame.data, frame.data_length);
-    else if (header->type_or_length == ETHERNET_ETHERTYPE_ARP) print_arp_packet(frame.data, frame.data_length);
-    else if (header->type_or_length == ETHERNET_ETHERTYPE_RARP) print_rarp_packet(frame.data, frame.data_length);
+    else if (header->type_or_length == ETHERNET_ETHERTYPE_ARP)
+      print_arp_packet(frame.data, frame.data_length);
+    else if (header->type_or_length == ETHERNET_ETHERTYPE_RARP)
+      print_rarp_packet(frame.data, frame.data_length);
   }
   return true;
 }
@@ -219,7 +249,14 @@ int main(int argc, char** argv) {
   long offset = ftell(f);
   uint8_t buff[MAX_READ + sizeof(vnet_frame_header_t)];
   size_t buffered_bytes = 0;
-  while (1) {
+  cmd_app_t commands;
+  cmd_app_init(&commands);
+  if (!cmd_app_register(&commands, "info", "Show the watched network file.", command_info, &(watch_context_t) {.path = fpath}) || !cmd_app_start(&commands)) {
+    fputs("Could not start the command application.\n", stderr);
+    fclose(f);
+    return EXIT_FAILURE;
+  }
+  while (cmd_app_is_running(&commands)) {
     fseek(f, 0, SEEK_END);
     const long end = ftell(f);
     if (end == offset) {
@@ -228,6 +265,8 @@ int main(int argc, char** argv) {
     }
     const long to_read = end - offset < MAX_READ ? end - offset : MAX_READ;
     if (to_read < 0) {
+      cmd_app_stop(&commands);
+      cmd_app_join(&commands);
       fclose(f);
       fprintf(stderr, "Unexpected file modification while watching the file '%s'.", fpath);
       return EXIT_FAILURE;
@@ -235,6 +274,8 @@ int main(int argc, char** argv) {
     fseek(f, offset, SEEK_SET);
     const long actually_read = fread(buff + buffered_bytes, 1, to_read, f);
     if (actually_read != to_read) {
+      cmd_app_stop(&commands);
+      cmd_app_join(&commands);
       fclose(f);
       fprintf(stderr, "Unexpected file op fail while reading the file '%s'.", fpath);
       return EXIT_FAILURE;
@@ -243,7 +284,7 @@ int main(int argc, char** argv) {
     const size_t byte_count = buffered_bytes + (size_t)actually_read;
     size_t frame_start = 0;
     while (frame_start < byte_count) {
-      if (byte_count - frame_start >= sizeof(vnet_frame_header_t) && vnet_parse_frame(buff + frame_start, sizeof(vnet_frame_header_t), &(vnet_frame_header_t){0})) {
+      if (byte_count - frame_start >= sizeof(vnet_frame_header_t) && vnet_parse_frame(buff + frame_start, sizeof(vnet_frame_header_t), &(vnet_frame_header_t) {0})) {
         print_vnet_frame(buff + frame_start, sizeof(vnet_frame_header_t));
         frame_start += sizeof(vnet_frame_header_t);
         continue;
@@ -270,6 +311,8 @@ int main(int argc, char** argv) {
     }
     if (frame_start == byte_count) buffered_bytes = 0;
   }
+  cmd_app_stop(&commands);
+  cmd_app_join(&commands);
   fclose(f);
   return EXIT_SUCCESS;
 }
