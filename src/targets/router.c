@@ -421,21 +421,6 @@ static bool handle_rarp(router_context_t* context, size_t ingress_interface, con
   return true;
 }
 
-static bool handle_dhcp(router_context_t* context, size_t ingress_interface, const ethernet_frame_view_t* frame, const ipv4_packet_view_t* ip4) {
-  udp_packet_view_t udp = {0};
-  dhcp_message_t request = {0};
-  dhcp_message_t response = {0};
-  dhcp_service_t* service = &context->dhcp[ingress_interface];
-  if (!service->enabled || ip4->header.protocol != UDP_IPV4_PROTOCOL || !udp_parse_packet(ip4->payload, ip4->payload_length, ip4->header.src_addr, ip4->header.dst_addr, &udp) || udp.header.dst_port != DHCP_SERVER_UDP_PORT || !dhcp_parse_message(udp.data, udp.data_length, &request)) return true;
-  const bool valid = request.type == DHCP_MESSAGE_DISCOVER ? dhcp_service_offer(service, &request, &response) : dhcp_service_acknowledge(service, &request, &response);
-  if (!valid) return true;
-  const interface_entry_t* entry = interface_table_get(&context->interfaces, ingress_interface);
-  if (!entry) return false;
-  udp_packet_data_t packet = {.src_addr = entry->ip4, .dst_addr = IPV4_ADDRESS(255, 255, 255, 255), .src_port = DHCP_SERVER_UDP_PORT, .dst_port = DHCP_CLIENT_UDP_PORT, .data = &response, .data_length = sizeof(response)};
-  memcpy(packet.src_mac_addr, entry->mac, sizeof(packet.src_mac_addr));
-  memcpy(packet.dst_mac_addr, frame->header.src_mac, sizeof(packet.dst_mac_addr));
-  return udp_write_ethernet_packet(context->ports[ingress_interface].destination, &packet) && fflush(context->ports[ingress_interface].destination) == 0;
-}
 
 static bool handle_rip(router_context_t* context, size_t ingress_interface, const ipv4_packet_view_t* ipv4_packet) {
   const interface_entry_t* ingress = interface_table_get(&context->interfaces, ingress_interface);
@@ -629,13 +614,12 @@ static bool handle_ethernet(router_context_t* context, size_t ingress_interface,
   const bool destination_is_interface = memcmp(frame.header.dst_mac, entry->mac, sizeof(entry->mac)) == 0;
   const bool destination_is_rip_multicast = memcmp(frame.header.dst_mac, rip_multicast_mac, sizeof(rip_multicast_mac)) == 0;
   const bool destination_is_ospf_multicast = memcmp(frame.header.dst_mac, ospf_multicast_mac, sizeof(ospf_multicast_mac)) == 0;
-  const bool destination_is_broadcast = ethernet_mac_is_broadcast(frame.header.dst_mac);
-  if (frame.header.type_or_length == ETHERNET_ETHERTYPE_ARP && (destination_is_interface || destination_is_broadcast)) return handle_arp(context, ingress_interface, &frame);
-  if (frame.header.type_or_length == ETHERNET_ETHERTYPE_RARP && (destination_is_interface || destination_is_broadcast)) return handle_rarp(context, ingress_interface, &frame);
-  if (frame.header.type_or_length != ETHERNET_ETHERTYPE_IPV4 || (!destination_is_interface && !destination_is_broadcast && !destination_is_rip_multicast && !destination_is_ospf_multicast)) return true;
+  if (frame.header.type_or_length == ETHERNET_ETHERTYPE_ARP && (destination_is_interface || ethernet_mac_is_broadcast(frame.header.dst_mac))) return handle_arp(context, ingress_interface, &frame);
+  if (frame.header.type_or_length == ETHERNET_ETHERTYPE_RARP && (destination_is_interface || ethernet_mac_is_broadcast(frame.header.dst_mac))) return handle_rarp(context, ingress_interface, &frame);
+  if (frame.header.type_or_length != ETHERNET_ETHERTYPE_IPV4 || (!destination_is_interface && !destination_is_rip_multicast && !destination_is_ospf_multicast)) return true;
   ipv4_packet_view_t packet = {0};
   if (!ipv4_parse_packet(frame.data, frame.client_data_length, &packet)) return true;
-  if (destination_is_broadcast && context->dhcp[ingress_interface].enabled) return handle_dhcp(context, ingress_interface, &frame, &packet);
+
   if (destination_is_rip_multicast) return handle_rip(context, ingress_interface, &packet);
   if (destination_is_ospf_multicast) return handle_ospf(context, ingress_interface, &packet);
   return route_ipv4(context, ingress_interface, &packet);
@@ -1028,90 +1012,6 @@ static void command_arp_delete(void* argument, char* arguments) {
   fputs(removed ? "ARP neighbor removed.\n" : "No such ARP neighbor.\n", removed ? stdout : stderr);
 }
 
-static void print_dhcp_service(uint16_t interface_number, const dhcp_service_t* service) {
-  fprintf(stdout, "DHCP dev %u: %s\n", interface_number, service->enabled ? "enabled" : "disabled");
-  if (!service->enabled) return;
-  fputs("  Pool: ", stdout);
-  ipv4_address_print(stdout, service->first_address);
-  fputs(" - ", stdout);
-  ipv4_address_print(stdout, service->last_address);
-  fputs("  gateway=", stdout);
-  ipv4_address_print(stdout, service->gateway);
-  fputs("  dns=", stdout);
-  ipv4_address_print(stdout, service->dns_server);
-  fprintf(stdout, "\n  Leases (%zu):\n", service->count);
-  for (size_t i = 0; i < service->count; ++i) {
-    fputs("    ", stdout);
-    ethernet_mac_print(stdout, service->leases[i].client_mac);
-    fputs("  ", stdout);
-    ipv4_address_print(stdout, service->leases[i].address);
-    fprintf(stdout, "  %s\n", service->leases[i].reserved ? "reserved" : "dynamic");
-  }
-}
-
-static void command_dhcp(void* argument, char* arguments) {
-  router_context_t* context = argument;
-  char* cursor = arguments;
-  char* interface_text = cmd_app_next_argument(&cursor);
-  char* action = cmd_app_next_argument(&cursor);
-  uint16_t interface_number = 0;
-  if (!interface_text || !action || !cmd_app_parse_uint16(interface_text, &interface_number) || interface_number == 0 || interface_number > context->interfaces.count) goto usage;
-  dhcp_service_t* service = &context->dhcp[interface_number - 1];
-
-  if (strcmpi(action, "off") == 0 && !cmd_app_next_argument(&cursor)) {
-    mutex_lock(&context->mutex);
-    service->enabled = false;
-    mutex_unlock(&context->mutex);
-    fputs("DHCP disabled.\n", stdout);
-    return;
-  }
-  if (strcmpi(action, "info") == 0 && !cmd_app_next_argument(&cursor)) {
-    mutex_lock(&context->mutex);
-    print_dhcp_service(interface_number, service);
-    mutex_unlock(&context->mutex);
-    return;
-  }
-  if (strcmpi(action, "reserve") == 0) {
-    char* mac_text = cmd_app_next_argument(&cursor);
-    char* address_text = cmd_app_next_argument(&cursor);
-    mac_address_t mac = {0};
-    ipv4_address_t address = 0;
-    if (!mac_text || !address_text || cmd_app_next_argument(&cursor) || !ethernet_mac_parse(mac_text, mac) || !ipv4_parse_address(address_text, &address)) goto usage;
-    mutex_lock(&context->mutex);
-    const bool reserved = dhcp_service_reserve(service, mac, address);
-    mutex_unlock(&context->mutex);
-    fputs(reserved ? "DHCP reservation set.\n" : "Could not set DHCP reservation.\n", reserved ? stdout : stderr);
-    return;
-  }
-  if (strcmpi(action, "delete") == 0) {
-    char* address_text = cmd_app_next_argument(&cursor);
-    ipv4_address_t address = 0;
-    if (!address_text || cmd_app_next_argument(&cursor) || !ipv4_parse_address(address_text, &address)) goto usage;
-    mutex_lock(&context->mutex);
-    const bool removed = dhcp_service_remove(service, address);
-    mutex_unlock(&context->mutex);
-    fputs(removed ? "DHCP lease removed.\n" : "No such DHCP lease.\n", removed ? stdout : stderr);
-    return;
-  }
-  if (strcmpi(action, "on") == 0) {
-    char* first_text = cmd_app_next_argument(&cursor);
-    char* last_text = cmd_app_next_argument(&cursor);
-    char* dns_text = cmd_app_next_argument(&cursor);
-    ipv4_address_t first_address = 0;
-    ipv4_address_t last_address = 0;
-    ipv4_address_t dns_server = 0;
-    if (!first_text || !last_text || !dns_text || cmd_app_next_argument(&cursor) || !ipv4_parse_address(first_text, &first_address) || !ipv4_parse_address(last_text, &last_address) || !ipv4_parse_address(dns_text, &dns_server)) goto usage;
-    const interface_entry_t* entry = interface_table_get(&context->interfaces, interface_number - 1);
-    mutex_lock(&context->mutex);
-    const bool configured = entry && dhcp_service_configure(service, entry->ip4, first_address, last_address, entry->mask, entry->ip4, dns_server);
-    mutex_unlock(&context->mutex);
-    fputs(configured ? "DHCP enabled.\n" : "Invalid DHCP configuration.\n", configured ? stdout : stderr);
-    return;
-  }
-usage:
-  fputs("Usage: dhcp <interface> on <first-ip> <last-ip> <dns> | dhcp <interface> off | dhcp <interface> info | dhcp <interface> reserve <mac> <ip> | dhcp <interface> delete <ip>\n", stderr);
-}
-
 static bool parse_options(router_context_t* context, int argc, char** argv) {
   for (int i = 1; i < argc;) {
     if (strcmpi(argv[i], "-i") == 0) {
@@ -1204,7 +1104,7 @@ int main(int argc, char** argv) {
   route_table_init(&context.routes, context.route_entries, ROUTER_ROUTE_CAPACITY);
   arp_table_init(&context.arp, context.arp_entries, ROUTER_ARP_CAPACITY);
   rarp_table_init(&context.rarp, context.rarp_entries, ROUTER_RARP_CAPACITY);
-  for (size_t i = 0; i < ROUTER_INTERFACE_CAPACITY; ++i) dhcp_service_init(&context.dhcp[i], context.dhcp_lease_entries[i], ROUTER_DHCP_LEASE_CAPACITY);
+
   prefix_list_init(&context.prefix_lists, context.prefix_list_entries, ROUTER_PREFIX_LIST_CAPACITY);
   nat_table_init(&context.nat, context.nat_entries, ROUTER_NAT_CAPACITY, context.nat_pool, ROUTER_NAT_POOL_CAPACITY, NAT_EPHEMERAL_PORT_MIN);
   if (!parse_options(&context, argc, argv)) {
@@ -1245,7 +1145,7 @@ int main(int argc, char** argv) {
     }
   }
   cmd_app_init(&context.commands);
-  if (!cmd_app_register(&context.commands, "info", "Show router state, including dynamic route sources.", command_info, &context) || !cmd_app_register(&context.commands, "arp", "Resolve an IPv4 neighbor on one interface.", command_arp, &context) || !cmd_app_register(&context.commands, "arp-delete", "Remove one learned ARP neighbor.", command_arp_delete, &context) || !cmd_app_register(&context.commands, "interface", "Administratively bring an interface up or down.", command_interface, &context) || !cmd_app_register(&context.commands, "dynamic-routing", "Select off, RIP v2, or OSPF dynamic routing.", command_dynamic_routing, &context) || !cmd_app_register(&context.commands, "prefix-list", "Add or delete a named IPv4 prefix-list rule.", command_prefix_list, &context) || !cmd_app_register(&context.commands, "bgp-prefix-list", "Assign or clear a BGP peer prefix list.", command_bgp_prefix_list, &context) || !cmd_app_register(&context.commands, "rip-prefix-list", "Assign or clear a RIP interface prefix list.", command_rip_prefix_list, &context) || !cmd_app_register(&context.commands, "route", "Add or delete a route in the forwarding table.", command_route, &context) || !cmd_app_register(&context.commands, "rarp-table", "Set or delete a static RARP assignment.", command_rarp_table, &context) || !cmd_app_register(&context.commands, "dhcp", "Configure or inspect DHCP service on one interface.", command_dhcp, &context) || !cmd_app_start(&context.commands)) {
+  if (!cmd_app_register(&context.commands, "info", "Show router state, including dynamic route sources.", command_info, &context) || !cmd_app_register(&context.commands, "arp", "Resolve an IPv4 neighbor on one interface.", command_arp, &context) || !cmd_app_register(&context.commands, "arp-delete", "Remove one learned ARP neighbor.", command_arp_delete, &context) || !cmd_app_register(&context.commands, "interface", "Administratively bring an interface up or down.", command_interface, &context) || !cmd_app_register(&context.commands, "dynamic-routing", "Select off, RIP v2, or OSPF dynamic routing.", command_dynamic_routing, &context) || !cmd_app_register(&context.commands, "prefix-list", "Add or delete a named IPv4 prefix-list rule.", command_prefix_list, &context) || !cmd_app_register(&context.commands, "bgp-prefix-list", "Assign or clear a BGP peer prefix list.", command_bgp_prefix_list, &context) || !cmd_app_register(&context.commands, "rip-prefix-list", "Assign or clear a RIP interface prefix list.", command_rip_prefix_list, &context) || !cmd_app_register(&context.commands, "route", "Add or delete a route in the forwarding table.", command_route, &context) || !cmd_app_register(&context.commands, "rarp-table", "Set or delete a static RARP assignment.", command_rarp_table, &context) || !cmd_app_start(&context.commands)) {
     fputs("Could not start the command application.\n", stderr);
     status = EXIT_FAILURE;
     goto cleanup;

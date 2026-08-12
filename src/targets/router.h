@@ -9,7 +9,7 @@ OSI/ISO layer: Layer 3; it routes IPv4 packets and resolves each egress next hop
 #include <arp_table.h>
 #include <bgp.h>
 #include <cmd_app.h>
-#include <dhcp_service.h>
+
 #include <ethernet.h>
 #include <futils.h>
 #include <interface_table.h>
@@ -45,7 +45,7 @@ OSI/ISO layer: Layer 3; it routes IPv4 packets and resolves each egress next hop
 #define ROUTER_PREFIX_LIST_CAPACITY  128
 #define ROUTER_NAT_CAPACITY          128
 #define ROUTER_NAT_POOL_CAPACITY     32
-#define ROUTER_DHCP_LEASE_CAPACITY   64
+
 #define ROUTER_BUFFER_SIZE           8192
 #define SLEEP_INTERVAL_MS            5
 #define RIP_ROUTE_TIMEOUT_SECONDS    180
@@ -118,8 +118,7 @@ typedef struct router_context {
   socket_handle_t bgp_listeners[ROUTER_INTERFACE_CAPACITY];
   router_bgp_peer_t bgp_peers[ROUTER_BGP_PEER_CAPACITY];
   nat_entry_t nat_entries[ROUTER_NAT_CAPACITY];
-  dhcp_lease_t dhcp_lease_entries[ROUTER_INTERFACE_CAPACITY][ROUTER_DHCP_LEASE_CAPACITY];
-  dhcp_service_t dhcp[ROUTER_INTERFACE_CAPACITY];
+
   ipv4_address_t nat_pool[ROUTER_NAT_POOL_CAPACITY];
   nat_table_t nat;
   size_t nat_inside_interface;
