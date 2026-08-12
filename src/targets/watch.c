@@ -163,27 +163,28 @@ static bool print_ethernet_frame(const uint8_t* bytes, size_t byte_count) {
   fputs("    Source MAC:      ", stdout);
   ethernet_mac_print(stdout, header->src_mac);
   fputc('\n', stdout);
+  if (frame.tagged) fprintf(stdout, "    IEEE 802.1Q VLAN: %u, priority: %u, DEI: %s\n", frame.vlan_id, frame.priority, frame.drop_eligible ? "set" : "clear");
   if (frame.format == ETHERNET_FRAME_FORMAT_IEEE_802_3) {
     fprintf(stdout, "    Client data:     %u bytes\n", frame.client_data_length);
     fprintf(stdout, "    Padding:         %u bytes\n", frame.data_length - frame.client_data_length);
   } else {
     const char* ether_type_name = "unknown";
-    if (header->type_or_length == ETHERNET_ETHERTYPE_IPV4) ether_type_name = "IPv4";
-    else if (header->type_or_length == ETHERNET_ETHERTYPE_ARP)
+    if (frame.type_or_length == ETHERNET_ETHERTYPE_IPV4) ether_type_name = "IPv4";
+    else if (frame.type_or_length == ETHERNET_ETHERTYPE_ARP)
       ether_type_name = "ARP";
-    else if (header->type_or_length == ETHERNET_ETHERTYPE_RARP)
+    else if (frame.type_or_length == ETHERNET_ETHERTYPE_RARP)
       ether_type_name = "RARP";
-    else if (header->type_or_length == ETHERNET_ETHERTYPE_IPV6)
+    else if (frame.type_or_length == ETHERNET_ETHERTYPE_IPV6)
       ether_type_name = "IPv6";
-    fprintf(stdout, "    EtherType:       0x%04X (%s)\n", header->type_or_length, ether_type_name);
+    fprintf(stdout, "    EtherType:       0x%04X (%s)\n", frame.type_or_length, ether_type_name);
     fprintf(stdout, "    Data field:      %u bytes (may include padding)\n", frame.data_length);
   }
   fprintf(stdout, "    FCS:             %08X (valid)\n", footer->crc);
   if (frame.format == ETHERNET_FRAME_FORMAT_II) {
-    if (header->type_or_length == ETHERNET_ETHERTYPE_IPV4) print_ipv4_packet(frame.data, frame.data_length);
-    else if (header->type_or_length == ETHERNET_ETHERTYPE_ARP)
+    if (frame.type_or_length == ETHERNET_ETHERTYPE_IPV4) print_ipv4_packet(frame.data, frame.data_length);
+    else if (frame.type_or_length == ETHERNET_ETHERTYPE_ARP)
       print_arp_packet(frame.data, frame.data_length);
-    else if (header->type_or_length == ETHERNET_ETHERTYPE_RARP)
+    else if (frame.type_or_length == ETHERNET_ETHERTYPE_RARP)
       print_rarp_packet(frame.data, frame.data_length);
   }
   return true;

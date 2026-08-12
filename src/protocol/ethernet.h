@@ -75,6 +75,10 @@ void ethernet_mac_print(FILE* destination, const mac_address_t mac);
 #define ETHERNET_ETHERTYPE_RARP 0x8035
 #define ETHERNET_ETHERTYPE_IPV6 0x86DD
 
+/* IEEE 802.1Q inserts this tag protocol identifier before the encapsulated EtherType/length. */
+#define ETHERNET_ETHERTYPE_VLAN 0x8100
+#define ETHERNET_VLAN_ID_MAX    4094
+
 typedef enum ethernet_frame_format {
   ETHERNET_FRAME_FORMAT_IEEE_802_3,
   ETHERNET_FRAME_FORMAT_II,
@@ -96,12 +100,22 @@ typedef struct ethernet_footer {
   uint32_t crc; /* Real Ethernet transmits the FCS least-significant byte first. */
 } ethernet_footer_t;
 
+/* IEEE 802.1Q tag: priority (3 bits), drop eligibility (1 bit), and VLAN identifier (12 bits). */
+typedef struct ethernet_vlan_tag {
+  uint16_t tag_control_information;
+  uint16_t type_or_length;
+} ethernet_vlan_tag_t;
+
 #pragma pack(pop)
 
 /* Data needed to serialize one complete Ethernet frame into a network file. */
 typedef struct ethernet_frame_data {
   mac_address_t dst_addr;
   mac_address_t src_addr;
+  bool tagged;
+  uint8_t priority;
+  bool drop_eligible;
+  uint16_t vlan_id;
   uint16_t type_or_length;
   uint16_t data_length;
   const void* data;
@@ -112,12 +126,17 @@ typedef struct ethernet_frame_view {
   ethernet_header_t header;
   ethernet_footer_t footer;
   ethernet_frame_format_t format;
+  bool tagged;
+  uint8_t priority;
+  bool drop_eligible;
+  uint16_t vlan_id;
+  uint16_t type_or_length;
   const uint8_t* data;
   uint16_t data_length;
   uint16_t client_data_length;
 } ethernet_frame_view_t;
 
-/* Writes one complete Ethernet frame, including preamble, SFD, padding, and FCS. */
+/* Writes one complete Ethernet frame, including optional IEEE 802.1Q tag, preamble, SFD, padding, and FCS. */
 bool ethernet_write_frame(FILE* destination, const ethernet_frame_data_t* frame_data);
 
 /* Returns true when bytes begin with Ethernet's preamble and start-frame delimiter. */
