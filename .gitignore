@@ -1,6 +1,7 @@
 build/
 dist/
 gen/
+.hermes/
 
 # Network files
 *.net
