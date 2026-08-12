@@ -1,12 +1,11 @@
 #pragma once
 
-/* Interactive DHCPv4 server for one configured VNet client lease. */
+/* Interactive configurable DHCPv4 service attached to one VNet LAN. */
 
 #include <cmd_app.h>
-#include <dhcp.h>
+#include <dhcp_service.h>
 #include <ethernet.h>
 #include <futils.h>
-#include <ipv4.h>
 #include <mutex.h>
 #include <thread.h>
 #include <udp.h>
@@ -16,17 +15,14 @@
 #include <string.h>
 
 #define DHCP_SERVER_BUFFER_SIZE 8192
+#define DHCP_SERVER_LEASE_CAPACITY 64
 
 typedef struct dhcp_server_context {
   const char* path;
   mac_address_t mac;
-  mac_address_t client_mac;
-  ipv4_address_t address;
-  ipv4_address_t client_address;
-  ipv4_address_t mask;
-  ipv4_address_t gateway;
-  ipv4_address_t dns_server;
   FILE* source;
   mutex_t mutex;
   cmd_app_t commands;
+  dhcp_lease_t lease_entries[DHCP_SERVER_LEASE_CAPACITY];
+  dhcp_service_t service;
 } dhcp_server_context_t;

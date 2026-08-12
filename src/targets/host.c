@@ -327,10 +327,11 @@ static void handle_rarp(host_context_t* context, const ethernet_frame_view_t* fr
 static void handle_dhcp(host_context_t* context, const udp_packet_view_t* udp) {
   dhcp_message_t message = {0};
   if (udp->header.src_port != DHCP_SERVER_UDP_PORT || udp->header.dst_port != DHCP_CLIENT_UDP_PORT || !dhcp_parse_message(udp->data, udp->data_length, &message) || memcmp(message.client_mac, context->mac, sizeof(context->mac)) != 0 || message.transaction_id != context->dhcp_transaction_id) return;
-  if (message.type == DHCP_MESSAGE_OFFER) {
+  if (message.type == DHCP_MESSAGE_OFFER && !context->dhcp_server) {
     dhcp_message_t request = {0};
-    if (dhcp_write_client_message(DHCP_MESSAGE_REQUEST, message.transaction_id, context->mac, message.client_address, message.server_address, &request) && write_dhcp_message(context, &request)) fputs("Requested offered DHCP address.\n", stdout);
-  } else if (message.type == DHCP_MESSAGE_ACK) {
+    context->dhcp_server = message.server_address;
+    if (dhcp_write_client_message(DHCP_MESSAGE_REQUEST, message.transaction_id, context->mac, message.client_address, message.server_address, &request) && write_dhcp_message(context, &request)) fputs("Selected DHCP offer and broadcast REQUEST.\n", stdout);
+  } else if (message.type == DHCP_MESSAGE_ACK && message.server_address == context->dhcp_server) {
     context->ip4 = message.client_address;
     context->mask = message.subnet_mask;
     context->gateway = message.gateway;
@@ -532,33 +533,27 @@ static void receiver_thread(void* argument) {
 
 static bool parse_options(host_context_t* context, int argc, char** argv) {
   context->mask = IPV4_ADDRESS(255, 255, 255, 0);
-  for (int i = 3; i < argc; i += 2) {
-    if (i + 1 >= argc) {
-      return false;
+  for (int i = 3; i < argc;) {
+    if (strcmpi(argv[i], "-dhcp") == 0) {
+      if (context->has_dhcp_server) return false;
+      context->has_dhcp_server = true;
+      ++i;
+      continue;
     }
+    if (i + 1 >= argc) return false;
     if (strcmpi(argv[i], "-ip4") == 0) {
-      if (context->has_ip4 || !ipv4_parse_address(argv[i + 1], &context->ip4)) {
-        return false;
-      }
+      if (context->has_ip4 || !ipv4_parse_address(argv[i + 1], &context->ip4)) return false;
       context->has_ip4 = true;
     } else if (strcmpi(argv[i], "-mask") == 0) {
-      if (!ipv4_parse_address(argv[i + 1], &context->mask) || !ipv4_mask_is_contiguous(context->mask)) {
-        return false;
-      }
+      if (!ipv4_parse_address(argv[i + 1], &context->mask) || !ipv4_mask_is_contiguous(context->mask)) return false;
     } else if (strcmpi(argv[i], "-gateway") == 0) {
-      if (context->has_gateway || !ipv4_parse_address(argv[i + 1], &context->gateway)) {
-        return false;
-      }
+      if (context->has_gateway || !ipv4_parse_address(argv[i + 1], &context->gateway)) return false;
       context->has_gateway = true;
     } else if (strcmpi(argv[i], "-dns") == 0) {
       if (context->has_dns_server || !ipv4_parse_address(argv[i + 1], &context->dns_server)) return false;
       context->has_dns_server = true;
-    } else if (strcmpi(argv[i], "-dhcp") == 0) {
-      if (context->has_dhcp_server || !ipv4_parse_address(argv[i + 1], &context->dhcp_server)) return false;
-      context->has_dhcp_server = true;
-    } else {
-      return false;
-    }
+    } else return false;
+    i += 2;
   }
   return context->has_ip4 || (!context->has_gateway && context->mask == IPV4_ADDRESS(255, 255, 255, 0));
 }
@@ -661,9 +656,10 @@ static void command_dhcp(void* context_argument, char* arguments) {
   } else if (context->has_ip4) {
     fputs("DHCP requires a host without an IPv4 address.\n", stderr);
   } else if (!context->has_dhcp_server) {
-    fputs("No DHCP server was configured with -dhcp.\n", stderr);
+    fputs("DHCP discovery is disabled; use config dhcp <any-ip> to enable it.\n", stderr);
   } else {
     context->dhcp_transaction_id = ++context->next_transaction_id;
+    context->dhcp_server = 0;
     if (dhcp_write_client_message(DHCP_MESSAGE_DISCOVER, context->dhcp_transaction_id, context->mac, 0, 0, &message) && write_dhcp_message(context, &message)) fputs("Sent DHCP DISCOVER.\n", stdout);
   }
 }
@@ -911,8 +907,8 @@ usage:
 }
 
 int main(int argc, char** argv) {
-  if (argc < 3 || ((argc - 3) % 2) != 0) {
-    fputs("Usage: host <file> <mac-address> [-ip4 <address> [-mask <address>] [-gateway <address>] [-dns <address>] [-dhcp <address>]]\n", stderr);
+  if (argc < 3) {
+    fputs("Usage: host <file> <mac-address> [-ip4 <address> [-mask <address>] [-gateway <address>] [-dns <address>] [-dhcp]]\n", stderr);
     return EXIT_FAILURE;
   }
   host_context_t context = {.path = argv[1]};
