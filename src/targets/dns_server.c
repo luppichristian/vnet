@@ -1,5 +1,7 @@
 #include "dns_server.h"
 
+static bool parse_record(const char* type, const char* name, const char* value, dns_record_t* record);
+
 static const char* record_type_name(uint16_t type) {
   return type == DNS_RECORD_A ? "A" : type == DNS_RECORD_CNAME ? "CNAME" : "unknown";
 }
@@ -17,7 +19,10 @@ static void command_info(void* argument, char* arguments) {
     fputs("Usage: info\n", stderr);
     return;
   }
-  fprintf(stdout, "DNS server file: %s\nDNS server IPv4: ", context->path);
+  mutex_lock(&context->mutex);
+  fprintf(stdout, "DNS server file: %s\nDNS server MAC: ", context->path);
+  ethernet_mac_print(stdout, context->mac);
+  fputs("\nDNS server IPv4: ", stdout);
   ipv4_address_print(stdout, context->address);
   fprintf(stdout, "\nRecords (%zu):\n", context->record_count);
   for (size_t i = 0; i < context->record_count; ++i) {
@@ -27,12 +32,60 @@ static void command_info(void* argument, char* arguments) {
     else fputs(record->data.name, stdout);
     fputc('\n', stdout);
   }
+  mutex_unlock(&context->mutex);
+}
+
+static void command_record(void* argument, char* arguments) {
+  dns_server_context_t* context = argument;
+  char* cursor = arguments;
+  char* action = cmd_app_next_argument(&cursor);
+  char* type = cmd_app_next_argument(&cursor);
+  char* name = cmd_app_next_argument(&cursor);
+  if (!action || !type || !name) {
+    fputs("Usage: record <add|delete> <A|CNAME> <name> [address|target]\n", stderr);
+    return;
+  }
+  if (strcmpi(action, "delete") == 0 && !cmd_app_next_argument(&cursor)) {
+    bool removed = false;
+    mutex_lock(&context->mutex);
+    for (size_t i = 0; i < context->record_count; ++i) {
+      if (strcmpi(record_type_name(context->records[i].type), type) == 0 && strcmpi(context->records[i].name, name) == 0) {
+        context->records[i] = context->records[--context->record_count];
+        removed = true;
+        break;
+      }
+    }
+    mutex_unlock(&context->mutex);
+    fputs(removed ? "DNS record removed.\n" : "No such DNS record.\n", removed ? stdout : stderr);
+    return;
+  }
+  char* value = cmd_app_next_argument(&cursor);
+  dns_record_t record = {0};
+  if (strcmpi(action, "add") != 0 || !value || cmd_app_next_argument(&cursor) || !parse_record(type, name, value, &record)) {
+    fputs("Usage: record <add|delete> <A|CNAME> <name> [address|target]\n", stderr);
+    return;
+  }
+  mutex_lock(&context->mutex);
+  size_t index = context->record_count;
+  for (size_t i = 0; i < context->record_count; ++i) {
+    if (context->records[i].type == record.type && strcmpi(context->records[i].name, record.name) == 0) {
+      index = i;
+      break;
+    }
+  }
+  if (index < DNS_SERVER_RECORD_CAPACITY) context->records[index] = record;
+  if (index == context->record_count && index < DNS_SERVER_RECORD_CAPACITY) ++context->record_count;
+  mutex_unlock(&context->mutex);
+  fputs(index < DNS_SERVER_RECORD_CAPACITY ? "DNS record set.\n" : "DNS record table is full.\n", index < DNS_SERVER_RECORD_CAPACITY ? stdout : stderr);
 }
 
 static bool write_dns_response(dns_server_context_t* context, const ethernet_frame_view_t* frame, const ipv4_packet_view_t* ipv4, const udp_packet_view_t* udp, const dns_message_t* query) {
   dns_message_t response = {0};
+  mutex_lock(&context->mutex);
   const dns_record_t* record = find_record(context, query->record.name);
-  if (!dns_write_response(query->transaction_id, query->record.name, record, &response)) return false;
+  const bool valid = dns_write_response(query->transaction_id, query->record.name, record, &response);
+  mutex_unlock(&context->mutex);
+  if (!valid) return false;
   FILE* destination = fopen(context->path, "ab");
   if (!destination) return false;
   udp_packet_data_t packet = {
@@ -96,8 +149,16 @@ int main(int argc, char** argv) {
   }
   context.source = fopen(context.path, "rb");
   if (!context.source || fseek(context.source, 0, SEEK_END) != 0) return EXIT_FAILURE;
+  if (!mutex_init(&context.mutex)) {
+    fclose(context.source);
+    return EXIT_FAILURE;
+  }
   cmd_app_init(&context.commands);
-  if (!cmd_app_register(&context.commands, "info", "Show the authoritative DNS records.", command_info, &context) || !cmd_app_start(&context.commands)) return EXIT_FAILURE;
+  if (!cmd_app_register(&context.commands, "info", "Show the configured server and authoritative records.", command_info, &context) || !cmd_app_register(&context.commands, "record", "Add, replace, or delete an authoritative DNS record.", command_record, &context) || !cmd_app_start(&context.commands)) {
+    mutex_destroy(&context.mutex);
+    fclose(context.source);
+    return EXIT_FAILURE;
+  }
   uint8_t buffer[DNS_SERVER_BUFFER_SIZE] = {0};
   while (cmd_app_is_running(&context.commands)) {
     long end = 0;
@@ -118,6 +179,7 @@ int main(int argc, char** argv) {
   }
   cmd_app_stop(&context.commands);
   cmd_app_join(&context.commands);
+  mutex_destroy(&context.mutex);
   fclose(context.source);
   return EXIT_SUCCESS;
 }

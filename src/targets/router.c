@@ -60,6 +60,7 @@ static bool write_rip_response(router_context_t* context, size_t interface_index
     while (route_index < context->routes.count && entry_count < RIP_MAX_ENTRIES_PER_PACKET) {
       const route_entry_t* route = &context->routes.entries[route_index++];
       if (route->source == ROUTE_SOURCE_RIP && route->interface_index == interface_index) continue;
+      if (context->rip_outbound_prefix_lists[interface_index][0] && !prefix_list_permits(&context->prefix_lists, context->rip_outbound_prefix_lists[interface_index], route->destination, route->mask)) continue;
       entries[entry_count++] = (rip_route_entry_t) {
           .address_family = RIP_ADDRESS_FAMILY_IPV4,
           .destination = route->destination,
@@ -418,6 +419,7 @@ static bool handle_rip(router_context_t* context, size_t ingress_interface, cons
   const uint32_t expires_at = (uint32_t)time(NULL) + RIP_ROUTE_TIMEOUT_SECONDS;
   for (size_t i = 0; i < rip_packet.entry_count; ++i) {
     const rip_route_entry_t* advertised = &rip_packet.entries[i];
+    if (context->rip_inbound_prefix_lists[ingress_interface][0] && !prefix_list_permits(&context->prefix_lists, context->rip_inbound_prefix_lists[ingress_interface], advertised->destination, advertised->subnet_mask)) continue;
     const uint32_t metric = advertised->metric == RIP_METRIC_INFINITY ? RIP_METRIC_INFINITY : advertised->metric + 1;
     const ipv4_address_t next_hop = advertised->next_hop ? advertised->next_hop : ipv4_packet->header.src_addr;
     if (!route_table_learn_rip(&context->routes, advertised->destination, advertised->subnet_mask, next_hop, ingress_interface, metric, expires_at)) return false;
@@ -473,6 +475,7 @@ static bool bgp_advertise_routes(router_context_t* context, router_bgp_peer_t* p
   for (size_t i = 0; i < context->routes.count; ++i) {
     const route_entry_t* route = &context->routes.entries[i];
     if (route->source != ROUTE_SOURCE_CONNECTED && route->source != ROUTE_SOURCE_STATIC) continue;
+    if (peer->outbound_prefix_list[0] && !prefix_list_permits(&context->prefix_lists, peer->outbound_prefix_list, route->destination, route->mask)) continue;
     uint8_t bytes[BGP_MAX_MESSAGE_LENGTH] = {0};
     uint16_t length = 0;
     if (!bgp_write_update(route->destination, route->mask, entry->ip4, peer->local_as, bytes, sizeof(bytes), &length) || !socket_send(&context->sockets[peer->interface_index], peer->socket, bytes, length)) return false;
@@ -504,14 +507,20 @@ static bool bgp_receive_messages(router_context_t* context, router_bgp_peer_t* p
       }
     } else if (message.header.type == BGP_MESSAGE_UPDATE) {
       bgp_update_t update = {0};
-      if (!peer->established || !bgp_parse_update(&message, &update) || update.autonomous_system != peer->remote_as || update.next_hop != peer->address || !route_table_learn_bgp(&context->routes, update.network, update.mask, peer->address, peer->interface_index, 0)) return false;
-      fputs("Learned BGP route ", stdout);
-      ipv4_address_print(stdout, update.network);
-      fputs("/", stdout);
-      ipv4_address_print(stdout, update.mask);
-      fputs(" from ", stdout);
-      ipv4_address_print(stdout, peer->address);
-      fputs(".\n", stdout);
+      if (!peer->established || !bgp_parse_update(&message, &update) || update.autonomous_system != peer->remote_as || update.next_hop != peer->address) return false;
+      if (peer->inbound_prefix_list[0] && !prefix_list_permits(&context->prefix_lists, peer->inbound_prefix_list, update.network, update.mask)) {
+        fputs("Rejected BGP route by prefix list.\n", stdout);
+      } else if (!route_table_learn_bgp(&context->routes, update.network, update.mask, peer->address, peer->interface_index, 0)) {
+        return false;
+      } else {
+        fputs("Learned BGP route ", stdout);
+        ipv4_address_print(stdout, update.network);
+        fputs("/", stdout);
+        ipv4_address_print(stdout, update.mask);
+        fputs(" from ", stdout);
+        ipv4_address_print(stdout, peer->address);
+        fputs(".\n", stdout);
+      }
     } else {
       return false;
     }
@@ -666,7 +675,20 @@ static void print_info(router_context_t* context) {
     const router_bgp_peer_t* peer = &context->bgp_peers[i];
     fputs("  ", stdout);
     ipv4_address_print(stdout, peer->address);
-    fprintf(stdout, "  dev %zu  AS %u -> %u  %s  %s\n", peer->interface_index + 1, peer->local_as, peer->remote_as, peer->active ? "active" : "passive", peer->established ? "established" : "idle");
+    fprintf(stdout, "  dev %zu  AS %u -> %u  %s  %s  in=%s out=%s\n", peer->interface_index + 1, peer->local_as, peer->remote_as, peer->active ? "active" : "passive", peer->established ? "established" : "idle", peer->inbound_prefix_list[0] ? peer->inbound_prefix_list : "none", peer->outbound_prefix_list[0] ? peer->outbound_prefix_list : "none");
+  }
+  fprintf(stdout, "RIP prefix lists:\n");
+  for (size_t i = 0; i < context->interfaces.count; ++i) {
+    fprintf(stdout, "  dev %zu  in=%s out=%s\n", i + 1, context->rip_inbound_prefix_lists[i][0] ? context->rip_inbound_prefix_lists[i] : "none", context->rip_outbound_prefix_lists[i][0] ? context->rip_outbound_prefix_lists[i] : "none");
+  }
+  fprintf(stdout, "Prefix-list rules (%zu):\n", context->prefix_lists.count);
+  for (size_t i = 0; i < context->prefix_lists.count; ++i) {
+    const prefix_list_rule_t* rule = &context->prefix_lists.entries[i];
+    fprintf(stdout, "  %-31s %u %s ", rule->name, rule->sequence, prefix_list_action_name(rule->action));
+    ipv4_address_print(stdout, rule->network);
+    fputs("/", stdout);
+    ipv4_address_print(stdout, rule->mask);
+    fprintf(stdout, " ge %u le %u\n", rule->minimum_length, rule->maximum_length);
   }
   fprintf(stdout, "ARP neighbors (%zu):\n", context->arp.count);
   for (size_t i = 0; i < context->arp.count; ++i) {
@@ -771,6 +793,109 @@ static void command_dynamic_routing(void* argument, char* arguments) {
     return;
   }
   fprintf(stdout, "Dynamic routing: %s.\n", dynamic_routing_name(mode));
+}
+
+static void command_prefix_list(void* argument, char* arguments) {
+  router_context_t* context = argument;
+  char* cursor = arguments;
+  char* action = cmd_app_next_argument(&cursor);
+  char* name = cmd_app_next_argument(&cursor);
+  char* sequence_text = cmd_app_next_argument(&cursor);
+  uint16_t sequence = 0;
+  if (!action || !name || !sequence_text || !cmd_app_parse_uint16(sequence_text, &sequence)) {
+    fputs("Usage: prefix-list <add|delete> <name> <sequence> [permit|deny <network> <mask> <ge> <le>]\n", stderr);
+    return;
+  }
+  if (strcmpi(action, "delete") == 0 && !cmd_app_next_argument(&cursor)) {
+    mutex_lock(&context->mutex);
+    const bool removed = prefix_list_remove(&context->prefix_lists, name, sequence);
+    mutex_unlock(&context->mutex);
+    fputs(removed ? "Prefix-list rule removed.\n" : "No such prefix-list rule.\n", removed ? stdout : stderr);
+    return;
+  }
+  char* decision = cmd_app_next_argument(&cursor);
+  char* network_text = cmd_app_next_argument(&cursor);
+  char* mask_text = cmd_app_next_argument(&cursor);
+  char* minimum_text = cmd_app_next_argument(&cursor);
+  char* maximum_text = cmd_app_next_argument(&cursor);
+  ipv4_address_t network = 0;
+  ipv4_address_t mask = 0;
+  uint16_t minimum = 0;
+  uint16_t maximum = 0;
+  if (strcmpi(action, "add") != 0 || !decision || !network_text || !mask_text || !minimum_text || !maximum_text || cmd_app_next_argument(&cursor) || (strcmpi(decision, "permit") != 0 && strcmpi(decision, "deny") != 0) || !ipv4_parse_address(network_text, &network) || !ipv4_parse_address(mask_text, &mask) || !cmd_app_parse_uint16(minimum_text, &minimum) || !cmd_app_parse_uint16(maximum_text, &maximum) || minimum > 32 || maximum > 32) {
+    fputs("Usage: prefix-list <add|delete> <name> <sequence> [permit|deny <network> <mask> <ge> <le>]\n", stderr);
+    return;
+  }
+  mutex_lock(&context->mutex);
+  const bool added = prefix_list_add(&context->prefix_lists, name, sequence, strcmpi(decision, "permit") == 0 ? PREFIX_LIST_PERMIT : PREFIX_LIST_DENY, network, mask, (uint8_t)minimum, (uint8_t)maximum);
+  mutex_unlock(&context->mutex);
+  fputs(added ? "Prefix-list rule added.\n" : "Could not add prefix-list rule.\n", added ? stdout : stderr);
+}
+
+static void command_bgp_prefix_list(void* argument, char* arguments) {
+  router_context_t* context = argument;
+  char* cursor = arguments;
+  char* peer_text = cmd_app_next_argument(&cursor);
+  char* direction = cmd_app_next_argument(&cursor);
+  char* name = cmd_app_next_argument(&cursor);
+  uint16_t peer_number = 0;
+  if (!peer_text || !direction || !name || cmd_app_next_argument(&cursor) || !cmd_app_parse_uint16(peer_text, &peer_number) || peer_number == 0 || peer_number > context->bgp_peer_count || (strcmpi(direction, "in") != 0 && strcmpi(direction, "out") != 0) || (strcmpi(name, "none") != 0 && strlen(name) >= PREFIX_LIST_NAME_LEN)) {
+    fputs("Usage: bgp-prefix-list <peer> <in|out> <name|none>\n", stderr);
+    return;
+  }
+  mutex_lock(&context->mutex);
+  char* assigned = strcmpi(direction, "in") == 0 ? context->bgp_peers[peer_number - 1].inbound_prefix_list : context->bgp_peers[peer_number - 1].outbound_prefix_list;
+  if (strcmpi(name, "none") != 0) {
+    bool exists = false;
+    for (size_t i = 0; i < context->prefix_lists.count; ++i) {
+      if (strcmpi(context->prefix_lists.entries[i].name, name) == 0) {
+        exists = true;
+        break;
+      }
+    }
+    if (!exists) {
+      mutex_unlock(&context->mutex);
+      fputs("No such prefix list.\n", stderr);
+      return;
+    }
+  }
+  assigned[0] = '\0';
+  if (strcmpi(name, "none") != 0) strncpy(assigned, name, PREFIX_LIST_NAME_LEN - 1);
+  mutex_unlock(&context->mutex);
+  fputs("BGP prefix list assigned.\n", stdout);
+}
+
+static void command_rip_prefix_list(void* argument, char* arguments) {
+  router_context_t* context = argument;
+  char* cursor = arguments;
+  char* interface_text = cmd_app_next_argument(&cursor);
+  char* direction = cmd_app_next_argument(&cursor);
+  char* name = cmd_app_next_argument(&cursor);
+  uint16_t interface_number = 0;
+  if (!interface_text || !direction || !name || cmd_app_next_argument(&cursor) || !cmd_app_parse_uint16(interface_text, &interface_number) || interface_number == 0 || interface_number > context->interfaces.count || (strcmpi(direction, "in") != 0 && strcmpi(direction, "out") != 0) || (strcmpi(name, "none") != 0 && strlen(name) >= PREFIX_LIST_NAME_LEN)) {
+    fputs("Usage: rip-prefix-list <interface> <in|out> <name|none>\n", stderr);
+    return;
+  }
+  mutex_lock(&context->mutex);
+  if (strcmpi(name, "none") != 0) {
+    bool exists = false;
+    for (size_t i = 0; i < context->prefix_lists.count; ++i) {
+      if (strcmpi(context->prefix_lists.entries[i].name, name) == 0) {
+        exists = true;
+        break;
+      }
+    }
+    if (!exists) {
+      mutex_unlock(&context->mutex);
+      fputs("No such prefix list.\n", stderr);
+      return;
+    }
+  }
+  char* assigned = strcmpi(direction, "in") == 0 ? context->rip_inbound_prefix_lists[interface_number - 1] : context->rip_outbound_prefix_lists[interface_number - 1];
+  assigned[0] = '\0';
+  if (strcmpi(name, "none") != 0) strncpy(assigned, name, PREFIX_LIST_NAME_LEN - 1);
+  mutex_unlock(&context->mutex);
+  fputs("RIP prefix list assigned.\n", stdout);
 }
 
 static void command_route(void* argument, char* arguments) {
@@ -926,6 +1051,7 @@ int main(int argc, char** argv) {
   route_table_init(&context.routes, context.route_entries, ROUTER_ROUTE_CAPACITY);
   arp_table_init(&context.arp, context.arp_entries, ROUTER_ARP_CAPACITY);
   rarp_table_init(&context.rarp, context.rarp_entries, ROUTER_RARP_CAPACITY);
+  prefix_list_init(&context.prefix_lists, context.prefix_list_entries, ROUTER_PREFIX_LIST_CAPACITY);
   nat_table_init(&context.nat, context.nat_entries, ROUTER_NAT_CAPACITY, NAT_EPHEMERAL_PORT_MIN);
   if (!parse_options(&context, argc, argv)) {
     fputs("Usage: router -i <file> <mac-address> <ip-address> <mask> [... ] [-r <network> <mask> <next-hop|direct> <interface> <metric> [...]] [-bgp <active|passive> <interface> <peer-ip> <local-as> <peer-as> [...]] [-rarp <client-mac> <ip-address> [...]] [-dynamic-routing <off|rip|ospf>] [-nat <inside-interface> <outside-interface>]\n", stderr);
@@ -965,7 +1091,7 @@ int main(int argc, char** argv) {
     }
   }
   cmd_app_init(&context.commands);
-  if (!cmd_app_register(&context.commands, "info", "Show router state, including dynamic route sources.", command_info, &context) || !cmd_app_register(&context.commands, "arp", "Resolve an IPv4 neighbor on one interface.", command_arp, &context) || !cmd_app_register(&context.commands, "arp-delete", "Remove one learned ARP neighbor.", command_arp_delete, &context) || !cmd_app_register(&context.commands, "interface", "Administratively bring an interface up or down.", command_interface, &context) || !cmd_app_register(&context.commands, "dynamic-routing", "Select off, RIP v2, or OSPF dynamic routing.", command_dynamic_routing, &context) || !cmd_app_register(&context.commands, "route", "Add or delete a route in the forwarding table.", command_route, &context) || !cmd_app_register(&context.commands, "rarp-table", "Set or delete a static RARP assignment.", command_rarp_table, &context) || !cmd_app_start(&context.commands)) {
+  if (!cmd_app_register(&context.commands, "info", "Show router state, including dynamic route sources.", command_info, &context) || !cmd_app_register(&context.commands, "arp", "Resolve an IPv4 neighbor on one interface.", command_arp, &context) || !cmd_app_register(&context.commands, "arp-delete", "Remove one learned ARP neighbor.", command_arp_delete, &context) || !cmd_app_register(&context.commands, "interface", "Administratively bring an interface up or down.", command_interface, &context) || !cmd_app_register(&context.commands, "dynamic-routing", "Select off, RIP v2, or OSPF dynamic routing.", command_dynamic_routing, &context) || !cmd_app_register(&context.commands, "prefix-list", "Add or delete a named IPv4 prefix-list rule.", command_prefix_list, &context) || !cmd_app_register(&context.commands, "bgp-prefix-list", "Assign or clear a BGP peer prefix list.", command_bgp_prefix_list, &context) || !cmd_app_register(&context.commands, "rip-prefix-list", "Assign or clear a RIP interface prefix list.", command_rip_prefix_list, &context) || !cmd_app_register(&context.commands, "route", "Add or delete a route in the forwarding table.", command_route, &context) || !cmd_app_register(&context.commands, "rarp-table", "Set or delete a static RARP assignment.", command_rarp_table, &context) || !cmd_app_start(&context.commands)) {
     fputs("Could not start the command application.\n", stderr);
     status = EXIT_FAILURE;
     goto cleanup;

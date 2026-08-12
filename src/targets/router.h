@@ -17,6 +17,7 @@ OSI/ISO layer: Layer 3; it routes IPv4 packets and resolves each egress next hop
 #include <mutex.h>
 #include <nat.h>
 #include <ospf.h>
+#include <prefix_list.h>
 #include <rarp.h>
 #include <rarp_table.h>
 #include <rip.h>
@@ -40,6 +41,7 @@ OSI/ISO layer: Layer 3; it routes IPv4 packets and resolves each egress next hop
 #define ROUTER_RARP_CAPACITY         128
 #define ROUTER_PENDING_CAPACITY      64
 #define ROUTER_BGP_PEER_CAPACITY     16
+#define ROUTER_PREFIX_LIST_CAPACITY  128
 #define ROUTER_NAT_CAPACITY          128
 #define ROUTER_BUFFER_SIZE           8192
 #define SLEEP_INTERVAL_MS            5
@@ -91,6 +93,8 @@ typedef struct router_bgp_peer {
   bool open_sent;
   bool open_received;
   bool established;
+  char outbound_prefix_list[PREFIX_LIST_NAME_LEN];
+  char inbound_prefix_list[PREFIX_LIST_NAME_LEN];
 } router_bgp_peer_t;
 
 typedef struct router_context {
@@ -98,11 +102,13 @@ typedef struct router_context {
   route_entry_t route_entries[ROUTER_ROUTE_CAPACITY];
   arp_entry_t arp_entries[ROUTER_ARP_CAPACITY];
   rarp_entry_t rarp_entries[ROUTER_RARP_CAPACITY];
+  prefix_list_rule_t prefix_list_entries[ROUTER_PREFIX_LIST_CAPACITY];
   router_pending_packet_t pending_packets[ROUTER_PENDING_CAPACITY];
   interface_table_t interfaces;
   route_table_t routes;
   arp_table_t arp;
   rarp_table_t rarp;
+  prefix_list_t prefix_lists;
   router_port_t ports[ROUTER_INTERFACE_CAPACITY];
   socket_context_t sockets[ROUTER_INTERFACE_CAPACITY];
   router_socket_emit_argument_t socket_arguments[ROUTER_INTERFACE_CAPACITY];
@@ -117,6 +123,8 @@ typedef struct router_context {
   router_dynamic_routing_mode_t dynamic_routing;
   uint32_t next_rip_update;
   uint32_t next_ospf_update;
+  char rip_inbound_prefix_lists[ROUTER_INTERFACE_CAPACITY][PREFIX_LIST_NAME_LEN];
+  char rip_outbound_prefix_lists[ROUTER_INTERFACE_CAPACITY][PREFIX_LIST_NAME_LEN];
   mutex_t mutex;
   cmd_app_t commands;
 } router_context_t;

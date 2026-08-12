@@ -10,6 +10,12 @@ static void command_info(void* argument, char* arguments) {
   for (size_t i = 0; i < context->port_count; ++i) {
     fprintf(stdout, "  %zu: %s\n", i + 1, context->ports[i].path);
   }
+  fprintf(stdout, "Forwarding database (%zu):\n", context->devices->count);
+  for (size_t i = 0; i < context->devices->count; ++i) {
+    fputs("  ", stdout);
+    ethernet_mac_print(stdout, context->devices->entries[i].mac);
+    fprintf(stdout, "  port %zu (%s)\n", context->devices->entries[i].port + 1, context->ports[context->devices->entries[i].port].path);
+  }
 }
 
 static void command_fdb(void* argument, char* arguments) {

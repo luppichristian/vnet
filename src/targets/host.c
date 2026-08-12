@@ -217,24 +217,26 @@ static void print_info(host_context_t* context) {
   if (context->has_ip4) {
     fputs("Host IPv4: ", stdout);
     ipv4_address_print(stdout, context->ip4);
-    fputs("\nSubnet mask: ", stdout);
-    ipv4_address_print(stdout, context->mask);
+  } else {
+    fputs("Host IPv4: unconfigured", stdout);
+  }
+  fputs("\nSubnet mask: ", stdout);
+  ipv4_address_print(stdout, context->mask);
+  fputc('\n', stdout);
+  if (context->has_gateway) {
+    fputs("Default gateway: ", stdout);
+    ipv4_address_print(stdout, context->gateway);
     fputc('\n', stdout);
-    if (context->has_gateway) {
-      fputs("Default gateway: ", stdout);
-      ipv4_address_print(stdout, context->gateway);
-      fputc('\n', stdout);
-    }
-    if (context->has_dns_server) {
-      fputs("DNS server: ", stdout);
-      ipv4_address_print(stdout, context->dns_server);
-      fputc('\n', stdout);
-    }
-    if (context->has_dhcp_server) {
-      fputs("DHCP server: ", stdout);
-      ipv4_address_print(stdout, context->dhcp_server);
-      fputc('\n', stdout);
-    }
+  }
+  if (context->has_dns_server) {
+    fputs("DNS server: ", stdout);
+    ipv4_address_print(stdout, context->dns_server);
+    fputc('\n', stdout);
+  }
+  if (context->has_dhcp_server) {
+    fputs("DHCP server: ", stdout);
+    ipv4_address_print(stdout, context->dhcp_server);
+    fputc('\n', stdout);
   }
   fprintf(stdout, "ARP cache (%zu):\n", context->arp.count);
   for (size_t i = 0; i < context->arp.count; ++i) {
@@ -569,6 +571,40 @@ static void command_info(void* argument, char* arguments) {
   print_info(argument);
 }
 
+static void command_config(void* context_argument, char* arguments) {
+  host_context_t* context = context_argument;
+  char* cursor = arguments;
+  char* option = cmd_app_next_argument(&cursor);
+  char* value = cmd_app_next_argument(&cursor);
+  ipv4_address_t address = 0;
+  if (!option || !value || cmd_app_next_argument(&cursor) || (strcmpi(option, "ip4") != 0 && strcmpi(option, "mask") != 0 && strcmpi(option, "gateway") != 0 && strcmpi(option, "dns") != 0 && strcmpi(option, "dhcp") != 0) || (strcmpi(value, "none") != 0 && !ipv4_parse_address(value, &address))) {
+    fputs("Usage: config <ip4|mask|gateway|dns|dhcp> <ip-address|none>\n", stderr);
+    return;
+  }
+  if (strcmpi(option, "mask") == 0 && (strcmpi(value, "none") == 0 || !ipv4_mask_is_contiguous(address))) {
+    fputs("Mask must be a contiguous IPv4 mask.\n", stderr);
+    return;
+  }
+  mutex_lock(&context->mutex);
+  if (strcmpi(option, "ip4") == 0) {
+    context->has_ip4 = strcmpi(value, "none") != 0;
+    context->ip4 = address;
+    context->sockets.local_address = address;
+  } else if (strcmpi(option, "mask") == 0) {
+    context->mask = address;
+  } else if (strcmpi(option, "gateway") == 0) {
+    context->has_gateway = strcmpi(value, "none") != 0;
+    context->gateway = address;
+  } else if (strcmpi(option, "dns") == 0) {
+    context->has_dns_server = strcmpi(value, "none") != 0;
+    context->dns_server = address;
+  } else {
+    context->has_dhcp_server = strcmpi(value, "none") != 0;
+    context->dhcp_server = address;
+  }
+  mutex_unlock(&context->mutex);
+  fputs("Host configuration updated.\n", stdout);
+}
 static void command_arp(void* context_argument, char* argument) {
   host_context_t* context = context_argument;
   ipv4_address_t destination = 0;
@@ -912,7 +948,7 @@ int main(int argc, char** argv) {
     return EXIT_FAILURE;
   }
 
-  if (!cmd_app_register(&context.commands, "info", "Show host, routes, ARP cache, and learned devices.", command_info, &context) || !cmd_app_register(&context.commands, "arp", "Resolve the local destination or next-hop gateway.", command_arp, &context) || !cmd_app_register(&context.commands, "arp-delete", "Remove one learned ARP neighbor.", command_arp_delete, &context) || !cmd_app_register(&context.commands, "rarp", "Request an IPv4 address for this host MAC.", command_rarp, &context) || !cmd_app_register(&context.commands, "dhcp", "Broadcast DHCP DISCOVER for IPv4 configuration.", command_dhcp, &context) || !cmd_app_register(&context.commands, "dns", "Query the configured DNS server for an IPv4 address.", command_dns, &context) || !cmd_app_register(&context.commands, "ping", "Send an ICMP Echo Request after ARP resolution.", command_ping, &context) || !cmd_app_register(&context.commands, "udp", "Send a UDP datagram after ARP resolution.", command_udp, &context) || !cmd_app_register(&context.commands, "tcp", "Send a base-header TCP segment after ARP resolution.", command_tcp, &context) || !cmd_app_register(&context.commands, "socket", "Control virtual TCP and UDP sockets.", command_socket, &context) || !cmd_app_start(&context.commands)) {
+  if (!cmd_app_register(&context.commands, "info", "Show all host configuration and live tables.", command_info, &context) || !cmd_app_register(&context.commands, "config", "Change host IPv4, mask, gateway, DNS, or DHCP server.", command_config, &context) || !cmd_app_register(&context.commands, "arp", "Resolve the local destination or next-hop gateway.", command_arp, &context) || !cmd_app_register(&context.commands, "arp-delete", "Remove one learned ARP neighbor.", command_arp_delete, &context) || !cmd_app_register(&context.commands, "rarp", "Request an IPv4 address for this host MAC.", command_rarp, &context) || !cmd_app_register(&context.commands, "dhcp", "Broadcast DHCP DISCOVER for IPv4 configuration.", command_dhcp, &context) || !cmd_app_register(&context.commands, "dns", "Query the configured DNS server for an IPv4 address.", command_dns, &context) || !cmd_app_register(&context.commands, "ping", "Send an ICMP Echo Request after ARP resolution.", command_ping, &context) || !cmd_app_register(&context.commands, "udp", "Send a UDP datagram after ARP resolution.", command_udp, &context) || !cmd_app_register(&context.commands, "tcp", "Send a base-header TCP segment after ARP resolution.", command_tcp, &context) || !cmd_app_register(&context.commands, "socket", "Control virtual TCP and UDP sockets.", command_socket, &context) || !cmd_app_start(&context.commands)) {
     fputs("Could not start the command application.\n", stderr);
     cmd_app_stop(&context.commands);
     thread_join(&thread);

@@ -6,18 +6,61 @@ static void command_info(void* argument, char* arguments) {
     fputs("Usage: info\n", stderr);
     return;
   }
-  fputs("DHCP server IPv4: ", stdout);
+  mutex_lock(&context->mutex);
+  fputs("DHCP server file: ", stdout);
+  fputs(context->path, stdout);
+  fputs("\nDHCP server MAC: ", stdout);
+  ethernet_mac_print(stdout, context->mac);
+  fputs("\nDHCP server IPv4: ", stdout);
   ipv4_address_print(stdout, context->address);
   fputs("\nLease client: ", stdout);
   ethernet_mac_print(stdout, context->client_mac);
   fputs("\nLease address: ", stdout);
   ipv4_address_print(stdout, context->client_address);
+  fputs("\nLease mask: ", stdout);
+  ipv4_address_print(stdout, context->mask);
+  fputs("\nLease gateway: ", stdout);
+  ipv4_address_print(stdout, context->gateway);
+  fputs("\nLease DNS server: ", stdout);
+  ipv4_address_print(stdout, context->dns_server);
   fputs("\n", stdout);
+  mutex_unlock(&context->mutex);
 }
+
+static void command_lease(void* argument, char* arguments) {
+  dhcp_server_context_t* context = argument;
+  char* cursor = arguments;
+  char* client_mac_text = cmd_app_next_argument(&cursor);
+  char* client_address_text = cmd_app_next_argument(&cursor);
+  char* mask_text = cmd_app_next_argument(&cursor);
+  char* gateway_text = cmd_app_next_argument(&cursor);
+  char* dns_server_text = cmd_app_next_argument(&cursor);
+  mac_address_t client_mac = {0};
+  ipv4_address_t client_address = 0;
+  ipv4_address_t mask = 0;
+  ipv4_address_t gateway = 0;
+  ipv4_address_t dns_server = 0;
+  if (!client_mac_text || !client_address_text || !mask_text || !gateway_text || !dns_server_text || cmd_app_next_argument(&cursor) || !ethernet_mac_parse(client_mac_text, client_mac) || !ipv4_parse_address(client_address_text, &client_address) || !ipv4_parse_address(mask_text, &mask) || !ipv4_mask_is_contiguous(mask) || !ipv4_parse_address(gateway_text, &gateway) || !ipv4_parse_address(dns_server_text, &dns_server)) {
+    fputs("Usage: lease <client-mac> <client-ip> <mask> <gateway> <dns-server>\n", stderr);
+    return;
+  }
+  mutex_lock(&context->mutex);
+  memcpy(context->client_mac, client_mac, sizeof(client_mac));
+  context->client_address = client_address;
+  context->mask = mask;
+  context->gateway = gateway;
+  context->dns_server = dns_server;
+  mutex_unlock(&context->mutex);
+  fputs("DHCP lease updated.\n", stdout);
+}
+
 
 static bool reply(dhcp_server_context_t* context, const ethernet_frame_view_t* frame, const dhcp_message_t* request, uint8_t type) {
   dhcp_message_t message = {0};
-  if (!dhcp_write_server_message(type, request->transaction_id, request->client_mac, context->client_address, context->address, context->mask, context->gateway, context->dns_server, &message)) return false;
+  mutex_lock(&context->mutex);
+  const bool valid = dhcp_write_server_message(type, request->transaction_id, request->client_mac, context->client_address, context->address, context->mask, context->gateway, context->dns_server, &message);
+  mutex_unlock(&context->mutex);
+  if (!valid) return false;
   FILE* destination = fopen(context->path, "ab");
   if (!destination) return false;
   udp_packet_data_t packet = {
@@ -55,8 +98,16 @@ int main(int argc, char** argv) {
   if (!ethernet_mac_parse(argv[2], context.mac) || !ipv4_parse_address(argv[3], &context.address) || !ethernet_mac_parse(argv[4], context.client_mac) || !ipv4_parse_address(argv[5], &context.client_address) || !ipv4_parse_address(argv[6], &context.mask) || !ipv4_mask_is_contiguous(context.mask) || !ipv4_parse_address(argv[7], &context.gateway) || !ipv4_parse_address(argv[8], &context.dns_server)) return EXIT_FAILURE;
   context.source = fopen(context.path, "rb");
   if (!context.source || fseek(context.source, 0, SEEK_END) != 0) return EXIT_FAILURE;
+  if (!mutex_init(&context.mutex)) {
+    fclose(context.source);
+    return EXIT_FAILURE;
+  }
   cmd_app_init(&context.commands);
-  if (!cmd_app_register(&context.commands, "info", "Show the configured client lease.", command_info, &context) || !cmd_app_start(&context.commands)) return EXIT_FAILURE;
+  if (!cmd_app_register(&context.commands, "info", "Show the complete configured DHCP lease.", command_info, &context) || !cmd_app_register(&context.commands, "lease", "Replace the configured client lease.", command_lease, &context) || !cmd_app_start(&context.commands)) {
+    mutex_destroy(&context.mutex);
+    fclose(context.source);
+    return EXIT_FAILURE;
+  }
   uint8_t buffer[DHCP_SERVER_BUFFER_SIZE];
   while (cmd_app_is_running(&context.commands)) {
     long end = 0;
@@ -74,6 +125,7 @@ int main(int argc, char** argv) {
   }
   cmd_app_stop(&context.commands);
   cmd_app_join(&context.commands);
+  mutex_destroy(&context.mutex);
   fclose(context.source);
   return EXIT_SUCCESS;
 }

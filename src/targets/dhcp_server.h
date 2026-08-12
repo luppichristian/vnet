@@ -7,6 +7,7 @@
 #include <ethernet.h>
 #include <futils.h>
 #include <ipv4.h>
+#include <mutex.h>
 #include <thread.h>
 #include <udp.h>
 
@@ -26,5 +27,6 @@ typedef struct dhcp_server_context {
   ipv4_address_t gateway;
   ipv4_address_t dns_server;
   FILE* source;
+  mutex_t mutex;
   cmd_app_t commands;
 } dhcp_server_context_t;

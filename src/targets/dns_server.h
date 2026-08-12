@@ -8,6 +8,7 @@
 #include <ethernet.h>
 #include <futils.h>
 #include <ipv4.h>
+#include <mutex.h>
 #include <thread.h>
 #include <udp.h>
 
@@ -25,5 +26,6 @@ typedef struct dns_server_context {
   dns_record_t records[DNS_SERVER_RECORD_CAPACITY];
   size_t record_count;
   FILE* source;
+  mutex_t mutex;
   cmd_app_t commands;
 } dns_server_context_t;
