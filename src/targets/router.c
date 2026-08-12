@@ -260,45 +260,49 @@ static bool route_ipv4(router_context_t* context, size_t ingress_interface, cons
   ipv4_packet_view_t translated_packet = {0};
   ipv4_header_t translated_header = {0};
   uint8_t translated_payload[ETHERNET_MAX_DATA_LEN - sizeof(ipv4_header_t)] = {0};
-  if (context->nat_enabled && ingress_interface == context->nat_outside_interface && (packet->header.protocol == UDP_IPV4_PROTOCOL || packet->header.protocol == TCP_IPV4_PROTOCOL)) {
+  const bool transport = packet->header.protocol == UDP_IPV4_PROTOCOL || packet->header.protocol == TCP_IPV4_PROTOCOL;
+  if (context->nat_enabled && ingress_interface == context->nat_outside_interface) {
     uint16_t source_port = 0;
     uint16_t destination_port = 0;
-    if (packet->header.protocol == UDP_IPV4_PROTOCOL) {
-      udp_packet_view_t udp = {0};
-      if (!udp_parse_packet(packet->payload, packet->payload_length, packet->header.src_addr, packet->header.dst_addr, &udp)) return false;
-      source_port = udp.header.src_port;
-      destination_port = udp.header.dst_port;
-    } else {
-      tcp_packet_view_t tcp = {0};
-      if (!tcp_parse_packet(packet->payload, packet->payload_length, packet->header.src_addr, packet->header.dst_addr, &tcp)) return false;
-      source_port = tcp.header.src_port;
-      destination_port = tcp.header.dst_port;
+    if (transport) {
+      if (packet->header.protocol == UDP_IPV4_PROTOCOL) {
+        udp_packet_view_t udp = {0};
+        if (!udp_parse_packet(packet->payload, packet->payload_length, packet->header.src_addr, packet->header.dst_addr, &udp)) return false;
+        source_port = udp.header.src_port;
+        destination_port = udp.header.dst_port;
+      } else {
+        tcp_packet_view_t tcp = {0};
+        if (!tcp_parse_packet(packet->payload, packet->payload_length, packet->header.src_addr, packet->header.dst_addr, &tcp)) return false;
+        source_port = tcp.header.src_port;
+        destination_port = tcp.header.dst_port;
+      }
     }
-    const interface_entry_t* outside = interface_table_get(&context->interfaces, context->nat_outside_interface);
-    nat_entry_t* nat = outside && packet->header.dst_addr == outside->ip4 ? nat_table_find_inbound(&context->nat, packet->header.protocol, destination_port, packet->header.src_addr, source_port) : NULL;
+    nat_entry_t* nat = transport ? nat_table_find_inbound_pat(&context->nat, packet->header.protocol, packet->header.dst_addr, destination_port, packet->header.src_addr, source_port) : NULL;
+    if (!nat) nat = nat_table_find_inbound_nat(&context->nat, packet->header.dst_addr, packet->header.src_addr);
     if (!nat) {
       fputs("Dropped unsolicited NAT packet.\n", stderr);
       return true;
     }
-    uint16_t translated_length = 0;
-    if (!nat_rewrite_transport(packet, packet->header.src_addr, nat->inside_address, source_port, nat->inside_port, translated_payload, sizeof(translated_payload), &translated_length)) return false;
+    uint16_t translated_length = packet->payload_length;
+    if (nat->kind == NAT_TRANSLATION_PAT && !nat_rewrite_transport(packet, packet->header.src_addr, nat->inside_address, source_port, nat->inside_port, translated_payload, sizeof(translated_payload), &translated_length)) return false;
     translated_header = packet->header;
     translated_header.dst_addr = nat->inside_address;
-    translated_packet = (ipv4_packet_view_t) {.header = translated_header, .payload = translated_payload, .payload_length = translated_length};
+    translated_packet = (ipv4_packet_view_t) {.header = translated_header, .payload = nat->kind == NAT_TRANSLATION_PAT ? translated_payload : packet->payload, .payload_length = translated_length};
     packet = &translated_packet;
-    fputs("NAT destination: outside:", stdout);
-    fprintf(stdout, "%u -> ", destination_port);
+    fputs("NAT destination: ", stdout);
+    ipv4_address_print(stdout, nat->outside_address);
+    if (nat->kind == NAT_TRANSLATION_PAT) fprintf(stdout, ":%u", destination_port);
+    fputs(" -> ", stdout);
     ipv4_address_print(stdout, nat->inside_address);
-    fprintf(stdout, ":%u.\n", nat->inside_port);
+    if (nat->kind == NAT_TRANSLATION_PAT) fprintf(stdout, ":%u", nat->inside_port);
+    fputs(".\n", stdout);
   }
   if (packet->header.ttl <= 1) {
     fputs("Dropped IPv4 packet with expired TTL.\n", stderr);
     return true;
   }
   const interface_entry_t* local = interface_table_find_ip4(&context->interfaces, packet->header.dst_addr);
-  if (local) {
-    return packet->header.protocol != SOCKET_PROTOCOL_TCP || socket_receive_ipv4(&context->sockets[ingress_interface], packet);
-  }
+  if (local) return packet->header.protocol != SOCKET_PROTOCOL_TCP || socket_receive_ipv4(&context->sockets[ingress_interface], packet);
   const route_entry_t* route = route_table_lookup(&context->routes, packet->header.dst_addr);
   fputs("Router IPv4: src=", stdout);
   ipv4_address_print(stdout, packet->header.src_addr);
@@ -314,14 +318,9 @@ static bool route_ipv4(router_context_t* context, size_t ingress_interface, cons
     fputs("Dropped IPv4 packet with an unavailable egress interface.\n", stderr);
     return true;
   }
-  const ipv4_address_t next_hop = route->next_hop ? route->next_hop : packet->header.dst_addr;
-  arp_entry_t* neighbor = arp_table_find(&context->arp, route->interface_index, next_hop);
-  if (neighbor) {
-    ipv4_header_t forwarded_header = packet->header;
-    uint8_t forwarded_payload[ETHERNET_MAX_DATA_LEN - sizeof(ipv4_header_t)] = {0};
-    const uint8_t* forwarded_data = packet->payload;
-    uint16_t forwarded_length = packet->payload_length;
-    if (context->nat_enabled && ingress_interface == context->nat_inside_interface && route->interface_index == context->nat_outside_interface && (packet->header.protocol == UDP_IPV4_PROTOCOL || packet->header.protocol == TCP_IPV4_PROTOCOL)) {
+  if (context->nat_enabled && ingress_interface == context->nat_inside_interface && route->interface_index == context->nat_outside_interface) {
+    nat_entry_t* nat = NULL;
+    if (transport) {
       uint16_t source_port = 0;
       uint16_t destination_port = 0;
       if (packet->header.protocol == UDP_IPV4_PROTOCOL) {
@@ -335,18 +334,33 @@ static bool route_ipv4(router_context_t* context, size_t ingress_interface, cons
         source_port = tcp.header.src_port;
         destination_port = tcp.header.dst_port;
       }
-      nat_entry_t* nat = nat_table_open(&context->nat, packet->header.protocol, packet->header.src_addr, source_port, packet->header.dst_addr, destination_port);
-      const interface_entry_t* outside = interface_table_get(&context->interfaces, context->nat_outside_interface);
-      if (!nat || !outside || !nat_rewrite_transport(packet, outside->ip4, packet->header.dst_addr, nat->outside_port, destination_port, forwarded_payload, sizeof(forwarded_payload), &forwarded_length)) return false;
-      forwarded_header.src_addr = outside->ip4;
-      forwarded_data = forwarded_payload;
-      fputs("NAT source: ", stdout);
-      ipv4_address_print(stdout, packet->header.src_addr);
-      fprintf(stdout, ":%u -> ", source_port);
-      ipv4_address_print(stdout, outside->ip4);
-      fprintf(stdout, ":%u.\n", nat->outside_port);
+      nat = nat_table_find_outbound_pat(&context->nat, packet->header.protocol, packet->header.src_addr, source_port, egress->ip4);
+      if (!nat && context->dynamic_pat_enabled) nat = nat_table_open_dynamic_pat(&context->nat, packet->header.protocol, packet->header.src_addr, source_port, packet->header.dst_addr, destination_port, egress->ip4);
+      if (nat) {
+        if (!nat_rewrite_transport(packet, egress->ip4, packet->header.dst_addr, nat->outside_port, destination_port, translated_payload, sizeof(translated_payload), &translated_packet.payload_length)) return false;
+        translated_header = packet->header;
+        translated_header.src_addr = egress->ip4;
+        translated_packet.header = translated_header;
+        translated_packet.payload = translated_payload;
+        packet = &translated_packet;
+      }
+    } else if (context->dynamic_nat_enabled || nat_table_find_outbound_nat(&context->nat, packet->header.src_addr, packet->header.dst_addr)) {
+      nat = nat_table_find_outbound_nat(&context->nat, packet->header.src_addr, packet->header.dst_addr);
+      if (!nat && context->dynamic_nat_enabled) nat = nat_table_open_dynamic_nat(&context->nat, packet->header.src_addr);
+      if (!nat) {
+        fputs("Dropped IPv4 packet because no dynamic NAT address is available.\n", stderr);
+        return true;
+      }
+      translated_header = packet->header;
+      translated_header.src_addr = nat->outside_address;
+      translated_packet = (ipv4_packet_view_t) {.header = translated_header, .payload = packet->payload, .payload_length = packet->payload_length};
+      packet = &translated_packet;
     }
-    if (!forward_ipv4(context, route->interface_index, &forwarded_header, forwarded_data, forwarded_length, neighbor->mac)) return false;
+  }
+  const ipv4_address_t next_hop = route->next_hop ? route->next_hop : packet->header.dst_addr;
+  arp_entry_t* neighbor = arp_table_find(&context->arp, route->interface_index, next_hop);
+  if (neighbor) {
+    if (!forward_ipv4(context, route->interface_index, &packet->header, packet->payload, packet->payload_length, neighbor->mac)) return false;
     fputs("Forwarded IPv4 packet from interface ", stdout);
     fprintf(stdout, "%zu to interface %zu.\n", ingress_interface + 1, route->interface_index + 1);
     return true;
@@ -700,15 +714,30 @@ static void print_info(router_context_t* context) {
     fputc('\n', stdout);
   }
   if (context->nat_enabled) {
-    fprintf(stdout, "NAT: inside dev %zu, outside dev %zu\n", context->nat_inside_interface + 1, context->nat_outside_interface + 1);
+    fprintf(stdout, "NAT: inside dev %zu, outside dev %zu  dynamic-nat=%s dynamic-pat=%s\n", context->nat_inside_interface + 1, context->nat_outside_interface + 1, context->dynamic_nat_enabled ? "on" : "off", context->dynamic_pat_enabled ? "on" : "off");
+    fputs("NAT pool:", stdout);
+    for (size_t i = 0; i < context->nat.pool_count; ++i) {
+      fputc(' ', stdout);
+      ipv4_address_print(stdout, context->nat.pool[i]);
+    }
+    fputc('\n', stdout);
     for (size_t i = 0; i < ROUTER_NAT_CAPACITY; ++i) {
       const nat_entry_t* entry = &context->nat_entries[i];
       if (!entry->active) continue;
       fputs("  ", stdout);
       ipv4_address_print(stdout, entry->inside_address);
-      fprintf(stdout, ":%u -> outside:%u  ", entry->inside_port, entry->outside_port);
-      ipv4_address_print(stdout, entry->remote_address);
-      fprintf(stdout, ":%u  %s\n", entry->remote_port, entry->protocol == TCP_IPV4_PROTOCOL ? "tcp" : "udp");
+      if (entry->kind == NAT_TRANSLATION_PAT) fprintf(stdout, ":%u", entry->inside_port);
+      fputs(" -> ", stdout);
+      ipv4_address_print(stdout, entry->outside_address);
+      if (entry->kind == NAT_TRANSLATION_PAT) fprintf(stdout, ":%u", entry->outside_port);
+      fprintf(stdout, "  %s %s", entry->is_static ? "static" : "dynamic", entry->kind == NAT_TRANSLATION_PAT ? "pat" : "nat");
+      if (!entry->is_static) {
+        fputs(" remote=", stdout);
+        ipv4_address_print(stdout, entry->remote_address);
+        if (entry->kind == NAT_TRANSLATION_PAT) fprintf(stdout, ":%u", entry->remote_port);
+      }
+      if (entry->kind == NAT_TRANSLATION_PAT) fprintf(stdout, " %s", entry->protocol == TCP_IPV4_PROTOCOL ? "tcp" : "udp");
+      fputc('\n', stdout);
     }
   }
   fprintf(stdout, "RARP assignments (%zu):\n", context->rarp.count);
@@ -1012,6 +1041,28 @@ static bool parse_options(router_context_t* context, int argc, char** argv) {
       context->nat_outside_interface = outside - 1;
       context->nat_enabled = true;
       i += 3;
+    } else if (strcmpi(argv[i], "-dynamic-nat") == 0) {
+      ipv4_address_t outside_address = 0;
+      if (i + 1 >= argc || !context->nat_enabled || !ipv4_parse_address(argv[i + 1], &outside_address) || !nat_table_add_pool(&context->nat, outside_address)) return false;
+      context->dynamic_nat_enabled = true;
+      i += 2;
+    } else if (strcmpi(argv[i], "-dynamic-pat") == 0) {
+      if (!context->nat_enabled || context->dynamic_pat_enabled) return false;
+      context->dynamic_pat_enabled = true;
+      i += 1;
+    } else if (strcmpi(argv[i], "-static-nat") == 0) {
+      ipv4_address_t inside_address = 0;
+      ipv4_address_t outside_address = 0;
+      if (i + 2 >= argc || !context->nat_enabled || !ipv4_parse_address(argv[i + 1], &inside_address) || !ipv4_parse_address(argv[i + 2], &outside_address) || !nat_table_add_static_nat(&context->nat, inside_address, outside_address)) return false;
+      i += 3;
+    } else if (strcmpi(argv[i], "-static-pat") == 0) {
+      ipv4_address_t inside_address = 0;
+      ipv4_address_t outside_address = 0;
+      uint16_t inside_port = 0;
+      uint16_t outside_port = 0;
+      const uint8_t protocol = i + 1 < argc && strcmpi(argv[i + 1], "udp") == 0 ? UDP_IPV4_PROTOCOL : i + 1 < argc && strcmpi(argv[i + 1], "tcp") == 0 ? TCP_IPV4_PROTOCOL : 0;
+      if (i + 5 >= argc || !context->nat_enabled || !protocol || !ipv4_parse_address(argv[i + 2], &inside_address) || !cmd_app_parse_uint16(argv[i + 3], &inside_port) || !ipv4_parse_address(argv[i + 4], &outside_address) || !cmd_app_parse_uint16(argv[i + 5], &outside_port) || !nat_table_add_static_pat(&context->nat, protocol, inside_address, inside_port, outside_address, outside_port)) return false;
+      i += 6;
     } else if (strcmpi(argv[i], "-bgp") == 0) {
       if (i + 5 >= argc || context->bgp_peer_count == ROUTER_BGP_PEER_CAPACITY) return false;
       uint16_t interface_number = 0;
@@ -1052,9 +1103,9 @@ int main(int argc, char** argv) {
   arp_table_init(&context.arp, context.arp_entries, ROUTER_ARP_CAPACITY);
   rarp_table_init(&context.rarp, context.rarp_entries, ROUTER_RARP_CAPACITY);
   prefix_list_init(&context.prefix_lists, context.prefix_list_entries, ROUTER_PREFIX_LIST_CAPACITY);
-  nat_table_init(&context.nat, context.nat_entries, ROUTER_NAT_CAPACITY, NAT_EPHEMERAL_PORT_MIN);
+  nat_table_init(&context.nat, context.nat_entries, ROUTER_NAT_CAPACITY, context.nat_pool, ROUTER_NAT_POOL_CAPACITY, NAT_EPHEMERAL_PORT_MIN);
   if (!parse_options(&context, argc, argv)) {
-    fputs("Usage: router -i <file> <mac-address> <ip-address> <mask> [... ] [-r <network> <mask> <next-hop|direct> <interface> <metric> [...]] [-bgp <active|passive> <interface> <peer-ip> <local-as> <peer-as> [...]] [-rarp <client-mac> <ip-address> [...]] [-dynamic-routing <off|rip|ospf>] [-nat <inside-interface> <outside-interface>]\n", stderr);
+    fputs("Usage: router -i <file> <mac-address> <ip-address> <mask> [... ] [-r <network> <mask> <next-hop|direct> <interface> <metric> [...]] [-bgp <active|passive> <interface> <peer-ip> <local-as> <peer-as> [...]] [-rarp <client-mac> <ip-address> [...]] [-dynamic-routing <off|rip|ospf>] [-nat <inside-interface> <outside-interface>] [-dynamic-nat <outside-address> ...] [-dynamic-pat] [-static-nat <inside-address> <outside-address> ...] [-static-pat <tcp|udp> <inside-address> <inside-port> <outside-address> <outside-port> ...]\n", stderr);
     return EXIT_FAILURE;
   }
   if (!mutex_init(&context.mutex)) {

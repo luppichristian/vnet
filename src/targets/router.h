@@ -43,6 +43,7 @@ OSI/ISO layer: Layer 3; it routes IPv4 packets and resolves each egress next hop
 #define ROUTER_BGP_PEER_CAPACITY     16
 #define ROUTER_PREFIX_LIST_CAPACITY  128
 #define ROUTER_NAT_CAPACITY          128
+#define ROUTER_NAT_POOL_CAPACITY     32
 #define ROUTER_BUFFER_SIZE           8192
 #define SLEEP_INTERVAL_MS            5
 #define RIP_ROUTE_TIMEOUT_SECONDS    180
@@ -115,10 +116,13 @@ typedef struct router_context {
   socket_handle_t bgp_listeners[ROUTER_INTERFACE_CAPACITY];
   router_bgp_peer_t bgp_peers[ROUTER_BGP_PEER_CAPACITY];
   nat_entry_t nat_entries[ROUTER_NAT_CAPACITY];
+  ipv4_address_t nat_pool[ROUTER_NAT_POOL_CAPACITY];
   nat_table_t nat;
   size_t nat_inside_interface;
   size_t nat_outside_interface;
   bool nat_enabled;
+  bool dynamic_nat_enabled;
+  bool dynamic_pat_enabled;
   size_t bgp_peer_count;
   router_dynamic_routing_mode_t dynamic_routing;
   uint32_t next_rip_update;
