@@ -13,6 +13,13 @@ static const dns_record_t* find_record(const dns_server_context_t* context, cons
   return NULL;
 }
 
+static bool name_is_blacklisted(const dns_server_context_t* context, const char* name) {
+  for (size_t i = 0; i < context->blacklist_count; ++i) {
+    if (strcmpi(context->blacklist[i], name) == 0) return true;
+  }
+  return false;
+}
+
 static void command_info(void* argument, char* arguments) {
   dns_server_context_t* context = argument;
   if (!cmd_app_arguments_empty(arguments)) {
@@ -32,6 +39,8 @@ static void command_info(void* argument, char* arguments) {
     else fputs(record->data.name, stdout);
     fputc('\n', stdout);
   }
+  fprintf(stdout, "Blacklist (%zu):\n", context->blacklist_count);
+  for (size_t i = 0; i < context->blacklist_count; ++i) fprintf(stdout, "  %s\n", context->blacklist[i]);
   mutex_unlock(&context->mutex);
 }
 
@@ -79,10 +88,49 @@ static void command_record(void* argument, char* arguments) {
   fputs(index < DNS_SERVER_RECORD_CAPACITY ? "DNS record set.\n" : "DNS record table is full.\n", index < DNS_SERVER_RECORD_CAPACITY ? stdout : stderr);
 }
 
-static bool write_dns_response(dns_server_context_t* context, const ethernet_frame_view_t* frame, const ipv4_packet_view_t* ipv4, const udp_packet_view_t* udp, const dns_message_t* query) {
+static void command_blacklist(void* argument, char* arguments) {
+  dns_server_context_t* context = argument;
+  char* cursor = arguments;
+  char* action = cmd_app_next_argument(&cursor);
+  char* name = cmd_app_next_argument(&cursor);
+  dns_message_t query = {0};
+  if (!action || !name || cmd_app_next_argument(&cursor) || !dns_write_query(1, DNS_RECORD_A, name, &query)) {
+    fputs("Usage: blacklist <add|delete> <name>\n", stderr);
+    return;
+  }
+  mutex_lock(&context->mutex);
+  size_t index = context->blacklist_count;
+  for (size_t i = 0; i < context->blacklist_count; ++i) {
+    if (strcmpi(context->blacklist[i], name) == 0) {
+      index = i;
+      break;
+    }
+  }
+  if (strcmpi(action, "add") == 0) {
+    if (index == context->blacklist_count && index < DNS_SERVER_BLACKLIST_CAPACITY) {
+      memcpy(context->blacklist[index], name, strlen(name) + 1);
+      ++context->blacklist_count;
+    }
+    mutex_unlock(&context->mutex);
+    fputs(index < DNS_SERVER_BLACKLIST_CAPACITY ? "DNS blacklist entry set.\n" : "DNS blacklist is full.\n", index < DNS_SERVER_BLACKLIST_CAPACITY ? stdout : stderr);
+    return;
+  }
+  if (strcmpi(action, "delete") == 0 && index < context->blacklist_count) {
+    --context->blacklist_count;
+    if (index != context->blacklist_count) memcpy(context->blacklist[index], context->blacklist[context->blacklist_count], sizeof(context->blacklist[index]));
+    mutex_unlock(&context->mutex);
+    fputs("DNS blacklist entry removed.\n", stdout);
+    return;
+  }
+  mutex_unlock(&context->mutex);
+  fputs(strcmpi(action, "delete") == 0 ? "No such DNS blacklist entry.\n" : "Usage: blacklist <add|delete> <name>\n", stderr);
+}
+
+static bool write_dns_response(dns_server_context_t* context, const ethernet_frame_view_t* frame, const ipv4_packet_view_t* ipv4, const udp_packet_view_t* udp, const dns_message_t* query, bool* blocked) {
   dns_message_t response = {0};
   mutex_lock(&context->mutex);
-  const dns_record_t* record = find_record(context, query->record.name);
+  *blocked = name_is_blacklisted(context, query->record.name);
+  const dns_record_t* record = *blocked ? NULL : find_record(context, query->record.name);
   const bool valid = dns_write_response(query->transaction_id, query->record.name, record, &response);
   mutex_unlock(&context->mutex);
   if (!valid) return false;
@@ -126,7 +174,8 @@ static void handle_frame(dns_server_context_t* context, const uint8_t* bytes, si
     return;
   }
   if (frame.header.type_or_length != ETHERNET_ETHERTYPE_IPV4 || memcmp(frame.header.dst_mac, context->mac, sizeof(context->mac)) != 0 || !ipv4_parse_packet(frame.data, frame.data_length, &ipv4) || ipv4.header.dst_addr != context->address || ipv4.header.protocol != UDP_IPV4_PROTOCOL || !udp_parse_packet(ipv4.payload, ipv4.payload_length, ipv4.header.src_addr, ipv4.header.dst_addr, &udp) || udp.header.dst_port != DNS_UDP_PORT || !dns_parse_message(udp.data, udp.data_length, &query) || query.type != DNS_MESSAGE_QUERY) return;
-  if (write_dns_response(context, &frame, &ipv4, &udp, &query)) fprintf(stdout, "DNS query: %s (%s).\n", query.record.name, find_record(context, query.record.name) ? "answered" : "name error");
+  bool blocked = false;
+  if (write_dns_response(context, &frame, &ipv4, &udp, &query, &blocked)) fprintf(stdout, "DNS query: %s (%s).\n", query.record.name, blocked ? "blocked" : find_record(context, query.record.name) ? "answered" : "name error");
 }
 
 static bool parse_record(const char* type, const char* name, const char* value, dns_record_t* record) {
@@ -154,7 +203,7 @@ int main(int argc, char** argv) {
     return EXIT_FAILURE;
   }
   cmd_app_init(&context.commands);
-  if (!cmd_app_register(&context.commands, "info", "Show the configured server and authoritative records.", command_info, &context) || !cmd_app_register(&context.commands, "record", "Add, replace, or delete an authoritative DNS record.", command_record, &context) || !cmd_app_start(&context.commands)) {
+  if (!cmd_app_register(&context.commands, "info", "Show the configured server, records, and blacklist.", command_info, &context) || !cmd_app_register(&context.commands, "record", "Add, replace, or delete an authoritative DNS record.", command_record, &context) || !cmd_app_register(&context.commands, "blacklist", "Block or allow a DNS name.", command_blacklist, &context) || !cmd_app_start(&context.commands)) {
     mutex_destroy(&context.mutex);
     fclose(context.source);
     return EXIT_FAILURE;
