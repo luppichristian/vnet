@@ -53,6 +53,7 @@ OSI/ISO layer: Layer 3; it routes IPv4 packets and resolves each egress next hop
 #define ROUTER_NAT_CAPACITY          128
 #define ROUTER_NAT_POOL_CAPACITY     32
 #define ROUTER_DHCP_RELAY_CAPACITY   16
+#define ROUTER_ACL_RULE_CAPACITY     64
 
 #define ROUTER_BUFFER_SIZE           8192
 #define SLEEP_INTERVAL_MS            5
@@ -77,6 +78,35 @@ typedef struct router_port {
   size_t buffer_length;
   size_t injected_bytes;
 } router_port_t;
+
+typedef enum router_acl_direction {
+  ROUTER_ACL_DIRECTION_INGRESS,
+  ROUTER_ACL_DIRECTION_EGRESS,
+} router_acl_direction_t;
+
+typedef enum router_acl_action {
+  ROUTER_ACL_ACTION_DENY,
+  ROUTER_ACL_ACTION_PERMIT,
+} router_acl_action_t;
+
+typedef struct router_acl_rule {
+  uint16_t sequence;
+  uint16_t src_port;
+  uint16_t dst_port;
+  ipv4_address_t src_network;
+  ipv4_address_t src_mask;
+  ipv4_address_t dst_network;
+  ipv4_address_t dst_mask;
+  uint64_t packets;
+  uint64_t bytes;
+  size_t interface_index;
+  uint8_t protocol;
+  bool src_port_any;
+  bool dst_port_any;
+  bool active;
+  router_acl_direction_t direction;
+  router_acl_action_t action;
+} router_acl_rule_t;
 
 typedef struct router_pending_packet {
   ipv4_header_t header;
@@ -135,6 +165,7 @@ typedef struct router_context {
   rarp_entry_t rarp_entries[ROUTER_RARP_CAPACITY];
   prefix_list_rule_t prefix_list_entries[ROUTER_PREFIX_LIST_CAPACITY];
   router_pending_packet_t pending_packets[ROUTER_PENDING_CAPACITY];
+  router_acl_rule_t acl_rules[ROUTER_ACL_RULE_CAPACITY];
   interface_table_t interfaces;
   route_table_t routes;
   arp_table_t arp;
@@ -162,6 +193,10 @@ typedef struct router_context {
   uint32_t next_rip_update;
   uint32_t next_ospf_update;
   uint32_t next_ra_update;
+  size_t port_count;
+  router_acl_action_t acl_defaults[ROUTER_INTERFACE_CAPACITY][2];
+  uint64_t acl_default_packets[ROUTER_INTERFACE_CAPACITY][2];
+  uint64_t acl_default_bytes[ROUTER_INTERFACE_CAPACITY][2];
   char rip_inbound_prefix_lists[ROUTER_INTERFACE_CAPACITY][PREFIX_LIST_NAME_LEN];
   char rip_outbound_prefix_lists[ROUTER_INTERFACE_CAPACITY][PREFIX_LIST_NAME_LEN];
   mutex_t mutex;

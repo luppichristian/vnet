@@ -32,6 +32,10 @@ typedef struct interface_entry {
   ipv6_address_t ip6_global;
   ipv6_address_t ip6_prefix;
   uint8_t ip6_prefix_length;
+  size_t parent_index;
+  size_t port_index;
+  uint16_t vlan_id;
+  bool tagged;
   bool enabled;
 } interface_entry_t;
 
@@ -48,9 +52,14 @@ void interface_table_init(interface_table_t* table, interface_entry_t* entries, 
 interface_entry_t* interface_table_find_path(interface_table_t* table, const char* path);
 interface_entry_t* interface_table_find_ip4(interface_table_t* table, ipv4_address_t ip4);
 const interface_entry_t* interface_table_get(const interface_table_t* table, size_t index);
+bool interface_table_index_valid(const interface_table_t* table, size_t index);
+bool interface_table_is_subinterface(const interface_entry_t* entry);
 
 /* Adds an enabled interface. Returns false for duplicate paths, invalid masks, or a full table. */
-bool interface_table_add(interface_table_t* table, const char* path, const mac_address_t mac, ipv4_address_t ip4, ipv4_address_t mask);
+bool interface_table_add_base(interface_table_t* table, const char* path, const mac_address_t mac, ipv4_address_t ip4, ipv4_address_t mask);
+
+/* Adds an IEEE 802.1Q subinterface that shares a parent medium and MAC address. */
+bool interface_table_add_subinterface(interface_table_t* table, size_t parent_index, uint16_t vlan_id, ipv4_address_t ip4, ipv4_address_t mask);
 
 /* Changes the administrative state of an existing interface. */
 bool interface_table_set_enabled(interface_table_t* table, size_t index, bool enabled);

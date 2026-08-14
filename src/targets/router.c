@@ -5,6 +5,9 @@ static const mac_address_t ospf_multicast_mac = {0x01, 0x00, 0x5E, 0x00, 0x00, 0
 static const mac_address_t ethernet_broadcast_mac = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static const ipv6_address_t ipv6_all_nodes = {.bytes = {0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}};
 static const ipv6_address_t ipv6_all_routers = {.bytes = {0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}};
+#define ROUTER_ACL_PROTOCOL_ANY 0
+#define ROUTER_ACL_PORT_ANY     0
+#define ROUTER_INTERFACE_NONE   ((size_t)-1)
 
 static bool write_arp_request(router_context_t* context, size_t interface_index, ipv4_address_t target);
 static bool forward_ipv4(router_context_t* context, size_t interface_index, const ipv4_header_t* header, const uint8_t* payload, uint16_t payload_length, const mac_address_t destination_mac);
@@ -16,15 +19,59 @@ static router_dhcp_relay_entry_t* find_dhcp_relay_entry(router_context_t* contex
 static router_dhcp_relay_entry_t* remember_dhcp_relay(router_context_t* context, size_t ingress_interface, const dhcp_message_t* message, ipv4_address_t server_address, uint32_t now);
 static bool handle_dhcp_relay(router_context_t* context, size_t ingress_interface, const ethernet_frame_view_t* frame, const ipv4_packet_view_t* packet, bool* handled);
 static bool handle_ipv6(router_context_t* context, size_t ingress_interface, const ethernet_frame_view_t* frame);
+static bool append_frame(router_context_t* context, size_t interface_index, const ethernet_frame_data_t* frame);
+static bool append_generated_frame_file(router_context_t* context, size_t interface_index, FILE* frame_file);
+static size_t find_ingress_interface(const router_context_t* context, size_t port_index, const ethernet_frame_view_t* frame);
+static router_acl_action_t evaluate_acl(router_context_t* context, size_t interface_index, router_acl_direction_t direction, const ipv4_packet_view_t* packet);
+static const char* acl_action_name(router_acl_action_t action);
+static const char* acl_direction_name(router_acl_direction_t direction);
+static bool parse_acl_protocol(const char* text, uint8_t* protocol);
+static bool parse_acl_port(const char* text, bool* any, uint16_t* port);
+static bool acl_protocol_has_ports(uint8_t protocol);
+static uint16_t acl_rule_sort_key(const router_acl_rule_t* rule);
+
+static bool append_generated_frame_file(router_context_t* context, size_t interface_index, FILE* frame_file) {
+  if (!context || !frame_file) return false;
+  const long length = ftell(frame_file);
+  if (length <= 0 || fseek(frame_file, 0, SEEK_SET) != 0) return false;
+  uint8_t* bytes = malloc((size_t)length);
+  if (!bytes) return false;
+  const bool read = fread(bytes, 1, (size_t)length, frame_file) == (size_t)length;
+  if (!read) {
+    free(bytes);
+    return false;
+  }
+  ethernet_frame_view_t parsed = {0};
+  const bool ok = ethernet_parse_frame(bytes, (size_t)length, &parsed);
+  if (!ok) {
+    free(bytes);
+    return false;
+  }
+  ethernet_frame_data_t frame = {
+      .type_or_length = parsed.type_or_length,
+      .data_length = parsed.client_data_length,
+      .data = parsed.data,
+      .tagged = parsed.tagged,
+      .priority = parsed.priority,
+      .drop_eligible = parsed.drop_eligible,
+      .vlan_id = parsed.vlan_id,
+  };
+  memcpy(frame.dst_addr, parsed.header.dst_mac, sizeof(frame.dst_addr));
+  memcpy(frame.src_addr, parsed.header.src_mac, sizeof(frame.src_addr));
+  const bool appended = append_frame(context, interface_index, &frame);
+  free(bytes);
+  return appended;
+}
 
 static bool append_ipv6_frame(router_context_t* context, size_t interface_index, const ipv6_packet_data_t* packet) {
-  router_port_t* port = &context->ports[interface_index];
-  const long before = ftell(port->destination);
-  if (before < 0 || !ipv6_write_ethernet_packet(port->destination, packet)) return false;
-  const long after = ftell(port->destination);
-  if (after < before || fflush(port->destination) != 0) return false;
-  port->injected_bytes += (size_t)(after - before);
-  return true;
+  FILE* destination = tmpfile();
+  if (!destination || !ipv6_write_ethernet_packet(destination, packet)) {
+    if (destination) fclose(destination);
+    return false;
+  }
+  const bool appended = append_generated_frame_file(context, interface_index, destination);
+  fclose(destination);
+  return appended;
 }
 
 static bool router_interface_owns_ip6(const interface_entry_t* entry, const ipv6_address_t* address) {
@@ -50,18 +97,20 @@ static bool write_router_advertisement(router_context_t* context, size_t interfa
   };
   memcpy(advertisement.src_mac_addr, entry->mac, sizeof(advertisement.src_mac_addr));
   memcpy(advertisement.dst_mac_addr, destination_mac, sizeof(advertisement.dst_mac_addr));
-  return ndp_write_router_advertisement(context->ports[interface_index].destination, &advertisement) && fflush(context->ports[interface_index].destination) == 0;
+  FILE* destination = tmpfile();
+  if (!destination || !ndp_write_router_advertisement(destination, &advertisement)) {
+    if (destination) fclose(destination);
+    return false;
+  }
+  const bool appended = append_generated_frame_file(context, interface_index, destination);
+  fclose(destination);
+  return appended;
 }
 
 static bool write_unsolicited_router_advertisement(router_context_t* context, size_t interface_index) {
   mac_address_t multicast_mac = {0};
   ipv6_multicast_mac(&ipv6_all_nodes, multicast_mac);
-  const long before = ftell(context->ports[interface_index].destination);
-  if (before < 0 || !write_router_advertisement(context, interface_index, &ipv6_all_nodes, multicast_mac)) return false;
-  const long after = ftell(context->ports[interface_index].destination);
-  if (after < before) return false;
-  context->ports[interface_index].injected_bytes += (size_t)(after - before);
-  return true;
+  return write_router_advertisement(context, interface_index, &ipv6_all_nodes, multicast_mac);
 }
 
 static bool write_neighbor_advertisement(router_context_t* context, size_t interface_index, const ipv6_address_t* destination_ip6, const mac_address_t destination_mac, const ipv6_address_t* target_address, bool solicited) {
@@ -77,12 +126,14 @@ static bool write_neighbor_advertisement(router_context_t* context, size_t inter
   };
   memcpy(advertisement.src_mac_addr, entry->mac, sizeof(advertisement.src_mac_addr));
   memcpy(advertisement.dst_mac_addr, destination_mac, sizeof(advertisement.dst_mac_addr));
-  const long before = ftell(context->ports[interface_index].destination);
-  if (before < 0 || !ndp_write_neighbor_advertisement(context->ports[interface_index].destination, &advertisement) || fflush(context->ports[interface_index].destination) != 0) return false;
-  const long after = ftell(context->ports[interface_index].destination);
-  if (after < before) return false;
-  context->ports[interface_index].injected_bytes += (size_t)(after - before);
-  return true;
+  FILE* destination = tmpfile();
+  if (!destination || !ndp_write_neighbor_advertisement(destination, &advertisement)) {
+    if (destination) fclose(destination);
+    return false;
+  }
+  const bool appended = append_generated_frame_file(context, interface_index, destination);
+  fclose(destination);
+  return appended;
 }
 
 static bool write_icmpv6_echo_reply(router_context_t* context, size_t interface_index, const ethernet_frame_view_t* frame, const ipv6_packet_view_t* ip6, const icmpv6_echo_header_t* echo, const uint8_t* data, size_t data_length) {
@@ -99,12 +150,14 @@ static bool write_icmpv6_echo_reply(router_context_t* context, size_t interface_
   };
   memcpy(reply.src_mac_addr, entry->mac, sizeof(reply.src_mac_addr));
   memcpy(reply.dst_mac_addr, frame->header.src_mac, sizeof(reply.dst_mac_addr));
-  const long before = ftell(context->ports[interface_index].destination);
-  if (before < 0 || !icmpv6_write_ethernet_echo_reply(context->ports[interface_index].destination, &reply) || fflush(context->ports[interface_index].destination) != 0) return false;
-  const long after = ftell(context->ports[interface_index].destination);
-  if (after < before) return false;
-  context->ports[interface_index].injected_bytes += (size_t)(after - before);
-  return true;
+  FILE* destination = tmpfile();
+  if (!destination || !icmpv6_write_ethernet_echo_reply(destination, &reply)) {
+    if (destination) fclose(destination);
+    return false;
+  }
+  const bool appended = append_generated_frame_file(context, interface_index, destination);
+  fclose(destination);
+  return appended;
 }
 
 static const char* dynamic_routing_name(router_dynamic_routing_mode_t mode) {
@@ -116,20 +169,146 @@ static const char* dynamic_routing_name(router_dynamic_routing_mode_t mode) {
   return "off";
 }
 
-static bool write_udp_on_interface(router_context_t* context, size_t interface_index, const udp_packet_data_t* packet) {
-  router_port_t* port = &context->ports[interface_index];
-  const long before = ftell(port->destination);
-  if (before < 0 || !udp_write_ethernet_packet(port->destination, packet)) return false;
-  const long after = ftell(port->destination);
-  if (after < before || fflush(port->destination) != 0) return false;
-  port->injected_bytes += (size_t)(after - before);
+static const char* acl_action_name(router_acl_action_t action) {
+  return action == ROUTER_ACL_ACTION_PERMIT ? "permit" : "deny";
+}
+
+static const char* acl_direction_name(router_acl_direction_t direction) {
+  return direction == ROUTER_ACL_DIRECTION_EGRESS ? "out" : "in";
+}
+
+static bool acl_protocol_has_ports(uint8_t protocol) {
+  return protocol == TCP_IPV4_PROTOCOL || protocol == UDP_IPV4_PROTOCOL;
+}
+
+static bool parse_acl_protocol(const char* text, uint8_t* protocol) {
+  if (!text || !protocol) return false;
+  if (strcmpi(text, "any") == 0) {
+    *protocol = ROUTER_ACL_PROTOCOL_ANY;
+    return true;
+  }
+  if (strcmpi(text, "tcp") == 0) {
+    *protocol = TCP_IPV4_PROTOCOL;
+    return true;
+  }
+  if (strcmpi(text, "udp") == 0) {
+    *protocol = UDP_IPV4_PROTOCOL;
+    return true;
+  }
+  if (strcmpi(text, "icmp") == 0) {
+    *protocol = ICMP_IPV4_PROTOCOL;
+    return true;
+  }
+  uint16_t value = 0;
+  if (!cmd_app_parse_uint16(text, &value) || value > UINT8_MAX) return false;
+  *protocol = (uint8_t)value;
   return true;
 }
 
+static bool parse_acl_port(const char* text, bool* any, uint16_t* port) {
+  if (!text || !any || !port) return false;
+  if (strcmpi(text, "any") == 0) {
+    *any = true;
+    *port = ROUTER_ACL_PORT_ANY;
+    return true;
+  }
+  *any = false;
+  return cmd_app_parse_uint16(text, port);
+}
+
+static uint16_t acl_rule_sort_key(const router_acl_rule_t* rule) {
+  return rule ? rule->sequence : 0;
+}
+
+static bool acl_packet_ports(const ipv4_packet_view_t* packet, uint16_t* src_port, uint16_t* dst_port) {
+  if (!packet || !src_port || !dst_port) return false;
+  *src_port = 0;
+  *dst_port = 0;
+  if (packet->header.protocol == UDP_IPV4_PROTOCOL) {
+    udp_packet_view_t udp = {0};
+    if (!udp_parse_packet(packet->payload, packet->payload_length, packet->header.src_addr, packet->header.dst_addr, &udp)) return false;
+    *src_port = udp.header.src_port;
+    *dst_port = udp.header.dst_port;
+    return true;
+  }
+  if (packet->header.protocol == TCP_IPV4_PROTOCOL) {
+    tcp_packet_view_t tcp = {0};
+    if (!tcp_parse_packet(packet->payload, packet->payload_length, packet->header.src_addr, packet->header.dst_addr, &tcp)) return false;
+    *src_port = tcp.header.src_port;
+    *dst_port = tcp.header.dst_port;
+    return true;
+  }
+  return true;
+}
+
+static router_acl_action_t evaluate_acl(router_context_t* context, size_t interface_index, router_acl_direction_t direction, const ipv4_packet_view_t* packet) {
+  uint16_t source_port = 0;
+  uint16_t destination_port = 0;
+  if (!context || !packet) return ROUTER_ACL_ACTION_DENY;
+  if (acl_protocol_has_ports(packet->header.protocol) && !acl_packet_ports(packet, &source_port, &destination_port)) {
+    return ROUTER_ACL_ACTION_DENY;
+  }
+  router_acl_rule_t* best = NULL;
+  for (size_t i = 0; i < ROUTER_ACL_RULE_CAPACITY; ++i) {
+    router_acl_rule_t* rule = &context->acl_rules[i];
+    if (!rule->active || rule->interface_index != interface_index || rule->direction != direction) continue;
+    if (rule->protocol != ROUTER_ACL_PROTOCOL_ANY && rule->protocol != packet->header.protocol) continue;
+    if ((packet->header.src_addr & rule->src_mask) != rule->src_network) continue;
+    if ((packet->header.dst_addr & rule->dst_mask) != rule->dst_network) continue;
+    if (acl_protocol_has_ports(rule->protocol ? rule->protocol : packet->header.protocol)) {
+      if (!rule->src_port_any && rule->src_port != source_port) continue;
+      if (!rule->dst_port_any && rule->dst_port != destination_port) continue;
+    } else if (!rule->src_port_any || !rule->dst_port_any) {
+      continue;
+    }
+    if (!best || acl_rule_sort_key(rule) < acl_rule_sort_key(best)) best = rule;
+  }
+  if (best) {
+    ++best->packets;
+    best->bytes += sizeof(packet->header) + packet->payload_length;
+    return best->action;
+  }
+  ++context->acl_default_packets[interface_index][direction];
+  context->acl_default_bytes[interface_index][direction] += sizeof(packet->header) + packet->payload_length;
+  return context->acl_defaults[interface_index][direction];
+}
+
+static size_t find_ingress_interface(const router_context_t* context, size_t port_index, const ethernet_frame_view_t* frame) {
+  if (!context || !frame) return ROUTER_INTERFACE_NONE;
+  for (size_t i = 0; i < context->interfaces.count; ++i) {
+    const interface_entry_t* entry = &context->interfaces.entries[i];
+    if (entry->port_index != port_index) continue;
+    if (entry->tagged != frame->tagged) continue;
+    if (entry->tagged && entry->vlan_id != frame->vlan_id) continue;
+    return i;
+  }
+  return ROUTER_INTERFACE_NONE;
+}
+
+static bool write_udp_on_interface(router_context_t* context, size_t interface_index, const udp_packet_data_t* packet) {
+  FILE* destination = tmpfile();
+  if (!destination || !udp_write_ethernet_packet(destination, packet)) {
+    if (destination) fclose(destination);
+    return false;
+  }
+  const bool appended = append_generated_frame_file(context, interface_index, destination);
+  fclose(destination);
+  return appended;
+}
+
 static bool append_frame(router_context_t* context, size_t interface_index, const ethernet_frame_data_t* frame) {
-  router_port_t* port = &context->ports[interface_index];
+  const interface_entry_t* entry = interface_table_get(&context->interfaces, interface_index);
+  if (!entry || entry->port_index == ROUTER_INTERFACE_NONE) return false;
+  router_port_t* port = &context->ports[entry->port_index];
+  ethernet_frame_data_t emitted = *frame;
+  if (entry->tagged) {
+    emitted.tagged = true;
+    emitted.vlan_id = entry->vlan_id;
+    emitted.priority = 0;
+    emitted.drop_eligible = false;
+  }
   const long before = ftell(port->destination);
-  if (before < 0 || !ethernet_write_frame(port->destination, frame)) {
+  if (before < 0 || !ethernet_write_frame(port->destination, &emitted)) {
     return false;
   }
   const long after = ftell(port->destination);
@@ -163,6 +342,24 @@ static bool emit_routed_ipv4(router_context_t* context, ipv4_address_t destinati
   if (!route) return true;
   const interface_entry_t* entry = interface_table_get(&context->interfaces, route->interface_index);
   if (!entry || !entry->enabled) return true;
+  ipv4_packet_view_t view = {
+      .header =
+          {
+              .version = 4,
+              .ihl = 5,
+              .total_length = (uint16_t)(sizeof(ipv4_header_t) + payload_length),
+              .ttl = IPV4_DEFAULT_TTL,
+              .protocol = protocol,
+              .src_addr = entry->ip4,
+              .dst_addr = destination,
+          },
+      .payload = payload,
+      .payload_length = payload_length,
+  };
+  if (evaluate_acl(context, route->interface_index, ROUTER_ACL_DIRECTION_EGRESS, &view) != ROUTER_ACL_ACTION_PERMIT) {
+    fputs("Dropped generated IPv4 packet by egress ACL.\n", stderr);
+    return true;
+  }
   const ipv4_address_t next_hop = route->next_hop ? route->next_hop : destination;
   const arp_entry_t* neighbor = arp_table_find_const(&context->arp, route->interface_index, next_hop);
   if (!neighbor) {
@@ -177,13 +374,14 @@ static bool emit_routed_ipv4(router_context_t* context, ipv4_address_t destinati
   };
   memcpy(packet.src_mac_addr, entry->mac, sizeof(packet.src_mac_addr));
   memcpy(packet.dst_mac_addr, neighbor->mac, sizeof(packet.dst_mac_addr));
-  router_port_t* port = &context->ports[route->interface_index];
-  const long before = ftell(port->destination);
-  if (before < 0 || !ipv4_write_ethernet_packet(port->destination, &packet)) return false;
-  const long after = ftell(port->destination);
-  if (after < before || fflush(port->destination) != 0) return false;
-  port->injected_bytes += (size_t)(after - before);
-  return true;
+  FILE* frame_file = tmpfile();
+  if (!frame_file || !ipv4_write_ethernet_packet(frame_file, &packet)) {
+    if (frame_file) fclose(frame_file);
+    return false;
+  }
+  const bool appended = append_generated_frame_file(context, route->interface_index, frame_file);
+  fclose(frame_file);
+  return appended;
 }
 
 static bool emit_generated_ipv4(router_context_t* context, const ipv4_packet_view_t* packet) {
@@ -241,13 +439,7 @@ static bool write_rip_packet(router_context_t* context, size_t interface_index, 
   };
   memcpy(packet.src_mac_addr, entry->mac, sizeof(packet.src_mac_addr));
   memcpy(packet.dst_mac_addr, rip_multicast_mac, sizeof(packet.dst_mac_addr));
-  router_port_t* port = &context->ports[interface_index];
-  const long before = ftell(port->destination);
-  if (before < 0 || !udp_write_ethernet_packet(port->destination, &packet)) return false;
-  const long after = ftell(port->destination);
-  if (after < before || fflush(port->destination) != 0) return false;
-  port->injected_bytes += (size_t)(after - before);
-  return true;
+  return write_udp_on_interface(context, interface_index, &packet);
 }
 
 static bool write_rip_response(router_context_t* context, size_t interface_index) {
@@ -314,12 +506,14 @@ static bool write_ospf_updates(router_context_t* context) {
     };
     memcpy(packet.src_mac_addr, entry->mac, sizeof(packet.src_mac_addr));
     memcpy(packet.dst_mac_addr, ospf_multicast_mac, sizeof(packet.dst_mac_addr));
-    router_port_t* port = &context->ports[i];
-    const long before = ftell(port->destination);
-    if (before < 0 || !ipv4_write_ethernet_packet(port->destination, &packet)) return false;
-    const long after = ftell(port->destination);
-    if (after < before || fflush(port->destination) != 0) return false;
-    port->injected_bytes += (size_t)(after - before);
+    FILE* frame_file = tmpfile();
+    if (!frame_file || !ipv4_write_ethernet_packet(frame_file, &packet)) {
+      if (frame_file) fclose(frame_file);
+      return false;
+    }
+    const bool appended = append_generated_frame_file(context, i, frame_file);
+    fclose(frame_file);
+    if (!appended) return false;
   }
   return true;
 }
@@ -329,7 +523,6 @@ static bool write_arp_request(router_context_t* context, size_t interface_index,
   if (!entry) {
     return false;
   }
-  uint8_t bytes[sizeof(arp_packet_t)] = {0};
   arp_packet_data_t request = {
       .sender_protocol_address = entry->ip4,
       .target_protocol_address = target,
@@ -340,27 +533,9 @@ static bool write_arp_request(router_context_t* context, size_t interface_index,
     if (destination) fclose(destination);
     return false;
   }
-  const long length = ftell(destination);
-  if (length <= 0 || (size_t)length > sizeof(bytes) + sizeof(ethernet_header_t) + ETHERNET_MIN_DATA_LEN + sizeof(ethernet_footer_t) || fseek(destination, 0, SEEK_SET) != 0) {
-    fclose(destination);
-    return false;
-  }
-  uint8_t* frame_bytes = malloc((size_t)length);
-  if (!frame_bytes) {
-    fclose(destination);
-    return false;
-  }
-  const bool read = fread(frame_bytes, 1, (size_t)length, destination) == (size_t)length;
+  const bool appended = append_generated_frame_file(context, interface_index, destination);
   fclose(destination);
-  if (!read) {
-    free(frame_bytes);
-    return false;
-  }
-  const size_t start = 0;
-  const bool written = fwrite(frame_bytes + start, 1, (size_t)length, context->ports[interface_index].destination) == (size_t)length && fflush(context->ports[interface_index].destination) == 0;
-  if (written) context->ports[interface_index].injected_bytes += (size_t)length;
-  free(frame_bytes);
-  return written;
+  return appended;
 }
 
 static bool write_arp_reply(router_context_t* context, size_t interface_index, const arp_packet_t* request) {
@@ -372,7 +547,14 @@ static bool write_arp_reply(router_context_t* context, size_t interface_index, c
   };
   memcpy(reply.sender_hardware_address, entry->mac, sizeof(reply.sender_hardware_address));
   memcpy(reply.target_hardware_address, request->sender_hardware_address, sizeof(reply.target_hardware_address));
-  return arp_write_ethernet_reply(context->ports[interface_index].destination, &reply) && fflush(context->ports[interface_index].destination) == 0;
+  FILE* destination = tmpfile();
+  if (!destination || !arp_write_ethernet_reply(destination, &reply)) {
+    if (destination) fclose(destination);
+    return false;
+  }
+  const bool appended = append_generated_frame_file(context, interface_index, destination);
+  fclose(destination);
+  return appended;
 }
 
 static bool write_rarp_reply(router_context_t* context, size_t interface_index, const rarp_packet_t* request, ipv4_address_t assigned_ip4) {
@@ -384,7 +566,14 @@ static bool write_rarp_reply(router_context_t* context, size_t interface_index, 
   };
   memcpy(reply.server_hardware_address, entry->mac, sizeof(reply.server_hardware_address));
   memcpy(reply.client_hardware_address, request->sender_hardware_address, sizeof(reply.client_hardware_address));
-  return rarp_write_ethernet_reply(context->ports[interface_index].destination, &reply) && fflush(context->ports[interface_index].destination) == 0;
+  FILE* destination = tmpfile();
+  if (!destination || !rarp_write_ethernet_reply(destination, &reply)) {
+    if (destination) fclose(destination);
+    return false;
+  }
+  const bool appended = append_generated_frame_file(context, interface_index, destination);
+  fclose(destination);
+  return appended;
 }
 
 static void clear_dhcp_relay_entries(router_context_t* context, size_t ingress_interface) {
@@ -561,6 +750,10 @@ static bool route_ipv4(router_context_t* context, size_t ingress_interface, cons
   ipv4_header_t translated_header = {0};
   uint8_t translated_payload[ETHERNET_MAX_DATA_LEN - sizeof(ipv4_header_t)] = {0};
   const bool transport = packet->header.protocol == UDP_IPV4_PROTOCOL || packet->header.protocol == TCP_IPV4_PROTOCOL;
+  if (evaluate_acl(context, ingress_interface, ROUTER_ACL_DIRECTION_INGRESS, packet) != ROUTER_ACL_ACTION_PERMIT) {
+    fputs("Dropped IPv4 packet by ingress ACL.\n", stderr);
+    return true;
+  }
   if (context->nat_enabled && ingress_interface == context->nat_outside_interface) {
     uint16_t source_port = 0;
     uint16_t destination_port = 0;
@@ -660,6 +853,10 @@ static bool route_ipv4(router_context_t* context, size_t ingress_interface, cons
       packet = &translated_packet;
     }
   }
+  if (evaluate_acl(context, route->interface_index, ROUTER_ACL_DIRECTION_EGRESS, packet) != ROUTER_ACL_ACTION_PERMIT) {
+    fputs("Dropped IPv4 packet by egress ACL.\n", stderr);
+    return true;
+  }
   const ipv4_address_t next_hop = route->next_hop ? route->next_hop : packet->header.dst_addr;
   arp_entry_t* neighbor = arp_table_find(&context->arp, route->interface_index, next_hop);
   if (neighbor) {
@@ -734,11 +931,7 @@ static bool handle_arp(router_context_t* context, size_t ingress_interface, cons
   if (!flush_pending(context, ingress_interface, packet.sender_protocol_address, packet.sender_hardware_address)) return false;
   const interface_entry_t* entry = interface_table_get(&context->interfaces, ingress_interface);
   if (packet.operation == ARP_OPERATION_REQUEST && entry && packet.target_protocol_address == entry->ip4) {
-    const long before = ftell(context->ports[ingress_interface].destination);
-    if (before < 0 || !write_arp_reply(context, ingress_interface, &packet)) return false;
-    const long after = ftell(context->ports[ingress_interface].destination);
-    if (after < before) return false;
-    context->ports[ingress_interface].injected_bytes += (size_t)(after - before);
+    if (!write_arp_reply(context, ingress_interface, &packet)) return false;
     fprintf(stdout, "Replied to ARP request on interface %zu.\n", ingress_interface + 1);
   }
   return true;
@@ -749,12 +942,7 @@ static bool handle_rarp(router_context_t* context, size_t ingress_interface, con
   if (!rarp_parse_packet(frame->data, sizeof(packet), &packet) || packet.operation != RARP_OPERATION_REQUEST) return true;
   rarp_entry_t* assignment = rarp_table_find(&context->rarp, packet.sender_hardware_address);
   if (!assignment) return true;
-  const long before = ftell(context->ports[ingress_interface].destination);
-  if (before < 0 || !write_rarp_reply(context, ingress_interface, &packet, assignment->ip4)) return false;
-  const long after = ftell(context->ports[ingress_interface].destination);
-  if (after < before) return false;
-  context->ports[ingress_interface].injected_bytes += (size_t)(after - before);
-  return true;
+  return write_rarp_reply(context, ingress_interface, &packet, assignment->ip4);
 }
 
 
@@ -937,16 +1125,20 @@ static bool bgp_tick(router_context_t* context, uint32_t now) {
   return true;
 }
 
-static bool handle_ethernet(router_context_t* context, size_t ingress_interface, const uint8_t* bytes, size_t byte_count) {
+static bool handle_ethernet(router_context_t* context, size_t port_index, const uint8_t* bytes, size_t byte_count) {
   ethernet_frame_view_t frame = {0};
   if (!ethernet_parse_frame(bytes, byte_count, &frame) || frame.format != ETHERNET_FRAME_FORMAT_II) return true;
+  const size_t ingress_interface = find_ingress_interface(context, port_index, &frame);
+  if (ingress_interface == ROUTER_INTERFACE_NONE) return true;
   const interface_entry_t* entry = interface_table_get(&context->interfaces, ingress_interface);
   if (!entry) return false;
   fprintf(stdout, "Router frame: ingress=%zu bytes=%zu dst=", ingress_interface + 1, byte_count);
   ethernet_mac_print(stdout, frame.header.dst_mac);
   fputs(" src=", stdout);
   ethernet_mac_print(stdout, frame.header.src_mac);
-  fprintf(stdout, " EtherType=0x%04X\n", frame.header.type_or_length);
+  fprintf(stdout, " EtherType=0x%04X", frame.header.type_or_length);
+  if (frame.tagged) fprintf(stdout, " VLAN=%u", frame.vlan_id);
+  fputc('\n', stdout);
   const bool destination_is_interface = memcmp(frame.header.dst_mac, entry->mac, sizeof(entry->mac)) == 0;
   const bool destination_is_broadcast = ethernet_mac_is_broadcast(frame.header.dst_mac);
   const bool destination_is_rip_multicast = memcmp(frame.header.dst_mac, rip_multicast_mac, sizeof(rip_multicast_mac)) == 0;
@@ -966,8 +1158,8 @@ static bool handle_ethernet(router_context_t* context, size_t ingress_interface,
   return route_ipv4(context, ingress_interface, &frame, &packet);
 }
 
-static bool process_port(router_context_t* context, size_t interface_index) {
-  router_port_t* port = &context->ports[interface_index];
+static bool process_port(router_context_t* context, size_t port_index) {
+  router_port_t* port = &context->ports[port_index];
   size_t offset = 0;
   while (offset < port->buffer_length) {
     const size_t remaining = port->buffer_length - offset;
@@ -986,7 +1178,7 @@ static bool process_port(router_context_t* context, size_t interface_index) {
     }
     ethernet_frame_view_t frame = {0};
     if (ethernet_parse_frame(port->buffer + offset, end - offset, &frame)) {
-      if (!handle_ethernet(context, interface_index, port->buffer + offset, end - offset)) return false;
+      if (!handle_ethernet(context, port_index, port->buffer + offset, end - offset)) return false;
       offset = end;
       continue;
     }
@@ -998,6 +1190,29 @@ static bool process_port(router_context_t* context, size_t interface_index) {
     port->buffer_length -= offset;
   }
   return true;
+}
+
+static router_acl_rule_t* find_acl_rule(router_context_t* context, size_t interface_index, router_acl_direction_t direction, uint16_t sequence) {
+  for (size_t i = 0; i < ROUTER_ACL_RULE_CAPACITY; ++i) {
+    router_acl_rule_t* rule = &context->acl_rules[i];
+    if (rule->active && rule->interface_index == interface_index && rule->direction == direction && rule->sequence == sequence) return rule;
+  }
+  return NULL;
+}
+
+static bool assign_interface_ports(router_context_t* context) {
+  if (!context) return false;
+  context->port_count = 0;
+  for (size_t i = 0; i < context->interfaces.count; ++i) {
+    interface_entry_t* entry = &context->interfaces.entries[i];
+    if (!entry->tagged) {
+      entry->port_index = context->port_count++;
+    } else {
+      if (!interface_table_index_valid(&context->interfaces, entry->parent_index)) return false;
+      entry->port_index = context->interfaces.entries[entry->parent_index].port_index;
+    }
+  }
+  return context->port_count > 0;
 }
 
 static void print_info(router_context_t* context) {
@@ -1012,7 +1227,11 @@ static void print_info(router_context_t* context) {
     ipv4_address_print(stdout, entry->ip4);
     fputs("/", stdout);
     ipv4_address_print(stdout, entry->mask);
-    fprintf(stdout, "  %s\n", entry->enabled ? "up" : "down");
+    fprintf(stdout, "  %s", entry->enabled ? "up" : "down");
+    if (entry->tagged) fprintf(stdout, "  parent=%zu vlan=%u", entry->parent_index + 1, entry->vlan_id);
+    else
+      fprintf(stdout, "  untagged port=%zu", entry->port_index + 1);
+    fputc('\n', stdout);
   }
   fprintf(stdout, "Routes (%zu):\n", context->routes.count);
   for (size_t i = 0; i < context->routes.count; ++i) {
@@ -1063,6 +1282,32 @@ static void print_info(router_context_t* context) {
     fputs("  ", stdout);
     ethernet_mac_print(stdout, entry->mac);
     fputc('\n', stdout);
+  }
+  fprintf(stdout, "ACLs:\n");
+  for (size_t interface_index = 0; interface_index < context->interfaces.count; ++interface_index) {
+    for (size_t direction = 0; direction < 2; ++direction) {
+      fprintf(stdout, "  dev %zu %s default=%s packets=%llu bytes=%llu\n", interface_index + 1, acl_direction_name((router_acl_direction_t)direction), acl_action_name(context->acl_defaults[interface_index][direction]), (unsigned long long)context->acl_default_packets[interface_index][direction], (unsigned long long)context->acl_default_bytes[interface_index][direction]);
+      for (size_t i = 0; i < ROUTER_ACL_RULE_CAPACITY; ++i) {
+        const router_acl_rule_t* rule = &context->acl_rules[i];
+        if (!rule->active || rule->interface_index != interface_index || rule->direction != direction) continue;
+        fprintf(stdout, "    seq %u %s ", rule->sequence, acl_action_name(rule->action));
+        ipv4_address_print(stdout, rule->src_network);
+        fputs("/", stdout);
+        ipv4_address_print(stdout, rule->src_mask);
+        fputs(" -> ", stdout);
+        ipv4_address_print(stdout, rule->dst_network);
+        fputs("/", stdout);
+        ipv4_address_print(stdout, rule->dst_mask);
+        fprintf(stdout, " proto=%u", rule->protocol);
+        if (rule->src_port_any) fputs(" sport=any", stdout);
+        else
+          fprintf(stdout, " sport=%u", rule->src_port);
+        if (rule->dst_port_any) fputs(" dport=any", stdout);
+        else
+          fprintf(stdout, " dport=%u", rule->dst_port);
+        fprintf(stdout, " packets=%llu bytes=%llu\n", (unsigned long long)rule->packets, (unsigned long long)rule->bytes);
+      }
+    }
   }
   if (context->nat_enabled) {
     fprintf(stdout, "NAT: inside dev %zu, outside dev %zu  dynamic-nat=%s dynamic-pat=%s\n", context->nat_inside_interface + 1, context->nat_outside_interface + 1, context->dynamic_nat_enabled ? "on" : "off", context->dynamic_pat_enabled ? "on" : "off");
@@ -1143,6 +1388,104 @@ static void command_interface(void* argument, char* arguments) {
   interface_table_set_enabled(&context->interfaces, index - 1, strcmpi(state, "up") == 0);
   mutex_unlock(&context->mutex);
   fprintf(stdout, "Interface %u is administratively %s.\n", index, state);
+}
+
+static void command_acl(void* argument, char* arguments) {
+  router_context_t* context = argument;
+  char* cursor = arguments;
+  char* action = cmd_app_next_argument(&cursor);
+  if (!action) {
+    print_info(context);
+    return;
+  }
+  char* interface_text = cmd_app_next_argument(&cursor);
+  char* direction_text = cmd_app_next_argument(&cursor);
+  uint16_t interface_number = 0;
+  router_acl_direction_t direction = ROUTER_ACL_DIRECTION_INGRESS;
+  if (!interface_text || !direction_text || !cmd_app_parse_uint16(interface_text, &interface_number) || interface_number == 0 || interface_number > context->interfaces.count || (strcmpi(direction_text, "in") != 0 && strcmpi(direction_text, "out") != 0)) {
+    fputs("Usage: acl <default|add|delete> <interface> <in|out> ...\n", stderr);
+    return;
+  }
+  direction = strcmpi(direction_text, "out") == 0 ? ROUTER_ACL_DIRECTION_EGRESS : ROUTER_ACL_DIRECTION_INGRESS;
+  if (strcmpi(action, "default") == 0) {
+    char* decision = cmd_app_next_argument(&cursor);
+    if (!decision || cmd_app_next_argument(&cursor) || (strcmpi(decision, "permit") != 0 && strcmpi(decision, "deny") != 0)) {
+      fputs("Usage: acl default <interface> <in|out> <permit|deny>\n", stderr);
+      return;
+    }
+    mutex_lock(&context->mutex);
+    context->acl_defaults[interface_number - 1][direction] = strcmpi(decision, "permit") == 0 ? ROUTER_ACL_ACTION_PERMIT : ROUTER_ACL_ACTION_DENY;
+    mutex_unlock(&context->mutex);
+    fputs("ACL default updated.\n", stdout);
+    return;
+  }
+  if (strcmpi(action, "delete") == 0) {
+    char* sequence_text = cmd_app_next_argument(&cursor);
+    uint16_t sequence = 0;
+    if (!sequence_text || cmd_app_next_argument(&cursor) || !cmd_app_parse_uint16(sequence_text, &sequence)) {
+      fputs("Usage: acl delete <interface> <in|out> <sequence>\n", stderr);
+      return;
+    }
+    mutex_lock(&context->mutex);
+    router_acl_rule_t* rule = find_acl_rule(context, interface_number - 1, direction, sequence);
+    if (rule) memset(rule, 0, sizeof(*rule));
+    mutex_unlock(&context->mutex);
+    fputs(rule ? "ACL rule removed.\n" : "No such ACL rule.\n", rule ? stdout : stderr);
+    return;
+  }
+  char* sequence_text = cmd_app_next_argument(&cursor);
+  char* decision = cmd_app_next_argument(&cursor);
+  char* src_network_text = cmd_app_next_argument(&cursor);
+  char* src_mask_text = cmd_app_next_argument(&cursor);
+  char* dst_network_text = cmd_app_next_argument(&cursor);
+  char* dst_mask_text = cmd_app_next_argument(&cursor);
+  char* protocol_text = cmd_app_next_argument(&cursor);
+  char* src_port_text = cmd_app_next_argument(&cursor);
+  char* dst_port_text = cmd_app_next_argument(&cursor);
+  uint16_t sequence = 0;
+  ipv4_address_t src_network = 0;
+  ipv4_address_t src_mask = 0;
+  ipv4_address_t dst_network = 0;
+  ipv4_address_t dst_mask = 0;
+  uint8_t protocol = 0;
+  bool src_port_any = true;
+  bool dst_port_any = true;
+  uint16_t src_port = 0;
+  uint16_t dst_port = 0;
+  if (strcmpi(action, "add") != 0 || !sequence_text || !decision || !src_network_text || !src_mask_text || !dst_network_text || !dst_mask_text || !protocol_text || !src_port_text || !dst_port_text || cmd_app_next_argument(&cursor) || !cmd_app_parse_uint16(sequence_text, &sequence) || (strcmpi(decision, "permit") != 0 && strcmpi(decision, "deny") != 0) || !ipv4_parse_address(src_network_text, &src_network) || !ipv4_parse_address(src_mask_text, &src_mask) || !ipv4_parse_address(dst_network_text, &dst_network) || !ipv4_parse_address(dst_mask_text, &dst_mask) || !parse_acl_protocol(protocol_text, &protocol) || !parse_acl_port(src_port_text, &src_port_any, &src_port) || !parse_acl_port(dst_port_text, &dst_port_any, &dst_port)) {
+    fputs("Usage: acl add <interface> <in|out> <sequence> <permit|deny> <src-network> <src-mask> <dst-network> <dst-mask> <protocol|any> <src-port|any> <dst-port|any>\n", stderr);
+    return;
+  }
+  mutex_lock(&context->mutex);
+  router_acl_rule_t* rule = find_acl_rule(context, interface_number - 1, direction, sequence);
+  if (!rule) {
+    for (size_t i = 0; i < ROUTER_ACL_RULE_CAPACITY; ++i) {
+      if (!context->acl_rules[i].active) {
+        rule = &context->acl_rules[i];
+        break;
+      }
+    }
+  }
+  if (rule) {
+    *rule = (router_acl_rule_t) {
+        .sequence = sequence,
+        .src_port = src_port,
+        .dst_port = dst_port,
+        .src_network = src_network & src_mask,
+        .src_mask = src_mask,
+        .dst_network = dst_network & dst_mask,
+        .dst_mask = dst_mask,
+        .interface_index = interface_number - 1,
+        .protocol = protocol,
+        .src_port_any = src_port_any,
+        .dst_port_any = dst_port_any,
+        .active = true,
+        .direction = direction,
+        .action = strcmpi(decision, "permit") == 0 ? ROUTER_ACL_ACTION_PERMIT : ROUTER_ACL_ACTION_DENY,
+    };
+  }
+  mutex_unlock(&context->mutex);
+  fputs(rule ? "ACL rule added.\n" : "ACL table is full.\n", rule ? stdout : stderr);
 }
 
 static void command_dynamic_routing(void* argument, char* arguments) {
@@ -1386,8 +1729,60 @@ static bool parse_options(router_context_t* context, int argc, char** argv) {
       mac_address_t mac = {0};
       ipv4_address_t ip4 = 0;
       ipv4_address_t mask = 0;
-      if (!ethernet_mac_parse(argv[i + 2], mac) || !ipv4_parse_address(argv[i + 3], &ip4) || !ipv4_parse_address(argv[i + 4], &mask) || !interface_table_add(&context->interfaces, argv[i + 1], mac, ip4, mask)) return false;
+      if (!ethernet_mac_parse(argv[i + 2], mac) || !ipv4_parse_address(argv[i + 3], &ip4) || !ipv4_parse_address(argv[i + 4], &mask) || !interface_table_add_base(&context->interfaces, argv[i + 1], mac, ip4, mask)) return false;
       i += 5;
+    } else if (strcmpi(argv[i], "-subif") == 0) {
+      uint16_t parent = 0;
+      uint16_t vlan_id = 0;
+      ipv4_address_t ip4 = 0;
+      ipv4_address_t mask = 0;
+      if (i + 4 >= argc || !cmd_app_parse_uint16(argv[i + 1], &parent) || !cmd_app_parse_uint16(argv[i + 2], &vlan_id) || parent == 0 || parent > context->interfaces.count || !ipv4_parse_address(argv[i + 3], &ip4) || !ipv4_parse_address(argv[i + 4], &mask) || !interface_table_add_subinterface(&context->interfaces, parent - 1, vlan_id, ip4, mask)) return false;
+      i += 5;
+    } else if (strcmpi(argv[i], "-acl-default") == 0) {
+      uint16_t interface_number = 0;
+      router_acl_direction_t direction = ROUTER_ACL_DIRECTION_INGRESS;
+      if (i + 3 >= argc || !cmd_app_parse_uint16(argv[i + 1], &interface_number) || interface_number == 0 || interface_number > context->interfaces.count || (strcmpi(argv[i + 2], "in") != 0 && strcmpi(argv[i + 2], "out") != 0) || (strcmpi(argv[i + 3], "permit") != 0 && strcmpi(argv[i + 3], "deny") != 0)) return false;
+      direction = strcmpi(argv[i + 2], "out") == 0 ? ROUTER_ACL_DIRECTION_EGRESS : ROUTER_ACL_DIRECTION_INGRESS;
+      context->acl_defaults[interface_number - 1][direction] = strcmpi(argv[i + 3], "permit") == 0 ? ROUTER_ACL_ACTION_PERMIT : ROUTER_ACL_ACTION_DENY;
+      i += 4;
+    } else if (strcmpi(argv[i], "-acl") == 0) {
+      uint16_t interface_number = 0;
+      uint16_t sequence = 0;
+      ipv4_address_t src_network = 0;
+      ipv4_address_t src_mask = 0;
+      ipv4_address_t dst_network = 0;
+      ipv4_address_t dst_mask = 0;
+      uint8_t protocol = 0;
+      bool src_port_any = true;
+      bool dst_port_any = true;
+      uint16_t src_port = 0;
+      uint16_t dst_port = 0;
+      if (i + 10 >= argc || !cmd_app_parse_uint16(argv[i + 1], &interface_number) || interface_number == 0 || interface_number > context->interfaces.count || (strcmpi(argv[i + 2], "in") != 0 && strcmpi(argv[i + 2], "out") != 0) || !cmd_app_parse_uint16(argv[i + 3], &sequence) || (strcmpi(argv[i + 4], "permit") != 0 && strcmpi(argv[i + 4], "deny") != 0) || !ipv4_parse_address(argv[i + 5], &src_network) || !ipv4_parse_address(argv[i + 6], &src_mask) || !ipv4_parse_address(argv[i + 7], &dst_network) || !ipv4_parse_address(argv[i + 8], &dst_mask) || !parse_acl_protocol(argv[i + 9], &protocol) || !parse_acl_port(argv[i + 10], &src_port_any, &src_port) || !parse_acl_port(argv[i + 11], &dst_port_any, &dst_port)) return false;
+      router_acl_rule_t* slot = NULL;
+      for (size_t j = 0; j < ROUTER_ACL_RULE_CAPACITY; ++j) {
+        if (!context->acl_rules[j].active) {
+          slot = &context->acl_rules[j];
+          break;
+        }
+      }
+      if (!slot) return false;
+      *slot = (router_acl_rule_t) {
+          .sequence = sequence,
+          .src_port = src_port,
+          .dst_port = dst_port,
+          .src_network = src_network & src_mask,
+          .src_mask = src_mask,
+          .dst_network = dst_network & dst_mask,
+          .dst_mask = dst_mask,
+          .interface_index = interface_number - 1,
+          .protocol = protocol,
+          .src_port_any = src_port_any,
+          .dst_port_any = dst_port_any,
+          .active = true,
+          .direction = strcmpi(argv[i + 2], "out") == 0 ? ROUTER_ACL_DIRECTION_EGRESS : ROUTER_ACL_DIRECTION_INGRESS,
+          .action = strcmpi(argv[i + 4], "permit") == 0 ? ROUTER_ACL_ACTION_PERMIT : ROUTER_ACL_ACTION_DENY,
+      };
+      i += 12;
     } else if (strcmpi(argv[i], "-r") == 0) {
       if (i + 5 >= argc) return false;
       ipv4_address_t network = 0;
@@ -1464,6 +1859,7 @@ static bool parse_options(router_context_t* context, int argc, char** argv) {
     }
   }
   if (context->interfaces.count < 2) return false;
+  if (!assign_interface_ports(context)) return false;
   for (size_t i = 0; i < context->interfaces.count; ++i) {
     const interface_entry_t* entry = &context->interfaces.entries[i];
     if (!route_table_add_connected(&context->routes, entry->ip4 & entry->mask, entry->mask, i)) return false;
@@ -1472,16 +1868,19 @@ static bool parse_options(router_context_t* context, int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
-  router_context_t context = {0};
+  static router_context_t context = {0};
   interface_table_init(&context.interfaces, context.interface_entries, ROUTER_INTERFACE_CAPACITY);
   route_table_init(&context.routes, context.route_entries, ROUTER_ROUTE_CAPACITY);
   arp_table_init(&context.arp, context.arp_entries, ROUTER_ARP_CAPACITY);
   rarp_table_init(&context.rarp, context.rarp_entries, ROUTER_RARP_CAPACITY);
-
   prefix_list_init(&context.prefix_lists, context.prefix_list_entries, ROUTER_PREFIX_LIST_CAPACITY);
   nat_table_init(&context.nat, context.nat_entries, ROUTER_NAT_CAPACITY, context.nat_pool, ROUTER_NAT_POOL_CAPACITY, NAT_EPHEMERAL_PORT_MIN);
+  for (size_t i = 0; i < ROUTER_INTERFACE_CAPACITY; ++i) {
+    context.acl_defaults[i][ROUTER_ACL_DIRECTION_INGRESS] = ROUTER_ACL_ACTION_PERMIT;
+    context.acl_defaults[i][ROUTER_ACL_DIRECTION_EGRESS] = ROUTER_ACL_ACTION_PERMIT;
+  }
   if (!parse_options(&context, argc, argv)) {
-    fputs("Usage: router -i <file> <mac-address> <ip-address> <mask> [... ] [-r <network> <mask> <next-hop|direct> <interface> <metric> [...]] [-bgp <active|passive> <interface> <peer-ip> <local-as> <peer-as> [...]] [-rarp <client-mac> <ip-address> [...]] [-dynamic-routing <off|rip|ospf>] [-dhcp-relay <interface> <server-ip> ...] [-nat <inside-interface> <outside-interface>] [-dynamic-nat <outside-address> ...] [-dynamic-pat] [-static-nat <inside-address> <outside-address> ...] [-static-pat <tcp|udp> <inside-address> <inside-port> <outside-address> <outside-port> ...]\n", stderr);
+    fputs("Usage: router -i <file> <mac-address> <ip-address> <mask> [... ] [-subif <parent-interface> <vlan-id> <ip-address> <mask> ...] [-acl-default <interface> <in|out> <permit|deny> ...] [-acl <interface> <in|out> <sequence> <permit|deny> <src-network> <src-mask> <dst-network> <dst-mask> <protocol|any> <src-port|any> <dst-port|any> ...] [-r <network> <mask> <next-hop|direct> <interface> <metric> [...]] [-bgp <active|passive> <interface> <peer-ip> <local-as> <peer-as> [...]] [-rarp <client-mac> <ip-address> [...]] [-dynamic-routing <off|rip|ospf>] [-dhcp-relay <interface> <server-ip> ...] [-nat <inside-interface> <outside-interface>] [-dynamic-nat <outside-address> ...] [-dynamic-pat] [-static-nat <inside-address> <outside-address> ...] [-static-pat <tcp|udp> <inside-address> <inside-port> <outside-address> <outside-port> ...]\n", stderr);
     return EXIT_FAILURE;
   }
   if (!mutex_init(&context.mutex)) {
@@ -1490,12 +1889,23 @@ int main(int argc, char** argv) {
   }
   int status = EXIT_SUCCESS;
   bool commands_started = false;
-  for (size_t i = 0; i < context.interfaces.count; ++i) {
+  for (size_t i = 0; i < context.port_count; ++i) {
     router_port_t* port = &context.ports[i];
-    port->source = fopen(context.interfaces.entries[i].path, "rb");
-    port->destination = fopen(context.interfaces.entries[i].path, "ab");
+    const interface_entry_t* base = NULL;
+    for (size_t j = 0; j < context.interfaces.count; ++j) {
+      if (!context.interfaces.entries[j].tagged && context.interfaces.entries[j].port_index == i) {
+        base = &context.interfaces.entries[j];
+        break;
+      }
+    }
+    if (!base) {
+      status = EXIT_FAILURE;
+      goto cleanup;
+    }
+    port->source = fopen(base->path, "rb");
+    port->destination = fopen(base->path, "ab");
     if (!port->source || !port->destination || fseek(port->source, 0, SEEK_END) != 0) {
-      fprintf(stderr, "Could not open router interface %zu.\n", i + 1);
+      fprintf(stderr, "Could not open router port %zu.\n", i + 1);
       status = EXIT_FAILURE;
       goto cleanup;
     }
@@ -1518,7 +1928,7 @@ int main(int argc, char** argv) {
     }
   }
   cmd_app_init(&context.commands);
-  if (!cmd_app_register(&context.commands, "info", "Show router state, including dynamic route sources.", command_info, &context) || !cmd_app_register(&context.commands, "arp", "Resolve an IPv4 neighbor on one interface.", command_arp, &context) || !cmd_app_register(&context.commands, "arp-delete", "Remove one learned ARP neighbor.", command_arp_delete, &context) || !cmd_app_register(&context.commands, "interface", "Administratively bring an interface up or down.", command_interface, &context) || !cmd_app_register(&context.commands, "dynamic-routing", "Select off, RIP v2, or OSPF dynamic routing.", command_dynamic_routing, &context) || !cmd_app_register(&context.commands, "dhcp-relay", "Assign or clear a DHCP relay server per ingress interface.", command_dhcp_relay, &context) || !cmd_app_register(&context.commands, "prefix-list", "Add or delete a named IPv4 prefix-list rule.", command_prefix_list, &context) || !cmd_app_register(&context.commands, "bgp-prefix-list", "Assign or clear a BGP peer prefix list.", command_bgp_prefix_list, &context) || !cmd_app_register(&context.commands, "rip-prefix-list", "Assign or clear a RIP interface prefix list.", command_rip_prefix_list, &context) || !cmd_app_register(&context.commands, "route", "Add or delete a route in the forwarding table.", command_route, &context) || !cmd_app_register(&context.commands, "rarp-table", "Set or delete a static RARP assignment.", command_rarp_table, &context) || !cmd_app_start(&context.commands)) {
+  if (!cmd_app_register(&context.commands, "info", "Show router state, including dynamic route sources.", command_info, &context) || !cmd_app_register(&context.commands, "arp", "Resolve an IPv4 neighbor on one interface.", command_arp, &context) || !cmd_app_register(&context.commands, "arp-delete", "Remove one learned ARP neighbor.", command_arp_delete, &context) || !cmd_app_register(&context.commands, "interface", "Administratively bring an interface up or down.", command_interface, &context) || !cmd_app_register(&context.commands, "acl", "Show or update per-interface ACL rules and defaults.", command_acl, &context) || !cmd_app_register(&context.commands, "dynamic-routing", "Select off, RIP v2, or OSPF dynamic routing.", command_dynamic_routing, &context) || !cmd_app_register(&context.commands, "dhcp-relay", "Assign or clear a DHCP relay server per ingress interface.", command_dhcp_relay, &context) || !cmd_app_register(&context.commands, "prefix-list", "Add or delete a named IPv4 prefix-list rule.", command_prefix_list, &context) || !cmd_app_register(&context.commands, "bgp-prefix-list", "Assign or clear a BGP peer prefix list.", command_bgp_prefix_list, &context) || !cmd_app_register(&context.commands, "rip-prefix-list", "Assign or clear a RIP interface prefix list.", command_rip_prefix_list, &context) || !cmd_app_register(&context.commands, "route", "Add or delete a route in the forwarding table.", command_route, &context) || !cmd_app_register(&context.commands, "rarp-table", "Set or delete a static RARP assignment.", command_rarp_table, &context) || !cmd_app_start(&context.commands)) {
     fputs("Could not start the command application.\n", stderr);
     status = EXIT_FAILURE;
     goto cleanup;
@@ -1538,7 +1948,7 @@ int main(int argc, char** argv) {
 
   while (cmd_app_is_running(&context.commands)) {
     long ends[ROUTER_INTERFACE_CAPACITY] = {0};
-    for (size_t i = 0; i < context.interfaces.count; ++i) {
+    for (size_t i = 0; i < context.port_count; ++i) {
       context.ports[i].injected_bytes = 0;
       if (!get_file_end(context.ports[i].source, &ends[i])) {
         fputs("Could not snapshot router interface traffic.\n", stderr);
@@ -1578,7 +1988,7 @@ int main(int argc, char** argv) {
       status = EXIT_FAILURE;
       goto cleanup;
     }
-    for (size_t i = 0; i < context.interfaces.count; ++i) {
+    for (size_t i = 0; i < context.port_count; ++i) {
       router_port_t* port = &context.ports[i];
       const long position = ftell(port->source);
       const long remaining = ends[i] - position;
@@ -1608,7 +2018,7 @@ int main(int argc, char** argv) {
       status = EXIT_FAILURE;
       goto cleanup;
     }
-    for (size_t i = 0; i < context.interfaces.count; ++i) {
+    for (size_t i = 0; i < context.port_count; ++i) {
       router_port_t* port = &context.ports[i];
       if (port->injected_bytes > 0 && fseek(port->source, (long)port->injected_bytes, SEEK_CUR) != 0) {
         mutex_unlock(&context.mutex);
@@ -1626,7 +2036,7 @@ cleanup:
     cmd_app_stop(&context.commands);
     cmd_app_join(&context.commands);
   }
-  for (size_t i = 0; i < context.interfaces.count; ++i) {
+  for (size_t i = 0; i < context.port_count; ++i) {
     if (context.ports[i].source) fclose(context.ports[i].source);
     if (context.ports[i].destination) fclose(context.ports[i].destination);
   }
