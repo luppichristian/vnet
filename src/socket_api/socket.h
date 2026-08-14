@@ -39,6 +39,10 @@ typedef enum socket_state {
   SOCKET_STATE_SYN_RECEIVED,
   SOCKET_STATE_ESTABLISHED,
   SOCKET_STATE_CLOSE_WAIT,
+  SOCKET_STATE_FIN_WAIT_1,
+  SOCKET_STATE_FIN_WAIT_2,
+  SOCKET_STATE_CLOSING,
+  SOCKET_STATE_LAST_ACK,
 } socket_state_t;
 
 typedef bool (*socket_emit_ipv4_fn)(void* argument, ipv4_address_t destination, uint8_t protocol, const uint8_t* payload, uint16_t payload_length);
@@ -50,13 +54,23 @@ typedef struct socket_entry {
   uint16_t local_port;
   uint16_t remote_port;
   uint32_t send_sequence;
+  uint32_t send_unacknowledged;
   uint32_t receive_sequence;
   uint32_t acknowledged_sequence;
+  uint16_t send_window;
+  uint16_t transmit_length;
+  uint16_t transmit_flags;
+  uint32_t transmit_sequence;
+  uint32_t retransmit_at;
+  socket_handle_t parent_listener;
   socket_handle_t accepted;
   ipv4_address_t received_address;
   uint16_t received_port;
   uint8_t receive_buffer[SOCKET_RECEIVE_CAPACITY];
+  uint8_t transmit_buffer[SOCKET_RECEIVE_CAPACITY];
   uint16_t receive_length;
+  uint8_t retransmit_count;
+  bool transmit_active;
   bool active;
 } socket_entry_t;
 

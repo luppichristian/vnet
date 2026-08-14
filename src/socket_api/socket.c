@@ -61,7 +61,11 @@ bool socket_open(socket_context_t* context, socket_protocol_t protocol, socket_h
 bool socket_close(socket_context_t* context, socket_handle_t handle) {
   socket_entry_t* entry = socket_find(context, handle);
   if (!entry) return false;
-  if (entry->protocol == SOCKET_PROTOCOL_TCP && entry->state == SOCKET_STATE_ESTABLISHED && !socket_tcp_close(context, handle)) return false;
+  if (entry->protocol == SOCKET_PROTOCOL_TCP) {
+    const socket_state_t state = entry->state;
+    if ((state == SOCKET_STATE_SYN_SENT || state == SOCKET_STATE_SYN_RECEIVED || state == SOCKET_STATE_ESTABLISHED || state == SOCKET_STATE_CLOSE_WAIT || state == SOCKET_STATE_FIN_WAIT_1 || state == SOCKET_STATE_FIN_WAIT_2 || state == SOCKET_STATE_CLOSING || state == SOCKET_STATE_LAST_ACK) && !socket_tcp_close(context, handle)) return false;
+    if (entry->active) return true;
+  }
   memset(entry, 0, sizeof(*entry));
   return true;
 }
