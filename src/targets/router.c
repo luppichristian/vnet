@@ -2,9 +2,17 @@
 
 static const mac_address_t rip_multicast_mac = {0x01, 0x00, 0x5E, 0x00, 0x00, 0x09};
 static const mac_address_t ospf_multicast_mac = {0x01, 0x00, 0x5E, 0x00, 0x00, 0x05};
+static const mac_address_t ethernet_broadcast_mac = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 static bool write_arp_request(router_context_t* context, size_t interface_index, ipv4_address_t target);
+static bool forward_ipv4(router_context_t* context, size_t interface_index, const ipv4_header_t* header, const uint8_t* payload, uint16_t payload_length, const mac_address_t destination_mac);
 static bool queue_packet(router_context_t* context, size_t egress_interface, ipv4_address_t next_hop, const ipv4_packet_view_t* packet, const ipv4_packet_view_t* report_packet, bool report_next_hop_failure, size_t report_interface, uint32_t now);
+static bool write_udp_on_interface(router_context_t* context, size_t interface_index, const udp_packet_data_t* packet);
+static bool emit_generated_ipv4(router_context_t* context, const ipv4_packet_view_t* packet);
+static void clear_dhcp_relay_entries(router_context_t* context, size_t ingress_interface);
+static router_dhcp_relay_entry_t* find_dhcp_relay_entry(router_context_t* context, uint16_t transaction_id, const mac_address_t client_mac, ipv4_address_t server_address);
+static router_dhcp_relay_entry_t* remember_dhcp_relay(router_context_t* context, size_t ingress_interface, const dhcp_message_t* message, ipv4_address_t server_address, uint32_t now);
+static bool handle_dhcp_relay(router_context_t* context, size_t ingress_interface, const ethernet_frame_view_t* frame, const ipv4_packet_view_t* packet, bool* handled);
 
 static const char* dynamic_routing_name(router_dynamic_routing_mode_t mode) {
   switch (mode) {
@@ -13,6 +21,16 @@ static const char* dynamic_routing_name(router_dynamic_routing_mode_t mode) {
     case ROUTER_DYNAMIC_ROUTING_OSPF: return "ospf";
   }
   return "off";
+}
+
+static bool write_udp_on_interface(router_context_t* context, size_t interface_index, const udp_packet_data_t* packet) {
+  router_port_t* port = &context->ports[interface_index];
+  const long before = ftell(port->destination);
+  if (before < 0 || !udp_write_ethernet_packet(port->destination, packet)) return false;
+  const long after = ftell(port->destination);
+  if (after < before || fflush(port->destination) != 0) return false;
+  port->injected_bytes += (size_t)(after - before);
+  return true;
 }
 
 static bool append_frame(router_context_t* context, size_t interface_index, const ethernet_frame_data_t* frame) {
@@ -72,6 +90,32 @@ static bool emit_routed_ipv4(router_context_t* context, ipv4_address_t destinati
   const long after = ftell(port->destination);
   if (after < before || fflush(port->destination) != 0) return false;
   port->injected_bytes += (size_t)(after - before);
+  return true;
+}
+
+static bool emit_generated_ipv4(router_context_t* context, const ipv4_packet_view_t* packet) {
+  if (!context || !packet) return false;
+  const route_entry_t* route = route_table_lookup(&context->routes, packet->header.dst_addr);
+  if (!route) {
+    fputs("Dropped generated IPv4 packet without a route.\n", stderr);
+    return true;
+  }
+  const interface_entry_t* egress = interface_table_get(&context->interfaces, route->interface_index);
+  if (!egress || !egress->enabled) {
+    fputs("Dropped generated IPv4 packet with an unavailable egress interface.\n", stderr);
+    return true;
+  }
+  const ipv4_address_t next_hop = route->next_hop ? route->next_hop : packet->header.dst_addr;
+  const arp_entry_t* neighbor = arp_table_find_const(&context->arp, route->interface_index, next_hop);
+  if (neighbor) return forward_ipv4(context, route->interface_index, &packet->header, packet->payload, packet->payload_length, neighbor->mac);
+  if (!queue_packet(context, route->interface_index, next_hop, packet, packet, false, route->interface_index, (uint32_t)time(NULL))) {
+    fputs("Dropped generated IPv4 packet because the pending-neighbor queue is full.\n", stderr);
+    return true;
+  }
+  if (!write_arp_request(context, route->interface_index, next_hop)) return false;
+  fputs("Resolving next hop ", stdout);
+  ipv4_address_print(stdout, next_hop);
+  fprintf(stdout, " for generated traffic on interface %zu.\n", route->interface_index + 1);
   return true;
 }
 
@@ -248,6 +292,114 @@ static bool write_rarp_reply(router_context_t* context, size_t interface_index, 
   memcpy(reply.server_hardware_address, entry->mac, sizeof(reply.server_hardware_address));
   memcpy(reply.client_hardware_address, request->sender_hardware_address, sizeof(reply.client_hardware_address));
   return rarp_write_ethernet_reply(context->ports[interface_index].destination, &reply) && fflush(context->ports[interface_index].destination) == 0;
+}
+
+static void clear_dhcp_relay_entries(router_context_t* context, size_t ingress_interface) {
+  for (size_t i = 0; i < ROUTER_DHCP_RELAY_CAPACITY; ++i) {
+    if (context->dhcp_relays[i].active && context->dhcp_relays[i].ingress_interface == ingress_interface) context->dhcp_relays[i].active = false;
+  }
+}
+
+static router_dhcp_relay_entry_t* find_dhcp_relay_entry(router_context_t* context, uint16_t transaction_id, const mac_address_t client_mac, ipv4_address_t server_address) {
+  for (size_t i = 0; i < ROUTER_DHCP_RELAY_CAPACITY; ++i) {
+    router_dhcp_relay_entry_t* entry = &context->dhcp_relays[i];
+    if (entry->active && entry->transaction_id == transaction_id && entry->server_address == server_address && memcmp(entry->client_mac, client_mac, sizeof(entry->client_mac)) == 0) return entry;
+  }
+  return NULL;
+}
+
+static router_dhcp_relay_entry_t* remember_dhcp_relay(router_context_t* context, size_t ingress_interface, const dhcp_message_t* message, ipv4_address_t server_address, uint32_t now) {
+  router_dhcp_relay_entry_t* entry = find_dhcp_relay_entry(context, message->transaction_id, message->client_mac, server_address);
+  if (!entry) {
+    for (size_t i = 0; i < ROUTER_DHCP_RELAY_CAPACITY; ++i) {
+      if (!context->dhcp_relays[i].active) {
+        entry = &context->dhcp_relays[i];
+        break;
+      }
+    }
+  }
+  if (!entry) {
+    entry = &context->dhcp_relays[0];
+    for (size_t i = 1; i < ROUTER_DHCP_RELAY_CAPACITY; ++i) {
+      if (context->dhcp_relays[i].updated_at < entry->updated_at) entry = &context->dhcp_relays[i];
+    }
+  }
+  *entry = (router_dhcp_relay_entry_t) {
+      .transaction_id = message->transaction_id,
+      .server_address = server_address,
+      .ingress_interface = ingress_interface,
+      .updated_at = now,
+      .active = true,
+  };
+  memcpy(entry->client_mac, message->client_mac, sizeof(entry->client_mac));
+  return entry;
+}
+
+static bool handle_dhcp_relay(router_context_t* context, size_t ingress_interface, const ethernet_frame_view_t* frame, const ipv4_packet_view_t* packet, bool* handled) {
+  *handled = false;
+  const interface_entry_t* ingress = interface_table_get(&context->interfaces, ingress_interface);
+  if (!ingress || packet->header.protocol != UDP_IPV4_PROTOCOL) return true;
+  udp_packet_view_t udp = {0};
+  dhcp_message_t message = {0};
+  if (!udp_parse_packet(packet->payload, packet->payload_length, packet->header.src_addr, packet->header.dst_addr, &udp) || !dhcp_parse_message(udp.data, udp.data_length, &message)) return true;
+
+  const bool client_broadcast = ethernet_mac_is_broadcast(frame->header.dst_mac) && udp.header.src_port == DHCP_CLIENT_UDP_PORT && udp.header.dst_port == DHCP_SERVER_UDP_PORT && ipv4_address_is_limited_broadcast(packet->header.dst_addr) && packet->header.src_addr == 0;
+  if (client_broadcast) {
+    const ipv4_address_t server_address = context->dhcp_relay_servers[ingress_interface];
+    if (!server_address) return true;
+    uint8_t udp_bytes[sizeof(udp_header_t) + ETHERNET_MAX_DATA_LEN] = {0};
+    uint16_t udp_length = 0;
+    udp_packet_data_t relay_udp = {
+        .src_addr = ingress->ip4,
+        .dst_addr = server_address,
+        .src_port = DHCP_SERVER_UDP_PORT,
+        .dst_port = DHCP_SERVER_UDP_PORT,
+        .data = &message,
+        .data_length = sizeof(message),
+    };
+    if (!udp_serialize_packet(&relay_udp, udp_bytes, sizeof(udp_bytes), &udp_length)) return false;
+    ipv4_header_t header = {
+        .version = 4,
+        .ihl = 5,
+        .total_length = (uint16_t)(sizeof(ipv4_header_t) + udp_length),
+        .fragment_id = 1,
+        .dont_fragment = 1,
+        .ttl = IPV4_DEFAULT_TTL,
+        .protocol = UDP_IPV4_PROTOCOL,
+        .src_addr = ingress->ip4,
+        .dst_addr = server_address,
+    };
+    header.header_checksum = checksum16(&header, sizeof(header));
+    ipv4_packet_view_t relay_packet = {.header = header, .payload = udp_bytes, .payload_length = udp_length};
+    remember_dhcp_relay(context, ingress_interface, &message, server_address, (uint32_t)time(NULL));
+    *handled = true;
+    if (!emit_generated_ipv4(context, &relay_packet)) return false;
+    fprintf(stdout, "Relayed DHCP %s from interface %zu to ", message.type == DHCP_MESSAGE_DISCOVER ? "DISCOVER" : "REQUEST", ingress_interface + 1);
+    ipv4_address_print(stdout, server_address);
+    fputs(".\n", stdout);
+    return true;
+  }
+
+  if (udp.header.src_port != DHCP_SERVER_UDP_PORT || udp.header.dst_port != DHCP_CLIENT_UDP_PORT || !ipv4_address_is_limited_broadcast(packet->header.dst_addr)) return true;
+  router_dhcp_relay_entry_t* relay = find_dhcp_relay_entry(context, message.transaction_id, message.client_mac, message.server_address);
+  if (!relay) return true;
+  udp_packet_data_t response = {
+      .src_addr = message.server_address,
+      .dst_addr = IPV4_ADDRESS(255, 255, 255, 255),
+      .src_port = DHCP_SERVER_UDP_PORT,
+      .dst_port = DHCP_CLIENT_UDP_PORT,
+      .data = &message,
+      .data_length = sizeof(message),
+  };
+  memcpy(response.src_mac_addr, context->interfaces.entries[relay->ingress_interface].mac, sizeof(response.src_mac_addr));
+  memcpy(response.dst_mac_addr, ethernet_broadcast_mac, sizeof(response.dst_mac_addr));
+  *handled = true;
+  if (!write_udp_on_interface(context, relay->ingress_interface, &response)) return false;
+  fprintf(stdout, "Relayed DHCP %s from ", message.type == DHCP_MESSAGE_OFFER ? "OFFER" : message.type == DHCP_MESSAGE_ACK ? "ACK" : "NAK", message.server_address);
+  ipv4_address_print(stdout, message.server_address);
+  fprintf(stdout, " back to interface %zu.\n", relay->ingress_interface + 1);
+  if (message.type != DHCP_MESSAGE_OFFER) relay->active = false;
+  return true;
 }
 
 static bool forward_ipv4(router_context_t* context, size_t interface_index, const ipv4_header_t* header, const uint8_t* payload, uint16_t payload_length, const mac_address_t destination_mac) {
@@ -703,16 +855,21 @@ static bool handle_ethernet(router_context_t* context, size_t ingress_interface,
   ethernet_mac_print(stdout, frame.header.src_mac);
   fprintf(stdout, " EtherType=0x%04X\n", frame.header.type_or_length);
   const bool destination_is_interface = memcmp(frame.header.dst_mac, entry->mac, sizeof(entry->mac)) == 0;
+  const bool destination_is_broadcast = ethernet_mac_is_broadcast(frame.header.dst_mac);
   const bool destination_is_rip_multicast = memcmp(frame.header.dst_mac, rip_multicast_mac, sizeof(rip_multicast_mac)) == 0;
   const bool destination_is_ospf_multicast = memcmp(frame.header.dst_mac, ospf_multicast_mac, sizeof(ospf_multicast_mac)) == 0;
-  if (frame.header.type_or_length == ETHERNET_ETHERTYPE_ARP && (destination_is_interface || ethernet_mac_is_broadcast(frame.header.dst_mac))) return handle_arp(context, ingress_interface, &frame);
-  if (frame.header.type_or_length == ETHERNET_ETHERTYPE_RARP && (destination_is_interface || ethernet_mac_is_broadcast(frame.header.dst_mac))) return handle_rarp(context, ingress_interface, &frame);
-  if (frame.header.type_or_length != ETHERNET_ETHERTYPE_IPV4 || (!destination_is_interface && !destination_is_rip_multicast && !destination_is_ospf_multicast)) return true;
+  if (frame.header.type_or_length == ETHERNET_ETHERTYPE_ARP && (destination_is_interface || destination_is_broadcast)) return handle_arp(context, ingress_interface, &frame);
+  if (frame.header.type_or_length == ETHERNET_ETHERTYPE_RARP && (destination_is_interface || destination_is_broadcast)) return handle_rarp(context, ingress_interface, &frame);
+  if (frame.header.type_or_length != ETHERNET_ETHERTYPE_IPV4 || (!destination_is_interface && !destination_is_broadcast && !destination_is_rip_multicast && !destination_is_ospf_multicast)) return true;
   ipv4_packet_view_t packet = {0};
   if (!ipv4_parse_packet(frame.data, frame.client_data_length, &packet)) return true;
 
   if (destination_is_rip_multicast) return handle_rip(context, ingress_interface, &packet);
   if (destination_is_ospf_multicast) return handle_ospf(context, ingress_interface, &packet);
+  bool handled = false;
+  if (!handle_dhcp_relay(context, ingress_interface, &frame, &packet, &handled)) return false;
+  if (handled) return true;
+  if (destination_is_broadcast) return true;
   return route_ipv4(context, ingress_interface, &frame, &packet);
 }
 
@@ -787,6 +944,14 @@ static void print_info(router_context_t* context) {
   fprintf(stdout, "RIP prefix lists:\n");
   for (size_t i = 0; i < context->interfaces.count; ++i) {
     fprintf(stdout, "  dev %zu  in=%s out=%s\n", i + 1, context->rip_inbound_prefix_lists[i][0] ? context->rip_inbound_prefix_lists[i] : "none", context->rip_outbound_prefix_lists[i][0] ? context->rip_outbound_prefix_lists[i] : "none");
+  }
+  fprintf(stdout, "DHCP relay:\n");
+  for (size_t i = 0; i < context->interfaces.count; ++i) {
+    fprintf(stdout, "  dev %zu  server=", i + 1);
+    if (context->dhcp_relay_servers[i]) ipv4_address_print(stdout, context->dhcp_relay_servers[i]);
+    else
+      fputs("none", stdout);
+    fputc('\n', stdout);
   }
   fprintf(stdout, "Prefix-list rules (%zu):\n", context->prefix_lists.count);
   for (size_t i = 0; i < context->prefix_lists.count; ++i) {
@@ -1103,6 +1268,24 @@ static void command_arp_delete(void* argument, char* arguments) {
   fputs(removed ? "ARP neighbor removed.\n" : "No such ARP neighbor.\n", removed ? stdout : stderr);
 }
 
+static void command_dhcp_relay(void* argument, char* arguments) {
+  router_context_t* context = argument;
+  char* cursor = arguments;
+  char* interface_text = cmd_app_next_argument(&cursor);
+  char* server_text = cmd_app_next_argument(&cursor);
+  uint16_t interface_number = 0;
+  ipv4_address_t server_address = 0;
+  if (!interface_text || !server_text || cmd_app_next_argument(&cursor) || !cmd_app_parse_uint16(interface_text, &interface_number) || interface_number == 0 || interface_number > context->interfaces.count || (strcmpi(server_text, "none") != 0 && !ipv4_parse_address(server_text, &server_address))) {
+    fputs("Usage: dhcp-relay <interface> <server-ip|none>\n", stderr);
+    return;
+  }
+  mutex_lock(&context->mutex);
+  context->dhcp_relay_servers[interface_number - 1] = strcmpi(server_text, "none") == 0 ? 0 : server_address;
+  clear_dhcp_relay_entries(context, interface_number - 1);
+  mutex_unlock(&context->mutex);
+  fputs("DHCP relay updated.\n", stdout);
+}
+
 static bool parse_options(router_context_t* context, int argc, char** argv) {
   for (int i = 1; i < argc;) {
     if (strcmpi(argv[i], "-i") == 0) {
@@ -1126,6 +1309,12 @@ static bool parse_options(router_context_t* context, int argc, char** argv) {
       context->dynamic_routing = strcmpi(argv[i + 1], "rip") == 0 ? ROUTER_DYNAMIC_ROUTING_RIP : strcmpi(argv[i + 1], "ospf") == 0 ? ROUTER_DYNAMIC_ROUTING_OSPF
                                                                                                                                    : ROUTER_DYNAMIC_ROUTING_OFF;
       i += 2;
+    } else if (strcmpi(argv[i], "-dhcp-relay") == 0) {
+      uint16_t interface_number = 0;
+      ipv4_address_t server_address = 0;
+      if (i + 2 >= argc || !cmd_app_parse_uint16(argv[i + 1], &interface_number) || interface_number == 0 || interface_number > context->interfaces.count || !ipv4_parse_address(argv[i + 2], &server_address)) return false;
+      context->dhcp_relay_servers[interface_number - 1] = server_address;
+      i += 3;
     } else if (strcmpi(argv[i], "-nat") == 0) {
       uint16_t inside = 0;
       uint16_t outside = 0;
@@ -1199,7 +1388,7 @@ int main(int argc, char** argv) {
   prefix_list_init(&context.prefix_lists, context.prefix_list_entries, ROUTER_PREFIX_LIST_CAPACITY);
   nat_table_init(&context.nat, context.nat_entries, ROUTER_NAT_CAPACITY, context.nat_pool, ROUTER_NAT_POOL_CAPACITY, NAT_EPHEMERAL_PORT_MIN);
   if (!parse_options(&context, argc, argv)) {
-    fputs("Usage: router -i <file> <mac-address> <ip-address> <mask> [... ] [-r <network> <mask> <next-hop|direct> <interface> <metric> [...]] [-bgp <active|passive> <interface> <peer-ip> <local-as> <peer-as> [...]] [-rarp <client-mac> <ip-address> [...]] [-dynamic-routing <off|rip|ospf>] [-nat <inside-interface> <outside-interface>] [-dynamic-nat <outside-address> ...] [-dynamic-pat] [-static-nat <inside-address> <outside-address> ...] [-static-pat <tcp|udp> <inside-address> <inside-port> <outside-address> <outside-port> ...]\n", stderr);
+    fputs("Usage: router -i <file> <mac-address> <ip-address> <mask> [... ] [-r <network> <mask> <next-hop|direct> <interface> <metric> [...]] [-bgp <active|passive> <interface> <peer-ip> <local-as> <peer-as> [...]] [-rarp <client-mac> <ip-address> [...]] [-dynamic-routing <off|rip|ospf>] [-dhcp-relay <interface> <server-ip> ...] [-nat <inside-interface> <outside-interface>] [-dynamic-nat <outside-address> ...] [-dynamic-pat] [-static-nat <inside-address> <outside-address> ...] [-static-pat <tcp|udp> <inside-address> <inside-port> <outside-address> <outside-port> ...]\n", stderr);
     return EXIT_FAILURE;
   }
   if (!mutex_init(&context.mutex)) {
@@ -1236,7 +1425,7 @@ int main(int argc, char** argv) {
     }
   }
   cmd_app_init(&context.commands);
-  if (!cmd_app_register(&context.commands, "info", "Show router state, including dynamic route sources.", command_info, &context) || !cmd_app_register(&context.commands, "arp", "Resolve an IPv4 neighbor on one interface.", command_arp, &context) || !cmd_app_register(&context.commands, "arp-delete", "Remove one learned ARP neighbor.", command_arp_delete, &context) || !cmd_app_register(&context.commands, "interface", "Administratively bring an interface up or down.", command_interface, &context) || !cmd_app_register(&context.commands, "dynamic-routing", "Select off, RIP v2, or OSPF dynamic routing.", command_dynamic_routing, &context) || !cmd_app_register(&context.commands, "prefix-list", "Add or delete a named IPv4 prefix-list rule.", command_prefix_list, &context) || !cmd_app_register(&context.commands, "bgp-prefix-list", "Assign or clear a BGP peer prefix list.", command_bgp_prefix_list, &context) || !cmd_app_register(&context.commands, "rip-prefix-list", "Assign or clear a RIP interface prefix list.", command_rip_prefix_list, &context) || !cmd_app_register(&context.commands, "route", "Add or delete a route in the forwarding table.", command_route, &context) || !cmd_app_register(&context.commands, "rarp-table", "Set or delete a static RARP assignment.", command_rarp_table, &context) || !cmd_app_start(&context.commands)) {
+  if (!cmd_app_register(&context.commands, "info", "Show router state, including dynamic route sources.", command_info, &context) || !cmd_app_register(&context.commands, "arp", "Resolve an IPv4 neighbor on one interface.", command_arp, &context) || !cmd_app_register(&context.commands, "arp-delete", "Remove one learned ARP neighbor.", command_arp_delete, &context) || !cmd_app_register(&context.commands, "interface", "Administratively bring an interface up or down.", command_interface, &context) || !cmd_app_register(&context.commands, "dynamic-routing", "Select off, RIP v2, or OSPF dynamic routing.", command_dynamic_routing, &context) || !cmd_app_register(&context.commands, "dhcp-relay", "Assign or clear a DHCP relay server per ingress interface.", command_dhcp_relay, &context) || !cmd_app_register(&context.commands, "prefix-list", "Add or delete a named IPv4 prefix-list rule.", command_prefix_list, &context) || !cmd_app_register(&context.commands, "bgp-prefix-list", "Assign or clear a BGP peer prefix list.", command_bgp_prefix_list, &context) || !cmd_app_register(&context.commands, "rip-prefix-list", "Assign or clear a RIP interface prefix list.", command_rip_prefix_list, &context) || !cmd_app_register(&context.commands, "route", "Add or delete a route in the forwarding table.", command_route, &context) || !cmd_app_register(&context.commands, "rarp-table", "Set or delete a static RARP assignment.", command_rarp_table, &context) || !cmd_app_start(&context.commands)) {
     fputs("Could not start the command application.\n", stderr);
     status = EXIT_FAILURE;
     goto cleanup;

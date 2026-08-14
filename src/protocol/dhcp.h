@@ -15,16 +15,17 @@ DHCP is an application-layer configuration protocol carried by UDP. A host
 without an address broadcasts a DISCOVER from UDP port 68 to server port 67;
 a server offers an address, the host requests it, and the server acknowledges
 the lease. Before assignment, the IPv4 source address is zero and delivery uses
-Ethernet and IPv4 broadcast. DHCP relay agents are normally needed to cross a
-router, but this first VNet model is limited to one LAN and does not relay.
+Ethernet and IPv4 broadcast. Routers need relay-agent behaviour to carry those
+broadcasts across interfaces; the VNet router target can now relay them while
+the DHCP message format itself remains the same fixed record.
 
   Ethernet II data: IPv4 header | UDP header | DHCP VNet message
 
 The real DHCPv4 BOOTP header has variable options. This simulator keeps the
 same four-step state transition and the address/mask/router/DNS configuration,
 but uses a fixed compiler-local record instead of BOOTP options. It omits
-lease timers, renewal/rebinding, relay agents, client identifiers, option
-negotiation, decline/release, and persistent lease storage.
+lease timers, renewal/rebinding, BOOTP relay-agent options, client identifiers,
+option negotiation, decline/release, and persistent lease storage.
 */
 
 #define DHCP_SERVER_UDP_PORT 67

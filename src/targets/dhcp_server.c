@@ -29,7 +29,7 @@ static dhcp_server_lease_t* allocate_lease(dhcp_server_context_t* context, const
 }
 
 static bool configure(dhcp_server_context_t* context, ipv4_address_t first_address, ipv4_address_t last_address, ipv4_address_t mask, ipv4_address_t gateway, ipv4_address_t dns_server) {
-  if (first_address > last_address || !ipv4_mask_is_contiguous(mask) || !ipv4_addresses_share_subnet(context->server_address, first_address, mask) || !ipv4_addresses_share_subnet(context->server_address, last_address, mask) || (gateway && !ipv4_addresses_share_subnet(context->server_address, gateway, mask))) return false;
+  if (first_address > last_address || !ipv4_mask_is_contiguous(mask) || !ipv4_addresses_share_subnet(first_address, last_address, mask) || (gateway && !ipv4_addresses_share_subnet(first_address, gateway, mask))) return false;
   context->first_address = first_address;
   context->last_address = last_address;
   context->mask = mask;
