@@ -67,6 +67,21 @@ bool ipv4_mask_is_contiguous(ipv4_address_t mask);
 /* Returns true when two IPv4 addresses belong to the same subnet under mask. */
 bool ipv4_addresses_share_subnet(ipv4_address_t first, ipv4_address_t second, ipv4_address_t mask);
 
+/* Returns true only for 0.0.0.0. */
+bool ipv4_address_is_unspecified(ipv4_address_t address);
+
+/* Returns true for 127.0.0.0/8. */
+bool ipv4_address_is_loopback(ipv4_address_t address);
+
+/* Returns true only for 255.255.255.255. */
+bool ipv4_address_is_limited_broadcast(ipv4_address_t address);
+
+/* Returns true when address is the all-host-bits-one address for mask. */
+bool ipv4_address_is_subnet_broadcast(ipv4_address_t address, ipv4_address_t mask);
+
+/* Returns true for 224.0.0.0/4. */
+bool ipv4_address_is_multicast(ipv4_address_t address);
+
 /* Writes a dotted-decimal IPv4 address to the caller-owned stream. */
 void ipv4_address_print(FILE* destination, ipv4_address_t address);
 

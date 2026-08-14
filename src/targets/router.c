@@ -3,6 +3,9 @@
 static const mac_address_t rip_multicast_mac = {0x01, 0x00, 0x5E, 0x00, 0x00, 0x09};
 static const mac_address_t ospf_multicast_mac = {0x01, 0x00, 0x5E, 0x00, 0x00, 0x05};
 
+static bool write_arp_request(router_context_t* context, size_t interface_index, ipv4_address_t target);
+static bool queue_packet(router_context_t* context, size_t egress_interface, ipv4_address_t next_hop, const ipv4_packet_view_t* packet, const ipv4_packet_view_t* report_packet, bool report_next_hop_failure, size_t report_interface, uint32_t now);
+
 static const char* dynamic_routing_name(router_dynamic_routing_mode_t mode) {
   switch (mode) {
     case ROUTER_DYNAMIC_ROUTING_OFF:  return "off";
@@ -24,6 +27,65 @@ static bool append_frame(router_context_t* context, size_t interface_index, cons
   }
   port->injected_bytes += (size_t)(after - before);
   return true;
+}
+
+static bool ipv4_source_is_valid_unicast(ipv4_address_t address, ipv4_address_t ingress_mask) {
+  return !ipv4_address_is_unspecified(address) && !ipv4_address_is_loopback(address) && !ipv4_address_is_limited_broadcast(address) && !ipv4_address_is_subnet_broadcast(address, ingress_mask) && !ipv4_address_is_multicast(address);
+}
+
+static bool frame_targets_eligible_unicast(const ethernet_frame_view_t* frame, const interface_entry_t* ingress_entry, const ipv4_packet_view_t* packet) {
+  if (!frame || !ingress_entry || !packet || ethernet_mac_is_group(frame->header.dst_mac) || ipv4_address_is_multicast(packet->header.dst_addr) || ipv4_address_is_limited_broadcast(packet->header.dst_addr) || ipv4_address_is_subnet_broadcast(packet->header.dst_addr, ingress_entry->mask)) {
+    return false;
+  }
+  return true;
+}
+
+static bool packet_allows_icmp_error(const ethernet_frame_view_t* frame, const interface_entry_t* ingress_entry, const ipv4_packet_view_t* packet) {
+  if (!frame_targets_eligible_unicast(frame, ingress_entry, packet) || !ipv4_source_is_valid_unicast(packet->header.src_addr, ingress_entry->mask)) {
+    return false;
+  }
+  return packet->header.protocol != ICMP_IPV4_PROTOCOL || !icmp_packet_is_error(packet->payload, packet->payload_length);
+}
+
+static bool emit_routed_ipv4(router_context_t* context, ipv4_address_t destination, uint8_t protocol, const uint8_t* payload, uint16_t payload_length) {
+  const route_entry_t* route = route_table_lookup(&context->routes, destination);
+  if (!route) return true;
+  const interface_entry_t* entry = interface_table_get(&context->interfaces, route->interface_index);
+  if (!entry || !entry->enabled) return true;
+  const ipv4_address_t next_hop = route->next_hop ? route->next_hop : destination;
+  const arp_entry_t* neighbor = arp_table_find_const(&context->arp, route->interface_index, next_hop);
+  if (!neighbor) {
+    return write_arp_request(context, route->interface_index, next_hop);
+  }
+  ipv4_packet_data_t packet = {
+      .src_addr = entry->ip4,
+      .dst_addr = destination,
+      .protocol = protocol,
+      .data = payload,
+      .data_length = payload_length,
+  };
+  memcpy(packet.src_mac_addr, entry->mac, sizeof(packet.src_mac_addr));
+  memcpy(packet.dst_mac_addr, neighbor->mac, sizeof(packet.dst_mac_addr));
+  router_port_t* port = &context->ports[route->interface_index];
+  const long before = ftell(port->destination);
+  if (before < 0 || !ipv4_write_ethernet_packet(port->destination, &packet)) return false;
+  const long after = ftell(port->destination);
+  if (after < before || fflush(port->destination) != 0) return false;
+  port->injected_bytes += (size_t)(after - before);
+  return true;
+}
+
+static bool emit_icmp_error(router_context_t* context, const ethernet_frame_view_t* frame, size_t ingress_interface, const ipv4_packet_view_t* offending, uint8_t type, uint8_t code) {
+  const interface_entry_t* ingress_entry = interface_table_get(&context->interfaces, ingress_interface);
+  if (!ingress_entry || !packet_allows_icmp_error(frame, ingress_entry, offending)) {
+    return true;
+  }
+  uint8_t payload[sizeof(icmp_error_header_t) + sizeof(ipv4_header_t) + ICMP_ERROR_QUOTE_DATA_LEN] = {0};
+  uint16_t payload_length = 0;
+  if (!icmp_write_error_payload(payload, sizeof(payload), &offending->header, offending->payload, offending->payload_length, type, code, &payload_length)) {
+    return false;
+  }
+  return emit_routed_ipv4(context, offending->header.src_addr, ICMP_IPV4_PROTOCOL, payload, payload_length);
 }
 
 static bool write_rip_packet(router_context_t* context, size_t interface_index, uint8_t command, const rip_route_entry_t* entries, size_t entry_count) {
@@ -217,38 +279,30 @@ static bool router_socket_emit(void* argument, ipv4_address_t destination, uint8
   const interface_entry_t* entry = interface_table_get(&context->interfaces, route->interface_index);
   if (!entry || !entry->enabled) return false;
   const ipv4_address_t next_hop = route->next_hop ? route->next_hop : destination;
-  const arp_entry_t* neighbor = arp_table_find(&context->arp, route->interface_index, next_hop);
+  const arp_entry_t* neighbor = arp_table_find_const(&context->arp, route->interface_index, next_hop);
   if (!neighbor) {
     write_arp_request(context, route->interface_index, next_hop);
     return false;
   }
-  ipv4_packet_data_t packet = {
-      .src_addr = entry->ip4,
-      .dst_addr = destination,
-      .protocol = protocol,
-      .data = payload,
-      .data_length = payload_length,
-  };
-  memcpy(packet.src_mac_addr, entry->mac, sizeof(packet.src_mac_addr));
-  memcpy(packet.dst_mac_addr, neighbor->mac, sizeof(packet.dst_mac_addr));
-  router_port_t* port = &context->ports[route->interface_index];
-  const long before = ftell(port->destination);
-  if (before < 0 || !ipv4_write_ethernet_packet(port->destination, &packet)) return false;
-  const long after = ftell(port->destination);
-  if (after < before || fflush(port->destination) != 0) return false;
-  port->injected_bytes += (size_t)(after - before);
-  return true;
+  return emit_routed_ipv4(context, destination, protocol, payload, payload_length);
 }
 
-static bool queue_packet(router_context_t* context, size_t egress_interface, ipv4_address_t next_hop, const ipv4_packet_view_t* packet) {
+static bool queue_packet(router_context_t* context, size_t egress_interface, ipv4_address_t next_hop, const ipv4_packet_view_t* packet, const ipv4_packet_view_t* report_packet, bool report_next_hop_failure, size_t report_interface, uint32_t now) {
   for (size_t i = 0; i < ROUTER_PENDING_CAPACITY; ++i) {
     router_pending_packet_t* pending = &context->pending_packets[i];
     if (!pending->active) {
       pending->header = packet->header;
       memcpy(pending->payload, packet->payload, packet->payload_length);
       pending->payload_length = packet->payload_length;
+      pending->report_header = report_packet->header;
+      memcpy(pending->report_payload, report_packet->payload, report_packet->payload_length);
+      pending->report_payload_length = report_packet->payload_length;
       pending->next_hop = next_hop;
       pending->egress_interface = egress_interface;
+      pending->report_interface = report_interface;
+      pending->next_retry_at = now + ROUTER_ARP_RETRY_INTERVAL_SECONDS;
+      pending->arp_attempts = 1;
+      pending->report_next_hop_failure = report_next_hop_failure;
       pending->active = true;
       return true;
     }
@@ -256,7 +310,8 @@ static bool queue_packet(router_context_t* context, size_t egress_interface, ipv
   return false;
 }
 
-static bool route_ipv4(router_context_t* context, size_t ingress_interface, const ipv4_packet_view_t* packet) {
+static bool route_ipv4(router_context_t* context, size_t ingress_interface, const ethernet_frame_view_t* frame, const ipv4_packet_view_t* packet) {
+  const ipv4_packet_view_t* received_packet = packet;
   ipv4_packet_view_t translated_packet = {0};
   ipv4_header_t translated_header = {0};
   uint8_t translated_payload[ETHERNET_MAX_DATA_LEN - sizeof(ipv4_header_t)] = {0};
@@ -298,6 +353,7 @@ static bool route_ipv4(router_context_t* context, size_t ingress_interface, cons
     fputs(".\n", stdout);
   }
   if (packet->header.ttl <= 1) {
+    if (!emit_icmp_error(context, frame, ingress_interface, received_packet, ICMP_TYPE_TIME_EXCEEDED, ICMP_CODE_TTL_EXPIRED)) return false;
     fputs("Dropped IPv4 packet with expired TTL.\n", stderr);
     return true;
   }
@@ -310,11 +366,13 @@ static bool route_ipv4(router_context_t* context, size_t ingress_interface, cons
   ipv4_address_print(stdout, packet->header.dst_addr);
   fprintf(stdout, " ttl=%u protocol=%u payload=%u bytes\n", packet->header.ttl, packet->header.protocol, packet->payload_length);
   if (!route) {
+    if (!emit_icmp_error(context, frame, ingress_interface, received_packet, ICMP_TYPE_DESTINATION_UNREACHABLE, ICMP_CODE_NETWORK_UNREACHABLE)) return false;
     fputs("Dropped IPv4 packet without a route.\n", stderr);
     return true;
   }
   const interface_entry_t* egress = interface_table_get(&context->interfaces, route->interface_index);
   if (!egress || !egress->enabled) {
+    if (!emit_icmp_error(context, frame, ingress_interface, received_packet, ICMP_TYPE_DESTINATION_UNREACHABLE, ICMP_CODE_HOST_UNREACHABLE)) return false;
     fputs("Dropped IPv4 packet with an unavailable egress interface.\n", stderr);
     return true;
   }
@@ -365,7 +423,7 @@ static bool route_ipv4(router_context_t* context, size_t ingress_interface, cons
     fprintf(stdout, "%zu to interface %zu.\n", ingress_interface + 1, route->interface_index + 1);
     return true;
   }
-  if (!queue_packet(context, route->interface_index, next_hop, packet)) {
+  if (!queue_packet(context, route->interface_index, next_hop, packet, received_packet, packet_allows_icmp_error(frame, interface_table_get(&context->interfaces, ingress_interface), received_packet), ingress_interface, (uint32_t)time(NULL))) {
     fputs("Dropped IPv4 packet because the pending-neighbor queue is full.\n", stderr);
     return true;
   }
@@ -373,6 +431,39 @@ static bool route_ipv4(router_context_t* context, size_t ingress_interface, cons
   fputs("Resolving next hop ", stdout);
   ipv4_address_print(stdout, next_hop);
   fprintf(stdout, " on interface %zu.\n", route->interface_index + 1);
+  return true;
+}
+
+static bool service_pending(router_context_t* context, uint32_t now) {
+  for (size_t i = 0; i < ROUTER_PENDING_CAPACITY; ++i) {
+    router_pending_packet_t* pending = &context->pending_packets[i];
+    if (!pending->active) continue;
+    if (arp_table_find_const(&context->arp, pending->egress_interface, pending->next_hop)) continue;
+    if (now < pending->next_retry_at) continue;
+    if (pending->arp_attempts < ROUTER_ARP_RETRY_LIMIT) {
+      if (!write_arp_request(context, pending->egress_interface, pending->next_hop)) return false;
+      ++pending->arp_attempts;
+      pending->next_retry_at = now + ROUTER_ARP_RETRY_INTERVAL_SECONDS;
+      continue;
+    }
+    if (pending->report_next_hop_failure) {
+      ethernet_frame_view_t synthetic_frame = {0};
+      const interface_entry_t* entry = interface_table_get(&context->interfaces, pending->report_interface);
+      if (entry) {
+        memcpy(synthetic_frame.header.dst_mac, entry->mac, sizeof(entry->mac));
+      }
+      ipv4_packet_view_t report_packet = {
+          .header = pending->report_header,
+          .payload = pending->report_payload,
+          .payload_length = pending->report_payload_length,
+      };
+      if (!emit_icmp_error(context, &synthetic_frame, pending->report_interface, &report_packet, ICMP_TYPE_DESTINATION_UNREACHABLE, ICMP_CODE_HOST_UNREACHABLE)) return false;
+    }
+    pending->active = false;
+    fputs("Dropped IPv4 packet after ARP retries exhausted for next hop ", stderr);
+    ipv4_address_print(stderr, pending->next_hop);
+    fputs(".\n", stderr);
+  }
   return true;
 }
 
@@ -622,7 +713,7 @@ static bool handle_ethernet(router_context_t* context, size_t ingress_interface,
 
   if (destination_is_rip_multicast) return handle_rip(context, ingress_interface, &packet);
   if (destination_is_ospf_multicast) return handle_ospf(context, ingress_interface, &packet);
-  return route_ipv4(context, ingress_interface, &packet);
+  return route_ipv4(context, ingress_interface, &frame, &packet);
 }
 
 static bool process_port(router_context_t* context, size_t interface_index) {
@@ -1198,6 +1289,12 @@ int main(int argc, char** argv) {
         }
         context.next_ospf_update = now + OSPF_UPDATE_INTERVAL_SECONDS;
       }
+    }
+    if (!service_pending(&context, (uint32_t)time(NULL))) {
+      mutex_unlock(&context.mutex);
+      fputs("Could not advance pending next-hop resolution.\n", stderr);
+      status = EXIT_FAILURE;
+      goto cleanup;
     }
     for (size_t i = 0; i < context.interfaces.count; ++i) {
       router_port_t* port = &context.ports[i];

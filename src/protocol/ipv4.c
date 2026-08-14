@@ -26,6 +26,30 @@ bool ipv4_addresses_share_subnet(ipv4_address_t first, ipv4_address_t second, ip
   return (first & mask) == (second & mask);
 }
 
+bool ipv4_address_is_unspecified(ipv4_address_t address) {
+  return address == 0;
+}
+
+bool ipv4_address_is_loopback(ipv4_address_t address) {
+  return (address & 0x000000FFu) == 127u;
+}
+
+bool ipv4_address_is_limited_broadcast(ipv4_address_t address) {
+  return address == UINT32_MAX;
+}
+
+bool ipv4_address_is_subnet_broadcast(ipv4_address_t address, ipv4_address_t mask) {
+  if (mask == 0 || mask == UINT32_MAX) {
+    return false;
+  }
+  return (address | mask) == UINT32_MAX;
+}
+
+bool ipv4_address_is_multicast(ipv4_address_t address) {
+  const uint8_t first_octet = (uint8_t)(address & 0xFFu);
+  return first_octet >= 224u && first_octet <= 239u;
+}
+
 void ipv4_address_print(FILE* destination, ipv4_address_t address) {
   fprintf(destination, "%u.%u.%u.%u", address & 0xFF, (address >> 8) & 0xFF, (address >> 16) & 0xFF, address >> 24);
 }

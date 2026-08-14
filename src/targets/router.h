@@ -12,6 +12,7 @@ OSI/ISO layer: Layer 3; it routes IPv4 packets and resolves each egress next hop
 
 #include <ethernet.h>
 #include <futils.h>
+#include <icmp.h>
 #include <interface_table.h>
 #include <ipv4.h>
 #include <math.h>
@@ -52,6 +53,8 @@ OSI/ISO layer: Layer 3; it routes IPv4 packets and resolves each egress next hop
 #define RIP_UPDATE_INTERVAL_SECONDS  30
 #define OSPF_ROUTE_TIMEOUT_SECONDS   40
 #define OSPF_UPDATE_INTERVAL_SECONDS 10
+#define ROUTER_ARP_RETRY_INTERVAL_SECONDS 1
+#define ROUTER_ARP_RETRY_LIMIT            3
 
 typedef enum router_dynamic_routing_mode {
   ROUTER_DYNAMIC_ROUTING_OFF,
@@ -69,10 +72,17 @@ typedef struct router_port {
 
 typedef struct router_pending_packet {
   ipv4_header_t header;
+  ipv4_header_t report_header;
   uint8_t payload[ETHERNET_MAX_DATA_LEN - sizeof(ipv4_header_t)];
+  uint8_t report_payload[ETHERNET_MAX_DATA_LEN - sizeof(ipv4_header_t)];
   ipv4_address_t next_hop;
   size_t egress_interface;
+  size_t report_interface;
   uint16_t payload_length;
+  uint16_t report_payload_length;
+  uint32_t next_retry_at;
+  uint8_t arp_attempts;
+  bool report_next_hop_failure;
   bool active;
 } router_pending_packet_t;
 
