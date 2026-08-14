@@ -1,9 +1,15 @@
 #include "host.h"
 
 static void command_transport(host_context_t* context, host_pending_packet_t* pending);
+static const ipv6_address_t ipv6_all_nodes = {.bytes = {0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}};
+static const ipv6_address_t ipv6_all_routers = {.bytes = {0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}};
 
 static bool ip4_is_local(const host_context_t* context, ipv4_address_t address) {
   return ipv4_addresses_share_subnet(context->ip4, address, context->mask);
+}
+
+static bool ip6_is_local(const host_context_t* context, const ipv6_address_t* address) {
+  return ipv6_address_is_link_local(address) || (context->has_ip6_global && ipv6_address_in_prefix(address, &context->ip6_prefix, context->ip6_prefix_length));
 }
 
 static bool write_arp_request(host_context_t* context, ipv4_address_t target) {
@@ -91,6 +97,107 @@ static bool write_ping(host_context_t* context, ipv4_address_t destination_ip, c
   return written;
 }
 
+static bool write_router_solicitation(host_context_t* context) {
+  FILE* destination = fopen(context->path, "ab");
+  if (!destination) {
+    fputs("Could not open the network file for IPv6 router solicitation.\n", stderr);
+    return false;
+  }
+  mac_address_t multicast_mac = {0};
+  ipv6_multicast_mac(&ipv6_all_routers, multicast_mac);
+  ndp_router_solicitation_data_t request = {
+      .src_addr = context->ip6_link_local,
+      .dst_addr = ipv6_all_routers,
+      .include_source_link_layer = true,
+  };
+  memcpy(request.src_mac_addr, context->mac, sizeof(request.src_mac_addr));
+  memcpy(request.dst_mac_addr, multicast_mac, sizeof(request.dst_mac_addr));
+  const bool written = ndp_write_router_solicitation(destination, &request);
+  fclose(destination);
+  return written;
+}
+
+static bool write_neighbor_solicitation(host_context_t* context, const ipv6_address_t* target) {
+  FILE* destination = fopen(context->path, "ab");
+  if (!destination) {
+    fputs("Could not open the network file for IPv6 neighbor solicitation.\n", stderr);
+    return false;
+  }
+  mac_address_t multicast_mac = {0};
+  ipv6_address_t multicast = {0};
+  ipv6_solicited_node_multicast(target, &multicast);
+  ipv6_solicited_node_multicast_mac(target, multicast_mac);
+  ndp_neighbor_solicitation_data_t request = {
+      .src_addr = context->has_ip6_global ? context->ip6_global : context->ip6_link_local,
+      .dst_addr = multicast,
+      .target_address = *target,
+      .include_source_link_layer = true,
+  };
+  memcpy(request.src_mac_addr, context->mac, sizeof(request.src_mac_addr));
+  memcpy(request.dst_mac_addr, multicast_mac, sizeof(request.dst_mac_addr));
+  const bool written = ndp_write_neighbor_solicitation(destination, &request);
+  fclose(destination);
+  return written;
+}
+
+static bool write_neighbor_advertisement(host_context_t* context, const ipv6_address_t* source_address, const ipv6_address_t* destination_address, const mac_address_t destination_mac, const ipv6_address_t* target_address, bool solicited) {
+  FILE* destination = fopen(context->path, "ab");
+  if (!destination) return false;
+  ndp_neighbor_advertisement_data_t reply = {
+      .src_addr = *source_address,
+      .dst_addr = *destination_address,
+      .target_address = *target_address,
+      .flags = NDP_NEIGHBOR_FLAG_OVERRIDE | (solicited ? NDP_NEIGHBOR_FLAG_SOLICITED : 0),
+      .include_target_link_layer = true,
+  };
+  memcpy(reply.src_mac_addr, context->mac, sizeof(reply.src_mac_addr));
+  memcpy(reply.dst_mac_addr, destination_mac, sizeof(reply.dst_mac_addr));
+  const bool written = ndp_write_neighbor_advertisement(destination, &reply);
+  fclose(destination);
+  return written;
+}
+
+static bool write_ping6(host_context_t* context, const ipv6_address_t* destination_ip, const mac_address_t destination_mac) {
+  FILE* destination = fopen(context->path, "ab");
+  if (!destination) {
+    fputs("Could not open the network file for IPv6 ping.\n", stderr);
+    return false;
+  }
+  const uint8_t data[] = {'v', 'n', 'e', 't', '6'};
+  icmpv6_echo_packet_data_t request = {
+      .src_addr = context->has_ip6_global ? context->ip6_global : context->ip6_link_local,
+      .dst_addr = *destination_ip,
+      .identifier = 1,
+      .sequence_number = ++context->ping6_sequence,
+      .data = data,
+      .data_length = sizeof(data),
+  };
+  memcpy(request.dst_mac_addr, destination_mac, sizeof(request.dst_mac_addr));
+  memcpy(request.src_mac_addr, context->mac, sizeof(request.src_mac_addr));
+  const bool written = icmpv6_write_ethernet_echo_request(destination, &request);
+  fclose(destination);
+  return written;
+}
+
+static bool write_ping6_reply(host_context_t* context, const ethernet_frame_view_t* frame, const ipv6_packet_view_t* ip6, const icmpv6_echo_header_t* echo, const uint8_t* data, size_t data_length) {
+  FILE* destination = fopen(context->path, "ab");
+  if (!destination) return false;
+  const ipv6_address_t* local = ipv6_address_equal(&ip6->header.dst_addr, &context->ip6_link_local) ? &context->ip6_link_local : &context->ip6_global;
+  icmpv6_echo_packet_data_t reply = {
+      .src_addr = *local,
+      .dst_addr = ip6->header.src_addr,
+      .identifier = echo->identifier,
+      .sequence_number = echo->sequence_number,
+      .data = data,
+      .data_length = (uint16_t)data_length,
+  };
+  memcpy(reply.dst_mac_addr, frame->header.src_mac, sizeof(reply.dst_mac_addr));
+  memcpy(reply.src_mac_addr, context->mac, sizeof(reply.src_mac_addr));
+  const bool written = icmpv6_write_ethernet_echo_reply(destination, &reply);
+  fclose(destination);
+  return written;
+}
+
 static bool write_ping_reply(host_context_t* context, const ethernet_frame_view_t* frame, const ipv4_packet_view_t* ip4, const icmp_echo_header_t* echo, const uint8_t* data, size_t data_length) {
   FILE* destination = fopen(context->path, "ab");
   if (!destination) {
@@ -160,6 +267,8 @@ static bool write_tcp(host_context_t* context, const host_pending_packet_t* pend
 static bool send_pending_packet(host_context_t* context, const host_pending_packet_t* pending, const mac_address_t destination_mac) {
   bool written = false;
   if (pending->type == HOST_PENDING_PING) written = write_ping(context, pending->destination, destination_mac);
+  else if (pending->type == HOST_PENDING_PING6)
+    written = write_ping6(context, &pending->destination_ip6, destination_mac);
   else if (pending->type == HOST_PENDING_UDP)
     written = write_udp(context, pending, destination_mac);
   else if (pending->type == HOST_PENDING_TCP)
@@ -167,9 +276,11 @@ static bool send_pending_packet(host_context_t* context, const host_pending_pack
   else if (pending->type == HOST_PENDING_DNS)
     written = write_udp(context, pending, destination_mac);
   if (written) {
-    fprintf(stdout, "Sent %s to ", pending->type == HOST_PENDING_PING ? "ping" : pending->type == HOST_PENDING_UDP ? "UDP datagram"
-                                                                                                                   : "TCP segment");
-    ipv4_address_print(stdout, pending->destination);
+    fprintf(stdout, "Sent %s to ", pending->type == HOST_PENDING_PING ? "ping" : pending->type == HOST_PENDING_PING6 ? "IPv6 ping" : pending->type == HOST_PENDING_UDP ? "UDP datagram"
+                                                                                                                                                                         : "TCP segment");
+    if (pending->type == HOST_PENDING_PING6) ipv6_address_print(stdout, &pending->destination_ip6);
+    else
+      ipv4_address_print(stdout, pending->destination);
     fputs(".\n", stdout);
   }
   return written;
@@ -182,6 +293,18 @@ static bool route_next_hop(const host_context_t* context, ipv4_address_t destina
   }
   if (context->has_gateway) {
     *next_hop = context->gateway;
+    return true;
+  }
+  return false;
+}
+
+static bool route_next_hop6(const host_context_t* context, const ipv6_address_t* destination, ipv6_address_t* next_hop) {
+  if (ipv6_address_is_link_local(destination) || ip6_is_local(context, destination)) {
+    *next_hop = *destination;
+    return true;
+  }
+  if (context->has_ip6_default_router) {
+    *next_hop = context->ip6_default_router;
     return true;
   }
   return false;
@@ -220,6 +343,16 @@ static void print_info(host_context_t* context) {
   } else {
     fputs("Host IPv4: unconfigured", stdout);
   }
+  fputs("\nHost IPv6 link-local: ", stdout);
+  ipv6_address_print(stdout, &context->ip6_link_local);
+  if (context->has_ip6_global) {
+    fputs("\nHost IPv6 global: ", stdout);
+    ipv6_address_print(stdout, &context->ip6_global);
+    fputs("/", stdout);
+    fprintf(stdout, "%u", context->ip6_prefix_length);
+  } else {
+    fputs("\nHost IPv6 global: unconfigured", stdout);
+  }
   fputs("\nSubnet mask: ", stdout);
   ipv4_address_print(stdout, context->mask);
   fputc('\n', stdout);
@@ -238,12 +371,25 @@ static void print_info(host_context_t* context) {
     ipv4_address_print(stdout, context->dhcp_server);
     fputc('\n', stdout);
   }
+  if (context->has_ip6_default_router) {
+    fputs("IPv6 default router: ", stdout);
+    ipv6_address_print(stdout, &context->ip6_default_router);
+    fputc('\n', stdout);
+  }
   fprintf(stdout, "ARP cache (%zu):\n", context->arp.count);
   for (size_t i = 0; i < context->arp.count; ++i) {
     fputs("  ", stdout);
     ipv4_address_print(stdout, context->arp.entries[i].ip4);
     fputs("  ", stdout);
     ethernet_mac_print(stdout, context->arp.entries[i].mac);
+    fputc('\n', stdout);
+  }
+  fprintf(stdout, "IPv6 neighbors (%zu):\n", context->nd.count);
+  for (size_t i = 0; i < context->nd.count; ++i) {
+    fputs("  ", stdout);
+    ipv6_address_print(stdout, &context->nd.entries[i].ip6);
+    fputs("  ", stdout);
+    ethernet_mac_print(stdout, context->nd.entries[i].mac);
     fputc('\n', stdout);
   }
   fprintf(stdout, "Devices (%zu):\n", context->devices.count);
@@ -389,6 +535,101 @@ static void handle_dns(host_context_t* context, const udp_packet_view_t* udp) {
   command_transport(context, &pending);
 }
 
+static bool host_owns_ip6(const host_context_t* context, const ipv6_address_t* address) {
+  return ipv6_address_equal(address, &context->ip6_link_local) || (context->has_ip6_global && ipv6_address_equal(address, &context->ip6_global));
+}
+
+static void handle_router_advertisement(host_context_t* context, const ethernet_frame_view_t* frame, const ipv6_packet_view_t* packet) {
+  ndp_router_advertisement_t advertisement = {0};
+  if (!ndp_parse_router_advertisement(packet->payload, packet->payload_length, &packet->header.src_addr, &packet->header.dst_addr, &advertisement)) return;
+  mutex_lock(&context->mutex);
+  nd_table_learn(&context->nd, 0, &packet->header.src_addr, frame->header.src_mac);
+  context->ip6_default_router = packet->header.src_addr;
+  context->has_ip6_default_router = advertisement.router_lifetime != 0;
+  if (advertisement.has_prefix_information && advertisement.autonomous && advertisement.prefix_length == 64 && ipv6_slaac_address_from_prefix(&advertisement.prefix, advertisement.prefix_length, context->mac, &context->ip6_global)) {
+    context->ip6_prefix = advertisement.prefix;
+    context->ip6_prefix_length = advertisement.prefix_length;
+    context->has_ip6_global = true;
+  }
+  mutex_unlock(&context->mutex);
+  fputs("Received IPv6 router advertisement from ", stdout);
+  ipv6_address_print(stdout, &packet->header.src_addr);
+  if (advertisement.has_prefix_information) {
+    fputs(" with prefix ", stdout);
+    ipv6_address_print(stdout, &advertisement.prefix);
+    fprintf(stdout, "/%u", advertisement.prefix_length);
+  }
+  fputs(".\n", stdout);
+}
+
+static void handle_neighbor_solicitation(host_context_t* context, const ethernet_frame_view_t* frame, const ipv6_packet_view_t* packet) {
+  ndp_neighbor_solicitation_t solicitation = {0};
+  if (!ndp_parse_neighbor_solicitation(packet->payload, packet->payload_length, &packet->header.src_addr, &packet->header.dst_addr, &solicitation)) return;
+  if (solicitation.has_source_link_layer && !ipv6_address_is_unspecified(&packet->header.src_addr)) {
+    mutex_lock(&context->mutex);
+    nd_table_learn(&context->nd, 0, &packet->header.src_addr, solicitation.source_link_layer);
+    mutex_unlock(&context->mutex);
+  }
+  if (!host_owns_ip6(context, &solicitation.target_address)) return;
+  const ipv6_address_t* local = ipv6_address_equal(&solicitation.target_address, &context->ip6_link_local) ? &context->ip6_link_local : &context->ip6_global;
+  if (write_neighbor_advertisement(context, local, &packet->header.src_addr, frame->header.src_mac, &solicitation.target_address, !ipv6_address_is_unspecified(&packet->header.src_addr))) {
+    fputs("Replied to IPv6 neighbor solicitation for ", stdout);
+    ipv6_address_print(stdout, &solicitation.target_address);
+    fputs(".\n", stdout);
+  }
+}
+
+static void handle_neighbor_advertisement(host_context_t* context, const ethernet_frame_view_t* frame, const ipv6_packet_view_t* packet) {
+  ndp_neighbor_advertisement_t advertisement = {0};
+  if (!ndp_parse_neighbor_advertisement(packet->payload, packet->payload_length, &packet->header.src_addr, &packet->header.dst_addr, &advertisement)) return;
+  mutex_lock(&context->mutex);
+  nd_table_learn(&context->nd, 0, &advertisement.target_address, advertisement.has_target_link_layer ? advertisement.target_link_layer : frame->header.src_mac);
+  host_pending_packet_t pending = {0};
+  if (context->pending_packet.active && context->pending_packet.type == HOST_PENDING_PING6 && ipv6_address_equal(&context->pending_packet.next_hop_ip6, &advertisement.target_address)) {
+    pending = context->pending_packet;
+    context->pending_packet.active = false;
+  }
+  mutex_unlock(&context->mutex);
+  if (pending.active) send_pending_packet(context, &pending, advertisement.has_target_link_layer ? advertisement.target_link_layer : frame->header.src_mac);
+}
+
+static void handle_ipv6(host_context_t* context, const ethernet_frame_view_t* frame) {
+  ipv6_packet_view_t packet = {0};
+  if (!ipv6_parse_packet(frame->data, frame->client_data_length, &packet)) return;
+  const bool local = host_owns_ip6(context, &packet.header.dst_addr);
+  const bool all_nodes = ipv6_address_equal(&packet.header.dst_addr, &ipv6_all_nodes);
+  const bool solicited_node = ipv6_address_is_multicast(&packet.header.dst_addr);
+  if (packet.header.next_header != IPV6_NEXT_HEADER_ICMPV6 || (!local && !all_nodes && !solicited_node)) return;
+  icmpv6_header_t header = {0};
+  if (!icmpv6_parse_header(packet.payload, packet.payload_length, &packet.header.src_addr, &packet.header.dst_addr, &header)) return;
+  if (header.type == ICMPV6_TYPE_ROUTER_ADVERTISEMENT) {
+    handle_router_advertisement(context, frame, &packet);
+    return;
+  }
+  if (header.type == ICMPV6_TYPE_NEIGHBOR_SOLICITATION) {
+    handle_neighbor_solicitation(context, frame, &packet);
+    return;
+  }
+  if (header.type == ICMPV6_TYPE_NEIGHBOR_ADVERTISEMENT) {
+    handle_neighbor_advertisement(context, frame, &packet);
+    return;
+  }
+  if (!local || (header.type != ICMPV6_TYPE_ECHO_REQUEST && header.type != ICMPV6_TYPE_ECHO_REPLY)) return;
+  icmpv6_echo_header_t echo = {0};
+  const uint8_t* data = NULL;
+  size_t data_length = 0;
+  if (!icmpv6_parse_echo_packet(packet.payload, packet.payload_length, &packet.header.src_addr, &packet.header.dst_addr, &echo, &data, &data_length)) return;
+  if (echo.type == ICMPV6_TYPE_ECHO_REQUEST && write_ping6_reply(context, frame, &packet, &echo, data, data_length)) {
+    fputs("Replied to IPv6 ping from ", stdout);
+    ipv6_address_print(stdout, &packet.header.src_addr);
+    fputs(".\n", stdout);
+  } else if (echo.type == ICMPV6_TYPE_ECHO_REPLY) {
+    fputs("IPv6 ping reply from ", stdout);
+    ipv6_address_print(stdout, &packet.header.src_addr);
+    fprintf(stdout, ": sequence=%u.\n", echo.sequence_number);
+  }
+}
+
 static void handle_ipv4(host_context_t* context, const ethernet_frame_view_t* frame) {
   ipv4_packet_view_t packet = {0};
   if (!ipv4_parse_packet(frame->data, frame->data_length, &packet)) return;
@@ -456,6 +697,8 @@ static void handle_ethernet(host_context_t* context, const uint8_t* bytes, size_
     handle_rarp(context, &frame);
   } else if (frame.header.type_or_length == ETHERNET_ETHERTYPE_IPV4) {
     handle_ipv4(context, &frame);
+  } else if (frame.header.type_or_length == ETHERNET_ETHERTYPE_IPV6) {
+    handle_ipv6(context, &frame);
   }
 }
 
@@ -533,6 +776,7 @@ static void receiver_thread(void* argument) {
 
 static bool parse_options(host_context_t* context, int argc, char** argv) {
   context->mask = IPV4_ADDRESS(255, 255, 255, 0);
+  ipv6_link_local_from_mac(context->mac, &context->ip6_link_local);
   for (int i = 3; i < argc;) {
     if (strcmpi(argv[i], "-dhcp") == 0) {
       if (context->has_dhcp_server) return false;
@@ -721,6 +965,42 @@ static void command_ping(void* context_argument, char* argument) {
       ipv4_address_print(stdout, next_hop);
       fputs(" before pinging ", stdout);
       ipv4_address_print(stdout, destination);
+      fputs(".\n", stdout);
+    }
+  }
+}
+
+static void command_ping6(void* context_argument, char* argument) {
+  host_context_t* context = context_argument;
+  ipv6_address_t destination = {0};
+  ipv6_address_t next_hop = {0};
+  if (!ipv6_parse_address(argument, &destination)) {
+    fputs("Usage: ping6 <ipv6-address>\n", stderr);
+  } else if (!route_next_hop6(context, &destination, &next_hop)) {
+    fputs("Destination is outside the local IPv6 prefix and no default router is configured.\n", stderr);
+  } else {
+    mutex_lock(&context->mutex);
+    nd_entry_t* entry = nd_table_find(&context->nd, 0, &next_hop);
+    mac_address_t mac = {0};
+    if (entry) {
+      memcpy(mac, entry->mac, sizeof(mac));
+    } else {
+      context->pending_packet = (host_pending_packet_t) {
+          .destination_ip6 = destination,
+          .next_hop_ip6 = next_hop,
+          .type = HOST_PENDING_PING6,
+          .active = true,
+      };
+    }
+    mutex_unlock(&context->mutex);
+    if (entry) {
+      const host_pending_packet_t pending = {.destination_ip6 = destination, .type = HOST_PENDING_PING6};
+      send_pending_packet(context, &pending, mac);
+    } else if (write_neighbor_solicitation(context, &next_hop)) {
+      fputs("Resolving IPv6 neighbor ", stdout);
+      ipv6_address_print(stdout, &next_hop);
+      fputs(" before pinging ", stdout);
+      ipv6_address_print(stdout, &destination);
       fputs(".\n", stdout);
     }
   }
@@ -929,6 +1209,7 @@ int main(int argc, char** argv) {
   }
   vnet_peer_table_init(&context.devices, context.device_entries, HOST_DEVICE_CAPACITY);
   arp_table_init(&context.arp, context.arp_entries, HOST_ARP_CAPACITY);
+  nd_table_init(&context.nd, context.nd_entries, HOST_ND_CAPACITY);
   if (!socket_context_init(&context.sockets, context.ip4, host_socket_emit, &context)) {
     fputs("Could not initialize the host socket context.\n", stderr);
     mutex_destroy(&context.mutex);
@@ -943,8 +1224,9 @@ int main(int argc, char** argv) {
     fclose(context.source);
     return EXIT_FAILURE;
   }
+  write_router_solicitation(&context);
 
-  if (!cmd_app_register(&context.commands, "info", "Show all host configuration and live tables.", command_info, &context) || !cmd_app_register(&context.commands, "config", "Change host IPv4, mask, gateway, DNS, or DHCP server.", command_config, &context) || !cmd_app_register(&context.commands, "arp", "Resolve the local destination or next-hop gateway.", command_arp, &context) || !cmd_app_register(&context.commands, "arp-delete", "Remove one learned ARP neighbor.", command_arp_delete, &context) || !cmd_app_register(&context.commands, "rarp", "Request an IPv4 address for this host MAC.", command_rarp, &context) || !cmd_app_register(&context.commands, "dhcp", "Broadcast DHCP DISCOVER for IPv4 configuration.", command_dhcp, &context) || !cmd_app_register(&context.commands, "dns", "Query the configured DNS server for an IPv4 address.", command_dns, &context) || !cmd_app_register(&context.commands, "ping", "Send an ICMP Echo Request after ARP resolution.", command_ping, &context) || !cmd_app_register(&context.commands, "udp", "Send a UDP datagram after ARP resolution.", command_udp, &context) || !cmd_app_register(&context.commands, "tcp", "Send a base-header TCP segment after ARP resolution.", command_tcp, &context) || !cmd_app_register(&context.commands, "socket", "Control virtual TCP and UDP sockets.", command_socket, &context) || !cmd_app_start(&context.commands)) {
+  if (!cmd_app_register(&context.commands, "info", "Show all host configuration and live tables.", command_info, &context) || !cmd_app_register(&context.commands, "config", "Change host IPv4, mask, gateway, DNS, or DHCP server.", command_config, &context) || !cmd_app_register(&context.commands, "arp", "Resolve the local destination or next-hop gateway.", command_arp, &context) || !cmd_app_register(&context.commands, "arp-delete", "Remove one learned ARP neighbor.", command_arp_delete, &context) || !cmd_app_register(&context.commands, "rarp", "Request an IPv4 address for this host MAC.", command_rarp, &context) || !cmd_app_register(&context.commands, "dhcp", "Broadcast DHCP DISCOVER for IPv4 configuration.", command_dhcp, &context) || !cmd_app_register(&context.commands, "dns", "Query the configured DNS server for an IPv4 address.", command_dns, &context) || !cmd_app_register(&context.commands, "ping", "Send an ICMP Echo Request after ARP resolution.", command_ping, &context) || !cmd_app_register(&context.commands, "ping6", "Send an ICMPv6 Echo Request after Neighbor Discovery resolution.", command_ping6, &context) || !cmd_app_register(&context.commands, "udp", "Send a UDP datagram after ARP resolution.", command_udp, &context) || !cmd_app_register(&context.commands, "tcp", "Send a base-header TCP segment after ARP resolution.", command_tcp, &context) || !cmd_app_register(&context.commands, "socket", "Control virtual TCP and UDP sockets.", command_socket, &context) || !cmd_app_start(&context.commands)) {
     fputs("Could not start the command application.\n", stderr);
     cmd_app_stop(&context.commands);
     thread_join(&thread);

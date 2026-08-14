@@ -3,6 +3,8 @@
 static const mac_address_t rip_multicast_mac = {0x01, 0x00, 0x5E, 0x00, 0x00, 0x09};
 static const mac_address_t ospf_multicast_mac = {0x01, 0x00, 0x5E, 0x00, 0x00, 0x05};
 static const mac_address_t ethernet_broadcast_mac = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+static const ipv6_address_t ipv6_all_nodes = {.bytes = {0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}};
+static const ipv6_address_t ipv6_all_routers = {.bytes = {0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}};
 
 static bool write_arp_request(router_context_t* context, size_t interface_index, ipv4_address_t target);
 static bool forward_ipv4(router_context_t* context, size_t interface_index, const ipv4_header_t* header, const uint8_t* payload, uint16_t payload_length, const mac_address_t destination_mac);
@@ -13,6 +15,97 @@ static void clear_dhcp_relay_entries(router_context_t* context, size_t ingress_i
 static router_dhcp_relay_entry_t* find_dhcp_relay_entry(router_context_t* context, uint16_t transaction_id, const mac_address_t client_mac, ipv4_address_t server_address);
 static router_dhcp_relay_entry_t* remember_dhcp_relay(router_context_t* context, size_t ingress_interface, const dhcp_message_t* message, ipv4_address_t server_address, uint32_t now);
 static bool handle_dhcp_relay(router_context_t* context, size_t ingress_interface, const ethernet_frame_view_t* frame, const ipv4_packet_view_t* packet, bool* handled);
+static bool handle_ipv6(router_context_t* context, size_t ingress_interface, const ethernet_frame_view_t* frame);
+
+static bool append_ipv6_frame(router_context_t* context, size_t interface_index, const ipv6_packet_data_t* packet) {
+  router_port_t* port = &context->ports[interface_index];
+  const long before = ftell(port->destination);
+  if (before < 0 || !ipv6_write_ethernet_packet(port->destination, packet)) return false;
+  const long after = ftell(port->destination);
+  if (after < before || fflush(port->destination) != 0) return false;
+  port->injected_bytes += (size_t)(after - before);
+  return true;
+}
+
+static bool router_interface_owns_ip6(const interface_entry_t* entry, const ipv6_address_t* address) {
+  return entry && (ipv6_address_equal(address, &entry->ip6_link_local) || ipv6_address_equal(address, &entry->ip6_global));
+}
+
+static bool write_router_advertisement(router_context_t* context, size_t interface_index, const ipv6_address_t* destination_ip6, const mac_address_t destination_mac) {
+  const interface_entry_t* entry = interface_table_get(&context->interfaces, interface_index);
+  if (!entry || !entry->enabled) return false;
+  ndp_router_advertisement_data_t advertisement = {
+      .src_addr = entry->ip6_link_local,
+      .dst_addr = *destination_ip6,
+      .current_hop_limit = IPV6_DEFAULT_HOP_LIMIT,
+      .router_lifetime = ROUTER_RA_INTERVAL_SECONDS * 3,
+      .include_source_link_layer = true,
+      .include_prefix_information = true,
+      .prefix = entry->ip6_prefix,
+      .prefix_length = entry->ip6_prefix_length,
+      .on_link = true,
+      .autonomous = true,
+      .valid_lifetime = ROUTER_RA_INTERVAL_SECONDS * 30,
+      .preferred_lifetime = ROUTER_RA_INTERVAL_SECONDS * 15,
+  };
+  memcpy(advertisement.src_mac_addr, entry->mac, sizeof(advertisement.src_mac_addr));
+  memcpy(advertisement.dst_mac_addr, destination_mac, sizeof(advertisement.dst_mac_addr));
+  return ndp_write_router_advertisement(context->ports[interface_index].destination, &advertisement) && fflush(context->ports[interface_index].destination) == 0;
+}
+
+static bool write_unsolicited_router_advertisement(router_context_t* context, size_t interface_index) {
+  mac_address_t multicast_mac = {0};
+  ipv6_multicast_mac(&ipv6_all_nodes, multicast_mac);
+  const long before = ftell(context->ports[interface_index].destination);
+  if (before < 0 || !write_router_advertisement(context, interface_index, &ipv6_all_nodes, multicast_mac)) return false;
+  const long after = ftell(context->ports[interface_index].destination);
+  if (after < before) return false;
+  context->ports[interface_index].injected_bytes += (size_t)(after - before);
+  return true;
+}
+
+static bool write_neighbor_advertisement(router_context_t* context, size_t interface_index, const ipv6_address_t* destination_ip6, const mac_address_t destination_mac, const ipv6_address_t* target_address, bool solicited) {
+  const interface_entry_t* entry = interface_table_get(&context->interfaces, interface_index);
+  if (!entry || !entry->enabled) return false;
+  const ipv6_address_t* source = ipv6_address_equal(target_address, &entry->ip6_link_local) ? &entry->ip6_link_local : &entry->ip6_global;
+  ndp_neighbor_advertisement_data_t advertisement = {
+      .src_addr = *source,
+      .dst_addr = *destination_ip6,
+      .target_address = *target_address,
+      .flags = NDP_NEIGHBOR_FLAG_ROUTER | NDP_NEIGHBOR_FLAG_OVERRIDE | (solicited ? NDP_NEIGHBOR_FLAG_SOLICITED : 0),
+      .include_target_link_layer = true,
+  };
+  memcpy(advertisement.src_mac_addr, entry->mac, sizeof(advertisement.src_mac_addr));
+  memcpy(advertisement.dst_mac_addr, destination_mac, sizeof(advertisement.dst_mac_addr));
+  const long before = ftell(context->ports[interface_index].destination);
+  if (before < 0 || !ndp_write_neighbor_advertisement(context->ports[interface_index].destination, &advertisement) || fflush(context->ports[interface_index].destination) != 0) return false;
+  const long after = ftell(context->ports[interface_index].destination);
+  if (after < before) return false;
+  context->ports[interface_index].injected_bytes += (size_t)(after - before);
+  return true;
+}
+
+static bool write_icmpv6_echo_reply(router_context_t* context, size_t interface_index, const ethernet_frame_view_t* frame, const ipv6_packet_view_t* ip6, const icmpv6_echo_header_t* echo, const uint8_t* data, size_t data_length) {
+  const interface_entry_t* entry = interface_table_get(&context->interfaces, interface_index);
+  if (!entry || !entry->enabled) return false;
+  const ipv6_address_t* local = ipv6_address_equal(&ip6->header.dst_addr, &entry->ip6_link_local) ? &entry->ip6_link_local : &entry->ip6_global;
+  icmpv6_echo_packet_data_t reply = {
+      .src_addr = *local,
+      .dst_addr = ip6->header.src_addr,
+      .identifier = echo->identifier,
+      .sequence_number = echo->sequence_number,
+      .data = data,
+      .data_length = (uint16_t)data_length,
+  };
+  memcpy(reply.src_mac_addr, entry->mac, sizeof(reply.src_mac_addr));
+  memcpy(reply.dst_mac_addr, frame->header.src_mac, sizeof(reply.dst_mac_addr));
+  const long before = ftell(context->ports[interface_index].destination);
+  if (before < 0 || !icmpv6_write_ethernet_echo_reply(context->ports[interface_index].destination, &reply) || fflush(context->ports[interface_index].destination) != 0) return false;
+  const long after = ftell(context->ports[interface_index].destination);
+  if (after < before) return false;
+  context->ports[interface_index].injected_bytes += (size_t)(after - before);
+  return true;
+}
 
 static const char* dynamic_routing_name(router_dynamic_routing_mode_t mode) {
   switch (mode) {
