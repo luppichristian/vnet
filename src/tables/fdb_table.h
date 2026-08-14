@@ -41,5 +41,8 @@ bool fdb_table_learn(fdb_table_t* table, const mac_address_t mac, uint16_t vlan_
 /* Removes every learned MAC mapping on port. */
 void fdb_table_remove_port(fdb_table_t* table, size_t port);
 
+/* Removes every learned MAC mapping, such as after a spanning-tree topology change. */
+void fdb_table_clear(fdb_table_t* table);
+
 /* Removes one learned unicast MAC mapping from VLAN. Returns false when it is absent. */
 bool fdb_table_remove(fdb_table_t* table, const mac_address_t mac, uint16_t vlan_id);

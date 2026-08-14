@@ -53,6 +53,10 @@ void fdb_table_remove_port(fdb_table_t* table, size_t port) {
   }
 }
 
+void fdb_table_clear(fdb_table_t* table) {
+  table->count = 0;
+}
+
 bool fdb_table_remove(fdb_table_t* table, const mac_address_t mac, uint16_t vlan_id) {
   fdb_entry_t* entry = fdb_table_find(table, mac, vlan_id);
   if (!entry) return false;
