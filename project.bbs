@@ -40,7 +40,7 @@ targets(
     output(router)
     stdver(c17)
     include_dirs(src/lib src/protocol src/socket_api src/tables src/targets)
-    units(src/targets/router.c src/lib/*.c src/protocol/*.c src/socket_api/*.c src/tables/*.c src/tables/prefix_list.c)
+    units(src/targets/router.c src/lib/*.c src/protocol/*.c src/socket_api/*.c src/tables/*.c)
   )
 
   console(

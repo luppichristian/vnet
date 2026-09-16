@@ -2,7 +2,7 @@
 
 ## Role
 
-IPv4 is the main Layer-3 packet format in VNet. Hosts decide whether the destination is local or requires the configured gateway; routers select a connected, static, or dynamically learned route and resolve the egress next hop with ARP.
+IPv4 is VNet's Layer-3 packet format. Hosts decide whether the destination is local or requires the configured gateway; routers select a connected or static route and resolve the egress next hop with ARP.
 
 ## Modeled header and handling
 
@@ -11,8 +11,8 @@ IPv4 is the main Layer-3 packet format in VNet. Hosts decide whether the destina
 | Addressing | parses dotted-decimal addresses; tests subnet, broadcast, multicast, loopback, and unspecified cases |
 | Header | packed IPv4 header with version, IHL, total length, identification, flags/fragment offset, TTL, protocol, checksum, source, destination |
 | Validation | parser validates header shape/length and header checksum |
-| Forwarding | router decrements TTL, performs longest-match table lookup, and recomputes the header checksum |
-| Payload protocol | ICMP, TCP, UDP, RIP, and OSPF are dispatched by the protocol field |
+| Forwarding | router decrements TTL, performs longest-prefix table lookup, and recomputes the header checksum |
+| Payload protocol | ICMP, TCP, UDP, DHCP, and DNS are carried through the protocol field |
 
 `ipv4_write_ethernet_packet` encapsulates the packet in Ethernet II; `ipv4_parse_packet` returns a view into caller-owned bytes. The data model is in `src/protocol/ipv4.{h,c}`.
 

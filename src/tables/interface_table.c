@@ -34,14 +34,10 @@ static bool interface_entry_init(interface_entry_t* entry, const char* path, con
   memcpy(entry->mac, mac, sizeof(entry->mac));
   entry->ip4 = ip4;
   entry->mask = mask;
-  entry->ip6_prefix_length = 64;
   entry->parent_index = parent_index;
   entry->port_index = INTERFACE_NONE;
   entry->tagged = tagged;
   entry->vlan_id = vlan_id;
-  ipv6_link_local_from_mac(mac, &entry->ip6_link_local);
-  ipv6_ula_prefix_from_ipv4_network(ip4 & mask, &entry->ip6_prefix);
-  if (!ipv6_slaac_address_from_prefix(&entry->ip6_prefix, entry->ip6_prefix_length, mac, &entry->ip6_global)) return false;
   entry->enabled = true;
   return true;
 }
@@ -76,7 +72,7 @@ bool interface_table_index_valid(const interface_table_t* table, size_t index) {
   return table && index < table->count;
 }
 
-bool interface_table_is_subinterface(const interface_entry_t* entry) {
+static bool interface_table_is_subinterface(const interface_entry_t* entry) {
   return entry && entry->tagged;
 }
 

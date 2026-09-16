@@ -25,7 +25,6 @@
 
 #include <ethernet.h>
 #include <ipv4.h>
-#include <ipv6.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <vnet.h>
@@ -42,19 +41,13 @@ interface.
 
 In this file-based simulator, path identifies the VNet medium in place of a
 physical port, VLAN subinterface, or operating-system interface index. This
-table models one static IPv4 address plus one simulator-derived IPv6 /64 for
-basic dual-stack behavior. It still does not represent MTU, link state, or
-multiple addresses per interface.
+table models one static IPv4 address. It still does not represent MTU, link state, or multiple addresses per interface.
 */
 typedef struct interface_entry {
   char path[VNET_PATH_LEN];
   mac_address_t mac;
   ipv4_address_t ip4;
   ipv4_address_t mask;
-  ipv6_address_t ip6_link_local;
-  ipv6_address_t ip6_global;
-  ipv6_address_t ip6_prefix;
-  uint8_t ip6_prefix_length;
   size_t parent_index;
   size_t port_index;
   uint16_t vlan_id;
@@ -76,7 +69,6 @@ interface_entry_t* interface_table_find_path(interface_table_t* table, const cha
 interface_entry_t* interface_table_find_ip4(interface_table_t* table, ipv4_address_t ip4);
 const interface_entry_t* interface_table_get(const interface_table_t* table, size_t index);
 bool interface_table_index_valid(const interface_table_t* table, size_t index);
-bool interface_table_is_subinterface(const interface_entry_t* entry);
 
 /* Adds an enabled interface. Returns false for duplicate paths, invalid masks, or a full table. */
 bool interface_table_add_base(interface_table_t* table, const char* path, const mac_address_t mac, ipv4_address_t ip4, ipv4_address_t mask);

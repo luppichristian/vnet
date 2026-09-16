@@ -23,11 +23,7 @@
  */
 #include "router.h"
 
-static const mac_address_t rip_multicast_mac = {0x01, 0x00, 0x5E, 0x00, 0x00, 0x09};
-static const mac_address_t ospf_multicast_mac = {0x01, 0x00, 0x5E, 0x00, 0x00, 0x05};
 static const mac_address_t ethernet_broadcast_mac = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-static const ipv6_address_t ipv6_all_nodes = {.bytes = {0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}};
-static const ipv6_address_t ipv6_all_routers = {.bytes = {0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}};
 #define ROUTER_ACL_PROTOCOL_ANY 0
 #define ROUTER_ACL_PORT_ANY     0
 #define ROUTER_INTERFACE_NONE   ((size_t)-1)
@@ -41,7 +37,6 @@ static void clear_dhcp_relay_entries(router_context_t* context, size_t ingress_i
 static router_dhcp_relay_entry_t* find_dhcp_relay_entry(router_context_t* context, uint16_t transaction_id, const mac_address_t client_mac, ipv4_address_t server_address);
 static router_dhcp_relay_entry_t* remember_dhcp_relay(router_context_t* context, size_t ingress_interface, const dhcp_message_t* message, ipv4_address_t server_address, uint32_t now);
 static bool handle_dhcp_relay(router_context_t* context, size_t ingress_interface, const ethernet_frame_view_t* frame, const ipv4_packet_view_t* packet, bool* handled);
-static bool handle_ipv6(router_context_t* context, size_t ingress_interface, const ethernet_frame_view_t* frame);
 static bool append_frame(router_context_t* context, size_t interface_index, const ethernet_frame_data_t* frame);
 static bool append_generated_frame_file(router_context_t* context, size_t interface_index, FILE* frame_file);
 static size_t find_ingress_interface(const router_context_t* context, size_t port_index, const ethernet_frame_view_t* frame);
@@ -86,111 +81,6 @@ static bool append_generated_frame_file(router_context_t* context, size_t interf
   return appended;
 }
 
-static bool append_ipv6_frame(router_context_t* context, size_t interface_index, const ipv6_packet_data_t* packet) {
-  FILE* destination = tmpfile();
-  if (!destination || !ipv6_write_ethernet_packet(destination, packet)) {
-    if (destination) fclose(destination);
-    return false;
-  }
-  const bool appended = append_generated_frame_file(context, interface_index, destination);
-  fclose(destination);
-  return appended;
-}
-
-static bool router_interface_owns_ip6(const interface_entry_t* entry, const ipv6_address_t* address) {
-  return entry && (ipv6_address_equal(address, &entry->ip6_link_local) || ipv6_address_equal(address, &entry->ip6_global));
-}
-
-static bool write_router_advertisement(router_context_t* context, size_t interface_index, const ipv6_address_t* destination_ip6, const mac_address_t destination_mac) {
-  const interface_entry_t* entry = interface_table_get(&context->interfaces, interface_index);
-  if (!entry || !entry->enabled) return false;
-  ndp_router_advertisement_data_t advertisement = {
-      .src_addr = entry->ip6_link_local,
-      .dst_addr = *destination_ip6,
-      .current_hop_limit = IPV6_DEFAULT_HOP_LIMIT,
-      .router_lifetime = ROUTER_RA_INTERVAL_SECONDS * 3,
-      .include_source_link_layer = true,
-      .include_prefix_information = true,
-      .prefix = entry->ip6_prefix,
-      .prefix_length = entry->ip6_prefix_length,
-      .on_link = true,
-      .autonomous = true,
-      .valid_lifetime = ROUTER_RA_INTERVAL_SECONDS * 30,
-      .preferred_lifetime = ROUTER_RA_INTERVAL_SECONDS * 15,
-  };
-  memcpy(advertisement.src_mac_addr, entry->mac, sizeof(advertisement.src_mac_addr));
-  memcpy(advertisement.dst_mac_addr, destination_mac, sizeof(advertisement.dst_mac_addr));
-  FILE* destination = tmpfile();
-  if (!destination || !ndp_write_router_advertisement(destination, &advertisement)) {
-    if (destination) fclose(destination);
-    return false;
-  }
-  const bool appended = append_generated_frame_file(context, interface_index, destination);
-  fclose(destination);
-  return appended;
-}
-
-static bool write_unsolicited_router_advertisement(router_context_t* context, size_t interface_index) {
-  mac_address_t multicast_mac = {0};
-  ipv6_multicast_mac(&ipv6_all_nodes, multicast_mac);
-  return write_router_advertisement(context, interface_index, &ipv6_all_nodes, multicast_mac);
-}
-
-static bool write_neighbor_advertisement(router_context_t* context, size_t interface_index, const ipv6_address_t* destination_ip6, const mac_address_t destination_mac, const ipv6_address_t* target_address, bool solicited) {
-  const interface_entry_t* entry = interface_table_get(&context->interfaces, interface_index);
-  if (!entry || !entry->enabled) return false;
-  const ipv6_address_t* source = ipv6_address_equal(target_address, &entry->ip6_link_local) ? &entry->ip6_link_local : &entry->ip6_global;
-  ndp_neighbor_advertisement_data_t advertisement = {
-      .src_addr = *source,
-      .dst_addr = *destination_ip6,
-      .target_address = *target_address,
-      .flags = NDP_NEIGHBOR_FLAG_ROUTER | NDP_NEIGHBOR_FLAG_OVERRIDE | (solicited ? NDP_NEIGHBOR_FLAG_SOLICITED : 0),
-      .include_target_link_layer = true,
-  };
-  memcpy(advertisement.src_mac_addr, entry->mac, sizeof(advertisement.src_mac_addr));
-  memcpy(advertisement.dst_mac_addr, destination_mac, sizeof(advertisement.dst_mac_addr));
-  FILE* destination = tmpfile();
-  if (!destination || !ndp_write_neighbor_advertisement(destination, &advertisement)) {
-    if (destination) fclose(destination);
-    return false;
-  }
-  const bool appended = append_generated_frame_file(context, interface_index, destination);
-  fclose(destination);
-  return appended;
-}
-
-static bool write_icmpv6_echo_reply(router_context_t* context, size_t interface_index, const ethernet_frame_view_t* frame, const ipv6_packet_view_t* ip6, const icmpv6_echo_header_t* echo, const uint8_t* data, size_t data_length) {
-  const interface_entry_t* entry = interface_table_get(&context->interfaces, interface_index);
-  if (!entry || !entry->enabled) return false;
-  const ipv6_address_t* local = ipv6_address_equal(&ip6->header.dst_addr, &entry->ip6_link_local) ? &entry->ip6_link_local : &entry->ip6_global;
-  icmpv6_echo_packet_data_t reply = {
-      .src_addr = *local,
-      .dst_addr = ip6->header.src_addr,
-      .identifier = echo->identifier,
-      .sequence_number = echo->sequence_number,
-      .data = data,
-      .data_length = (uint16_t)data_length,
-  };
-  memcpy(reply.src_mac_addr, entry->mac, sizeof(reply.src_mac_addr));
-  memcpy(reply.dst_mac_addr, frame->header.src_mac, sizeof(reply.dst_mac_addr));
-  FILE* destination = tmpfile();
-  if (!destination || !icmpv6_write_ethernet_echo_reply(destination, &reply)) {
-    if (destination) fclose(destination);
-    return false;
-  }
-  const bool appended = append_generated_frame_file(context, interface_index, destination);
-  fclose(destination);
-  return appended;
-}
-
-static const char* dynamic_routing_name(router_dynamic_routing_mode_t mode) {
-  switch (mode) {
-    case ROUTER_DYNAMIC_ROUTING_OFF:  return "off";
-    case ROUTER_DYNAMIC_ROUTING_RIP:  return "rip";
-    case ROUTER_DYNAMIC_ROUTING_OSPF: return "ospf";
-  }
-  return "off";
-}
 
 static const char* acl_action_name(router_acl_action_t action) {
   return action == ROUTER_ACL_ACTION_PERMIT ? "permit" : "deny";
@@ -446,100 +336,6 @@ static bool emit_icmp_error(router_context_t* context, const ethernet_frame_view
   return emit_routed_ipv4(context, offending->header.src_addr, ICMP_IPV4_PROTOCOL, payload, payload_length);
 }
 
-static bool write_rip_packet(router_context_t* context, size_t interface_index, uint8_t command, const rip_route_entry_t* entries, size_t entry_count) {
-  const interface_entry_t* entry = interface_table_get(&context->interfaces, interface_index);
-  if (!entry || !entry->enabled) return false;
-  uint8_t rip_bytes[sizeof(rip_header_t) + RIP_MAX_ENTRIES_PER_PACKET * sizeof(rip_route_entry_t)] = {0};
-  size_t rip_length = 0;
-  if (!rip_write_packet(command, entries, entry_count, rip_bytes, sizeof(rip_bytes), &rip_length)) return false;
-  udp_packet_data_t packet = {
-      .src_addr = entry->ip4,
-      .dst_addr = RIP_MULTICAST_ADDRESS,
-      .src_port = RIP_UDP_PORT,
-      .dst_port = RIP_UDP_PORT,
-      .data = rip_bytes,
-      .data_length = (uint16_t)rip_length,
-  };
-  memcpy(packet.src_mac_addr, entry->mac, sizeof(packet.src_mac_addr));
-  memcpy(packet.dst_mac_addr, rip_multicast_mac, sizeof(packet.dst_mac_addr));
-  return write_udp_on_interface(context, interface_index, &packet);
-}
-
-static bool write_rip_response(router_context_t* context, size_t interface_index) {
-  bool wrote = false;
-  size_t route_index = 0;
-  while (route_index < context->routes.count || !wrote) {
-    rip_route_entry_t entries[RIP_MAX_ENTRIES_PER_PACKET] = {0};
-    size_t entry_count = 0;
-    while (route_index < context->routes.count && entry_count < RIP_MAX_ENTRIES_PER_PACKET) {
-      const route_entry_t* route = &context->routes.entries[route_index++];
-      if (route->source == ROUTE_SOURCE_RIP && route->interface_index == interface_index) continue;
-      if (context->rip_outbound_prefix_lists[interface_index][0] && !prefix_list_permits(&context->prefix_lists, context->rip_outbound_prefix_lists[interface_index], route->destination, route->mask)) continue;
-      entries[entry_count++] = (rip_route_entry_t) {
-          .address_family = RIP_ADDRESS_FAMILY_IPV4,
-          .destination = route->destination,
-          .subnet_mask = route->mask,
-          .next_hop = 0,
-          .metric = route->metric == 0 ? RIP_METRIC_MIN : route->metric > RIP_METRIC_INFINITY ? RIP_METRIC_INFINITY
-                                                                                              : route->metric,
-      };
-    }
-    if (!write_rip_packet(context, interface_index, RIP_COMMAND_RESPONSE, entries, entry_count)) return false;
-    wrote = true;
-  }
-  return true;
-}
-
-static bool write_rip_updates(router_context_t* context) {
-  for (size_t i = 0; i < context->interfaces.count; ++i) {
-    if (!write_rip_response(context, i)) return false;
-  }
-  return true;
-}
-
-static bool write_rip_requests(router_context_t* context) {
-  for (size_t i = 0; i < context->interfaces.count; ++i) {
-    if (!write_rip_packet(context, i, RIP_COMMAND_REQUEST, NULL, 0)) return false;
-  }
-  return true;
-}
-
-static bool write_ospf_updates(router_context_t* context) {
-  ospf_router_link_t links[ROUTER_INTERFACE_CAPACITY] = {0};
-  for (size_t i = 0; i < context->interfaces.count; ++i) {
-    const interface_entry_t* entry = &context->interfaces.entries[i];
-    links[i] = (ospf_router_link_t) {
-        .network = entry->ip4 & entry->mask,
-        .mask = entry->mask,
-        .metric = 10,
-    };
-  }
-  uint8_t ospf_bytes[sizeof(ospf_header_t) + ROUTER_INTERFACE_CAPACITY * sizeof(ospf_router_link_t)] = {0};
-  size_t ospf_length = 0;
-  if (!ospf_write_router_update(context->interfaces.entries[0].ip4, links, context->interfaces.count, ospf_bytes, sizeof(ospf_bytes), &ospf_length)) return false;
-  for (size_t i = 0; i < context->interfaces.count; ++i) {
-    const interface_entry_t* entry = &context->interfaces.entries[i];
-    if (!entry->enabled) continue;
-    ipv4_packet_data_t packet = {
-        .src_addr = entry->ip4,
-        .dst_addr = OSPF_ALL_SPF_ROUTERS,
-        .protocol = OSPF_IPV4_PROTOCOL,
-        .data = ospf_bytes,
-        .data_length = (uint16_t)ospf_length,
-    };
-    memcpy(packet.src_mac_addr, entry->mac, sizeof(packet.src_mac_addr));
-    memcpy(packet.dst_mac_addr, ospf_multicast_mac, sizeof(packet.dst_mac_addr));
-    FILE* frame_file = tmpfile();
-    if (!frame_file || !ipv4_write_ethernet_packet(frame_file, &packet)) {
-      if (frame_file) fclose(frame_file);
-      return false;
-    }
-    const bool appended = append_generated_frame_file(context, i, frame_file);
-    fclose(frame_file);
-    if (!appended) return false;
-  }
-  return true;
-}
 
 static bool write_arp_request(router_context_t* context, size_t interface_index, ipv4_address_t target) {
   const interface_entry_t* entry = interface_table_get(&context->interfaces, interface_index);
@@ -727,22 +523,6 @@ static bool forward_ipv4(router_context_t* context, size_t interface_index, cons
   return append_frame(context, interface_index, &frame);
 }
 
-static bool router_socket_emit(void* argument, ipv4_address_t destination, uint8_t protocol, const uint8_t* payload, uint16_t payload_length) {
-  router_socket_emit_argument_t* emit = argument;
-  if (!emit || !emit->context || !payload || !payload_length) return false;
-  router_context_t* context = emit->context;
-  const route_entry_t* route = route_table_lookup(&context->routes, destination);
-  if (!route || route->interface_index != emit->interface_index) return false;
-  const interface_entry_t* entry = interface_table_get(&context->interfaces, route->interface_index);
-  if (!entry || !entry->enabled) return false;
-  const ipv4_address_t next_hop = route->next_hop ? route->next_hop : destination;
-  const arp_entry_t* neighbor = arp_table_find_const(&context->arp, route->interface_index, next_hop);
-  if (!neighbor) {
-    write_arp_request(context, route->interface_index, next_hop);
-    return false;
-  }
-  return emit_routed_ipv4(context, destination, protocol, payload, payload_length);
-}
 
 static bool queue_packet(router_context_t* context, size_t egress_interface, ipv4_address_t next_hop, const ipv4_packet_view_t* packet, const ipv4_packet_view_t* report_packet, bool report_next_hop_failure, size_t report_interface, uint32_t now) {
   for (size_t i = 0; i < ROUTER_PENDING_CAPACITY; ++i) {
@@ -819,7 +599,7 @@ static bool route_ipv4(router_context_t* context, size_t ingress_interface, cons
     return true;
   }
   const interface_entry_t* local = interface_table_find_ip4(&context->interfaces, packet->header.dst_addr);
-  if (local) return packet->header.protocol != SOCKET_PROTOCOL_TCP || socket_receive_ipv4(&context->sockets[ingress_interface], packet);
+  if (local) return true;
   const route_entry_t* route = route_table_lookup(&context->routes, packet->header.dst_addr);
   fputs("Router IPv4: src=", stdout);
   ipv4_address_print(stdout, packet->header.src_addr);
@@ -969,184 +749,6 @@ static bool handle_rarp(router_context_t* context, size_t ingress_interface, con
 }
 
 
-static bool handle_rip(router_context_t* context, size_t ingress_interface, const ipv4_packet_view_t* ipv4_packet) {
-  const interface_entry_t* ingress = interface_table_get(&context->interfaces, ingress_interface);
-  if (context->dynamic_routing != ROUTER_DYNAMIC_ROUTING_RIP || !ingress || ipv4_packet->header.src_addr == ingress->ip4 || ipv4_packet->header.protocol != UDP_IPV4_PROTOCOL || !rip_is_multicast_address(ipv4_packet->header.dst_addr)) return true;
-  udp_packet_view_t udp_packet = {0};
-  rip_packet_view_t rip_packet = {0};
-  if (!udp_parse_packet(ipv4_packet->payload, ipv4_packet->payload_length, ipv4_packet->header.src_addr, ipv4_packet->header.dst_addr, &udp_packet) || udp_packet.header.src_port != RIP_UDP_PORT || udp_packet.header.dst_port != RIP_UDP_PORT || !rip_parse_packet(udp_packet.data, udp_packet.data_length, &rip_packet)) return true;
-  if (rip_packet.header.command == RIP_COMMAND_REQUEST) {
-    return write_rip_response(context, ingress_interface);
-  }
-  const uint32_t expires_at = (uint32_t)time(NULL) + RIP_ROUTE_TIMEOUT_SECONDS;
-  for (size_t i = 0; i < rip_packet.entry_count; ++i) {
-    const rip_route_entry_t* advertised = &rip_packet.entries[i];
-    if (context->rip_inbound_prefix_lists[ingress_interface][0] && !prefix_list_permits(&context->prefix_lists, context->rip_inbound_prefix_lists[ingress_interface], advertised->destination, advertised->subnet_mask)) continue;
-    const uint32_t metric = advertised->metric == RIP_METRIC_INFINITY ? RIP_METRIC_INFINITY : advertised->metric + 1;
-    const ipv4_address_t next_hop = advertised->next_hop ? advertised->next_hop : ipv4_packet->header.src_addr;
-    if (!route_table_learn_rip(&context->routes, advertised->destination, advertised->subnet_mask, next_hop, ingress_interface, metric, expires_at)) return false;
-  }
-  fprintf(stdout, "Learned %zu RIP route%s on interface %zu.\n", rip_packet.entry_count, rip_packet.entry_count == 1 ? "" : "s", ingress_interface + 1);
-  return true;
-}
-
-static bool handle_ospf(router_context_t* context, size_t ingress_interface, const ipv4_packet_view_t* ipv4_packet) {
-  const interface_entry_t* ingress = interface_table_get(&context->interfaces, ingress_interface);
-  if (context->dynamic_routing != ROUTER_DYNAMIC_ROUTING_OSPF || !ingress || ipv4_packet->header.src_addr == ingress->ip4 || ipv4_packet->header.protocol != OSPF_IPV4_PROTOCOL || !ospf_is_all_spf_routers(ipv4_packet->header.dst_addr)) return true;
-  ospf_packet_view_t packet = {0};
-  if (!ospf_parse_router_update(ipv4_packet->payload, ipv4_packet->payload_length, &packet)) return true;
-  const uint32_t expires_at = (uint32_t)time(NULL) + OSPF_ROUTE_TIMEOUT_SECONDS;
-  for (size_t i = 0; i < packet.link_count; ++i) {
-    const ospf_router_link_t* link = &packet.links[i];
-    if (!route_table_learn_ospf(&context->routes, link->network, link->mask, ipv4_packet->header.src_addr, ingress_interface, link->metric, expires_at)) return false;
-  }
-  fprintf(stdout, "Learned %zu OSPF route%s from router ", packet.link_count, packet.link_count == 1 ? "" : "s");
-  ipv4_address_print(stdout, packet.header.router_id);
-  fputs(".\n", stdout);
-  return true;
-}
-
-static router_bgp_peer_t* find_bgp_peer(router_context_t* context, size_t interface_index, ipv4_address_t address) {
-  for (size_t i = 0; i < context->bgp_peer_count; ++i) {
-    router_bgp_peer_t* peer = &context->bgp_peers[i];
-    if (peer->interface_index == interface_index && peer->address == address) return peer;
-  }
-  return NULL;
-}
-
-static bool bgp_send_open(router_context_t* context, router_bgp_peer_t* peer) {
-  uint8_t bytes[sizeof(bgp_open_t)] = {0};
-  uint16_t length = 0;
-  const interface_entry_t* entry = interface_table_get(&context->interfaces, peer->interface_index);
-  if (!entry || !bgp_write_open(peer->local_as, entry->ip4, bytes, sizeof(bytes), &length) || !socket_send(&context->sockets[peer->interface_index], peer->socket, bytes, length)) return false;
-  peer->open_sent = true;
-  return true;
-}
-
-static bool bgp_send_keepalive(router_context_t* context, router_bgp_peer_t* peer, uint32_t now) {
-  uint8_t bytes[BGP_HEADER_LENGTH] = {0};
-  uint16_t length = 0;
-  if (!bgp_write_keepalive(bytes, sizeof(bytes), &length) || !socket_send(&context->sockets[peer->interface_index], peer->socket, bytes, length)) return false;
-  peer->last_keepalive = now;
-  return true;
-}
-
-static bool bgp_advertise_routes(router_context_t* context, router_bgp_peer_t* peer) {
-  const interface_entry_t* entry = interface_table_get(&context->interfaces, peer->interface_index);
-  if (!entry) return false;
-  for (size_t i = 0; i < context->routes.count; ++i) {
-    const route_entry_t* route = &context->routes.entries[i];
-    if (route->source != ROUTE_SOURCE_CONNECTED && route->source != ROUTE_SOURCE_STATIC) continue;
-    if (peer->outbound_prefix_list[0] && !prefix_list_permits(&context->prefix_lists, peer->outbound_prefix_list, route->destination, route->mask)) continue;
-    uint8_t bytes[BGP_MAX_MESSAGE_LENGTH] = {0};
-    uint16_t length = 0;
-    if (!bgp_write_update(route->destination, route->mask, entry->ip4, peer->local_as, bytes, sizeof(bytes), &length) || !socket_send(&context->sockets[peer->interface_index], peer->socket, bytes, length)) return false;
-  }
-  return true;
-}
-
-static bool bgp_receive_messages(router_context_t* context, router_bgp_peer_t* peer, uint32_t now) {
-  uint8_t bytes[SOCKET_RECEIVE_CAPACITY] = {0};
-  const size_t byte_count = socket_receive(&context->sockets[peer->interface_index], peer->socket, bytes, sizeof(bytes), NULL, NULL);
-  for (size_t offset = 0; offset < byte_count;) {
-    bgp_message_view_t message = {0};
-    if (!bgp_parse_message(bytes + offset, byte_count - offset, &message)) return false;
-    peer->last_received = now;
-    if (message.header.type == BGP_MESSAGE_OPEN) {
-      const bgp_open_t* open = (const bgp_open_t*)(bytes + offset);
-      if (open->autonomous_system != peer->remote_as || !open->hold_time) return false;
-      peer->open_received = true;
-      if (!peer->open_sent && !bgp_send_open(context, peer)) return false;
-      if (!bgp_send_keepalive(context, peer, now)) return false;
-    } else if (message.header.type == BGP_MESSAGE_KEEPALIVE) {
-      if (!peer->open_sent || !peer->open_received) return false;
-      if (!peer->established) {
-        peer->established = true;
-        fputs("BGP established with ", stdout);
-        ipv4_address_print(stdout, peer->address);
-        fputs(".\n", stdout);
-        if (!bgp_advertise_routes(context, peer)) return false;
-      }
-    } else if (message.header.type == BGP_MESSAGE_UPDATE) {
-      bgp_update_t update = {0};
-      if (!peer->established || !bgp_parse_update(&message, &update) || update.autonomous_system != peer->remote_as || update.next_hop != peer->address) return false;
-      if (peer->inbound_prefix_list[0] && !prefix_list_permits(&context->prefix_lists, peer->inbound_prefix_list, update.network, update.mask)) {
-        fputs("Rejected BGP route by prefix list.\n", stdout);
-      } else if (!route_table_learn_bgp(&context->routes, update.network, update.mask, peer->address, peer->interface_index, 0)) {
-        return false;
-      } else {
-        fputs("Learned BGP route ", stdout);
-        ipv4_address_print(stdout, update.network);
-        fputs("/", stdout);
-        ipv4_address_print(stdout, update.mask);
-        fputs(" from ", stdout);
-        ipv4_address_print(stdout, peer->address);
-        fputs(".\n", stdout);
-      }
-    } else {
-      return false;
-    }
-    offset += message.header.length;
-  }
-  return true;
-}
-
-static bool bgp_tick(router_context_t* context, uint32_t now) {
-  for (size_t interface_index = 0; interface_index < context->interfaces.count; ++interface_index) {
-    socket_context_t* sockets = &context->sockets[interface_index];
-    socket_handle_t listener = context->bgp_listeners[interface_index];
-    if (listener) {
-      socket_handle_t connection = SOCKET_INVALID_HANDLE;
-      while (socket_accept(sockets, listener, &connection)) {
-        const socket_entry_t* socket = socket_get(sockets, connection);
-        router_bgp_peer_t* peer = socket ? find_bgp_peer(context, interface_index, socket->remote_address) : NULL;
-        if (!peer || peer->active || peer->socket) {
-          socket_close(sockets, connection);
-        } else {
-          peer->socket = connection;
-          peer->last_received = now;
-        }
-      }
-    }
-  }
-  for (size_t i = 0; i < context->bgp_peer_count; ++i) {
-    router_bgp_peer_t* peer = &context->bgp_peers[i];
-    socket_context_t* sockets = &context->sockets[peer->interface_index];
-    const socket_entry_t* socket = peer->socket ? socket_get(sockets, peer->socket) : NULL;
-    if (socket && socket->state == SOCKET_STATE_CLOSE_WAIT) {
-      route_table_remove_bgp_peer(&context->routes, peer->address, peer->interface_index);
-      socket_close(sockets, peer->socket);
-      peer->socket = SOCKET_INVALID_HANDLE;
-      peer->open_sent = peer->open_received = peer->established = false;
-      socket = NULL;
-    }
-    if (peer->active && !socket && peer->last_attempt != now) {
-      peer->last_attempt = now;
-      if (socket_open(sockets, SOCKET_PROTOCOL_TCP, &peer->socket) && socket_connect(sockets, peer->socket, peer->address, BGP_TCP_PORT)) peer->last_received = now;
-      else {
-        if (peer->socket) socket_close(sockets, peer->socket);
-        peer->socket = SOCKET_INVALID_HANDLE;
-      }
-      socket = peer->socket ? socket_get(sockets, peer->socket) : NULL;
-    }
-    if (!socket) continue;
-    if (socket->state == SOCKET_STATE_ESTABLISHED) {
-      if (!peer->open_sent && !bgp_send_open(context, peer)) return false;
-      if (!bgp_receive_messages(context, peer, now)) return false;
-      if (peer->established && now - peer->last_keepalive >= BGP_KEEPALIVE_SECONDS && !bgp_send_keepalive(context, peer, now)) return false;
-      if (peer->last_received && now - peer->last_received >= BGP_HOLD_TIME_SECONDS) {
-        route_table_remove_bgp_peer(&context->routes, peer->address, peer->interface_index);
-        socket_close(sockets, peer->socket);
-        peer->socket = SOCKET_INVALID_HANDLE;
-        peer->open_sent = peer->open_received = peer->established = false;
-      }
-    }
-  }
-  for (size_t i = 0; i < context->interfaces.count; ++i) {
-    if (!socket_tick(&context->sockets[i], now)) return false;
-  }
-  return true;
-}
 
 static bool handle_ethernet(router_context_t* context, size_t port_index, const uint8_t* bytes, size_t byte_count) {
   ethernet_frame_view_t frame = {0};
@@ -1164,16 +766,11 @@ static bool handle_ethernet(router_context_t* context, size_t port_index, const 
   fputc('\n', stdout);
   const bool destination_is_interface = memcmp(frame.header.dst_mac, entry->mac, sizeof(entry->mac)) == 0;
   const bool destination_is_broadcast = ethernet_mac_is_broadcast(frame.header.dst_mac);
-  const bool destination_is_rip_multicast = memcmp(frame.header.dst_mac, rip_multicast_mac, sizeof(rip_multicast_mac)) == 0;
-  const bool destination_is_ospf_multicast = memcmp(frame.header.dst_mac, ospf_multicast_mac, sizeof(ospf_multicast_mac)) == 0;
   if (frame.header.type_or_length == ETHERNET_ETHERTYPE_ARP && (destination_is_interface || destination_is_broadcast)) return handle_arp(context, ingress_interface, &frame);
   if (frame.header.type_or_length == ETHERNET_ETHERTYPE_RARP && (destination_is_interface || destination_is_broadcast)) return handle_rarp(context, ingress_interface, &frame);
-  if (frame.header.type_or_length != ETHERNET_ETHERTYPE_IPV4 || (!destination_is_interface && !destination_is_broadcast && !destination_is_rip_multicast && !destination_is_ospf_multicast)) return true;
+  if (frame.header.type_or_length != ETHERNET_ETHERTYPE_IPV4 || (!destination_is_interface && !destination_is_broadcast)) return true;
   ipv4_packet_view_t packet = {0};
   if (!ipv4_parse_packet(frame.data, frame.client_data_length, &packet)) return true;
-
-  if (destination_is_rip_multicast) return handle_rip(context, ingress_interface, &packet);
-  if (destination_is_ospf_multicast) return handle_ospf(context, ingress_interface, &packet);
   bool handled = false;
   if (!handle_dhcp_relay(context, ingress_interface, &frame, &packet, &handled)) return false;
   if (handled) return true;
@@ -1240,7 +837,6 @@ static bool assign_interface_ports(router_context_t* context) {
 
 static void print_info(router_context_t* context) {
   mutex_lock(&context->mutex);
-  fprintf(stdout, "Dynamic routing: %s\n", dynamic_routing_name(context->dynamic_routing));
   fprintf(stdout, "Interfaces (%zu):\n", context->interfaces.count);
   for (size_t i = 0; i < context->interfaces.count; ++i) {
     const interface_entry_t* entry = &context->interfaces.entries[i];
@@ -1268,34 +864,6 @@ static void print_info(router_context_t* context) {
     else
       fputs("direct", stdout);
     fprintf(stdout, " dev %zu metric %u %s\n", route->interface_index + 1, route->metric, route_source_name(route->source));
-  }
-  fprintf(stdout, "BGP peers (%zu):\n", context->bgp_peer_count);
-  for (size_t i = 0; i < context->bgp_peer_count; ++i) {
-    const router_bgp_peer_t* peer = &context->bgp_peers[i];
-    fputs("  ", stdout);
-    ipv4_address_print(stdout, peer->address);
-    fprintf(stdout, "  dev %zu  AS %u -> %u  %s  %s  in=%s out=%s\n", peer->interface_index + 1, peer->local_as, peer->remote_as, peer->active ? "active" : "passive", peer->established ? "established" : "idle", peer->inbound_prefix_list[0] ? peer->inbound_prefix_list : "none", peer->outbound_prefix_list[0] ? peer->outbound_prefix_list : "none");
-  }
-  fprintf(stdout, "RIP prefix lists:\n");
-  for (size_t i = 0; i < context->interfaces.count; ++i) {
-    fprintf(stdout, "  dev %zu  in=%s out=%s\n", i + 1, context->rip_inbound_prefix_lists[i][0] ? context->rip_inbound_prefix_lists[i] : "none", context->rip_outbound_prefix_lists[i][0] ? context->rip_outbound_prefix_lists[i] : "none");
-  }
-  fprintf(stdout, "DHCP relay:\n");
-  for (size_t i = 0; i < context->interfaces.count; ++i) {
-    fprintf(stdout, "  dev %zu  server=", i + 1);
-    if (context->dhcp_relay_servers[i]) ipv4_address_print(stdout, context->dhcp_relay_servers[i]);
-    else
-      fputs("none", stdout);
-    fputc('\n', stdout);
-  }
-  fprintf(stdout, "Prefix-list rules (%zu):\n", context->prefix_lists.count);
-  for (size_t i = 0; i < context->prefix_lists.count; ++i) {
-    const prefix_list_rule_t* rule = &context->prefix_lists.entries[i];
-    fprintf(stdout, "  %-31s %u %s ", rule->name, rule->sequence, prefix_list_action_name(rule->action));
-    ipv4_address_print(stdout, rule->network);
-    fputs("/", stdout);
-    ipv4_address_print(stdout, rule->mask);
-    fprintf(stdout, " ge %u le %u\n", rule->minimum_length, rule->maximum_length);
   }
   fprintf(stdout, "ARP neighbors (%zu):\n", context->arp.count);
   for (size_t i = 0; i < context->arp.count; ++i) {
@@ -1511,138 +1079,6 @@ static void command_acl(void* argument, char* arguments) {
   fputs(rule ? "ACL rule added.\n" : "ACL table is full.\n", rule ? stdout : stderr);
 }
 
-static void command_dynamic_routing(void* argument, char* arguments) {
-  router_context_t* context = argument;
-  char* mode_text = cmd_app_next_argument(&arguments);
-  if (!mode_text || cmd_app_next_argument(&arguments) || (strcmpi(mode_text, "off") != 0 && strcmpi(mode_text, "rip") != 0 && strcmpi(mode_text, "ospf") != 0)) {
-    fputs("Usage: dynamic-routing <off|rip|ospf>\n", stderr);
-    return;
-  }
-  const router_dynamic_routing_mode_t mode = strcmpi(mode_text, "rip") == 0 ? ROUTER_DYNAMIC_ROUTING_RIP : strcmpi(mode_text, "ospf") == 0 ? ROUTER_DYNAMIC_ROUTING_OSPF
-                                                                                                                                           : ROUTER_DYNAMIC_ROUTING_OFF;
-  mutex_lock(&context->mutex);
-  route_table_remove_rip(&context->routes);
-  route_table_remove_ospf(&context->routes);
-  context->dynamic_routing = mode;
-  const uint32_t now = (uint32_t)time(NULL);
-  bool started = true;
-  if (mode == ROUTER_DYNAMIC_ROUTING_RIP) {
-    context->next_rip_update = now + RIP_UPDATE_INTERVAL_SECONDS;
-    started = write_rip_requests(context) && write_rip_updates(context);
-  } else if (mode == ROUTER_DYNAMIC_ROUTING_OSPF) {
-    context->next_ospf_update = now + OSPF_UPDATE_INTERVAL_SECONDS;
-    started = write_ospf_updates(context);
-  }
-  mutex_unlock(&context->mutex);
-  if (!started) {
-    fputs("Could not start selected dynamic routing protocol.\n", stderr);
-    return;
-  }
-  fprintf(stdout, "Dynamic routing: %s.\n", dynamic_routing_name(mode));
-}
-
-static void command_prefix_list(void* argument, char* arguments) {
-  router_context_t* context = argument;
-  char* cursor = arguments;
-  char* action = cmd_app_next_argument(&cursor);
-  char* name = cmd_app_next_argument(&cursor);
-  char* sequence_text = cmd_app_next_argument(&cursor);
-  uint16_t sequence = 0;
-  if (!action || !name || !sequence_text || !cmd_app_parse_uint16(sequence_text, &sequence)) {
-    fputs("Usage: prefix-list <add|delete> <name> <sequence> [permit|deny <network> <mask> <ge> <le>]\n", stderr);
-    return;
-  }
-  if (strcmpi(action, "delete") == 0 && !cmd_app_next_argument(&cursor)) {
-    mutex_lock(&context->mutex);
-    const bool removed = prefix_list_remove(&context->prefix_lists, name, sequence);
-    mutex_unlock(&context->mutex);
-    fputs(removed ? "Prefix-list rule removed.\n" : "No such prefix-list rule.\n", removed ? stdout : stderr);
-    return;
-  }
-  char* decision = cmd_app_next_argument(&cursor);
-  char* network_text = cmd_app_next_argument(&cursor);
-  char* mask_text = cmd_app_next_argument(&cursor);
-  char* minimum_text = cmd_app_next_argument(&cursor);
-  char* maximum_text = cmd_app_next_argument(&cursor);
-  ipv4_address_t network = 0;
-  ipv4_address_t mask = 0;
-  uint16_t minimum = 0;
-  uint16_t maximum = 0;
-  if (strcmpi(action, "add") != 0 || !decision || !network_text || !mask_text || !minimum_text || !maximum_text || cmd_app_next_argument(&cursor) || (strcmpi(decision, "permit") != 0 && strcmpi(decision, "deny") != 0) || !ipv4_parse_address(network_text, &network) || !ipv4_parse_address(mask_text, &mask) || !cmd_app_parse_uint16(minimum_text, &minimum) || !cmd_app_parse_uint16(maximum_text, &maximum) || minimum > 32 || maximum > 32) {
-    fputs("Usage: prefix-list <add|delete> <name> <sequence> [permit|deny <network> <mask> <ge> <le>]\n", stderr);
-    return;
-  }
-  mutex_lock(&context->mutex);
-  const bool added = prefix_list_add(&context->prefix_lists, name, sequence, strcmpi(decision, "permit") == 0 ? PREFIX_LIST_PERMIT : PREFIX_LIST_DENY, network, mask, (uint8_t)minimum, (uint8_t)maximum);
-  mutex_unlock(&context->mutex);
-  fputs(added ? "Prefix-list rule added.\n" : "Could not add prefix-list rule.\n", added ? stdout : stderr);
-}
-
-static void command_bgp_prefix_list(void* argument, char* arguments) {
-  router_context_t* context = argument;
-  char* cursor = arguments;
-  char* peer_text = cmd_app_next_argument(&cursor);
-  char* direction = cmd_app_next_argument(&cursor);
-  char* name = cmd_app_next_argument(&cursor);
-  uint16_t peer_number = 0;
-  if (!peer_text || !direction || !name || cmd_app_next_argument(&cursor) || !cmd_app_parse_uint16(peer_text, &peer_number) || peer_number == 0 || peer_number > context->bgp_peer_count || (strcmpi(direction, "in") != 0 && strcmpi(direction, "out") != 0) || (strcmpi(name, "none") != 0 && strlen(name) >= PREFIX_LIST_NAME_LEN)) {
-    fputs("Usage: bgp-prefix-list <peer> <in|out> <name|none>\n", stderr);
-    return;
-  }
-  mutex_lock(&context->mutex);
-  char* assigned = strcmpi(direction, "in") == 0 ? context->bgp_peers[peer_number - 1].inbound_prefix_list : context->bgp_peers[peer_number - 1].outbound_prefix_list;
-  if (strcmpi(name, "none") != 0) {
-    bool exists = false;
-    for (size_t i = 0; i < context->prefix_lists.count; ++i) {
-      if (strcmpi(context->prefix_lists.entries[i].name, name) == 0) {
-        exists = true;
-        break;
-      }
-    }
-    if (!exists) {
-      mutex_unlock(&context->mutex);
-      fputs("No such prefix list.\n", stderr);
-      return;
-    }
-  }
-  assigned[0] = '\0';
-  if (strcmpi(name, "none") != 0) strncpy(assigned, name, PREFIX_LIST_NAME_LEN - 1);
-  mutex_unlock(&context->mutex);
-  fputs("BGP prefix list assigned.\n", stdout);
-}
-
-static void command_rip_prefix_list(void* argument, char* arguments) {
-  router_context_t* context = argument;
-  char* cursor = arguments;
-  char* interface_text = cmd_app_next_argument(&cursor);
-  char* direction = cmd_app_next_argument(&cursor);
-  char* name = cmd_app_next_argument(&cursor);
-  uint16_t interface_number = 0;
-  if (!interface_text || !direction || !name || cmd_app_next_argument(&cursor) || !cmd_app_parse_uint16(interface_text, &interface_number) || interface_number == 0 || interface_number > context->interfaces.count || (strcmpi(direction, "in") != 0 && strcmpi(direction, "out") != 0) || (strcmpi(name, "none") != 0 && strlen(name) >= PREFIX_LIST_NAME_LEN)) {
-    fputs("Usage: rip-prefix-list <interface> <in|out> <name|none>\n", stderr);
-    return;
-  }
-  mutex_lock(&context->mutex);
-  if (strcmpi(name, "none") != 0) {
-    bool exists = false;
-    for (size_t i = 0; i < context->prefix_lists.count; ++i) {
-      if (strcmpi(context->prefix_lists.entries[i].name, name) == 0) {
-        exists = true;
-        break;
-      }
-    }
-    if (!exists) {
-      mutex_unlock(&context->mutex);
-      fputs("No such prefix list.\n", stderr);
-      return;
-    }
-  }
-  char* assigned = strcmpi(direction, "in") == 0 ? context->rip_inbound_prefix_lists[interface_number - 1] : context->rip_outbound_prefix_lists[interface_number - 1];
-  assigned[0] = '\0';
-  if (strcmpi(name, "none") != 0) strncpy(assigned, name, PREFIX_LIST_NAME_LEN - 1);
-  mutex_unlock(&context->mutex);
-  fputs("RIP prefix list assigned.\n", stdout);
-}
 
 static void command_route(void* argument, char* arguments) {
   router_context_t* context = argument;
@@ -1815,11 +1251,6 @@ static bool parse_options(router_context_t* context, int argc, char** argv) {
       uint32_t metric = 0;
       if (!ipv4_parse_address(argv[i + 1], &network) || !ipv4_parse_address(argv[i + 2], &mask) || (strcmpi(argv[i + 3], "direct") != 0 && !ipv4_parse_address(argv[i + 3], &next_hop)) || !cmd_app_parse_uint16(argv[i + 4], &interface_number) || interface_number == 0 || interface_number > context->interfaces.count || !cmd_app_parse_uint32(argv[i + 5], &metric) || !route_table_add(&context->routes, network, mask, next_hop, interface_number - 1, metric)) return false;
       i += 6;
-    } else if (strcmpi(argv[i], "-dynamic-routing") == 0) {
-      if (i + 1 >= argc || (strcmpi(argv[i + 1], "off") != 0 && strcmpi(argv[i + 1], "rip") != 0 && strcmpi(argv[i + 1], "ospf") != 0)) return false;
-      context->dynamic_routing = strcmpi(argv[i + 1], "rip") == 0 ? ROUTER_DYNAMIC_ROUTING_RIP : strcmpi(argv[i + 1], "ospf") == 0 ? ROUTER_DYNAMIC_ROUTING_OSPF
-                                                                                                                                   : ROUTER_DYNAMIC_ROUTING_OFF;
-      i += 2;
     } else if (strcmpi(argv[i], "-dhcp-relay") == 0) {
       uint16_t interface_number = 0;
       ipv4_address_t server_address = 0;
@@ -1856,21 +1287,6 @@ static bool parse_options(router_context_t* context, int argc, char** argv) {
       const uint8_t protocol = i + 1 < argc && strcmpi(argv[i + 1], "udp") == 0 ? UDP_IPV4_PROTOCOL : i + 1 < argc && strcmpi(argv[i + 1], "tcp") == 0 ? TCP_IPV4_PROTOCOL : 0;
       if (i + 5 >= argc || !context->nat_enabled || !protocol || !ipv4_parse_address(argv[i + 2], &inside_address) || !cmd_app_parse_uint16(argv[i + 3], &inside_port) || !ipv4_parse_address(argv[i + 4], &outside_address) || !cmd_app_parse_uint16(argv[i + 5], &outside_port) || !nat_table_add_static_pat(&context->nat, protocol, inside_address, inside_port, outside_address, outside_port)) return false;
       i += 6;
-    } else if (strcmpi(argv[i], "-bgp") == 0) {
-      if (i + 5 >= argc || context->bgp_peer_count == ROUTER_BGP_PEER_CAPACITY) return false;
-      uint16_t interface_number = 0;
-      uint16_t local_as = 0;
-      uint16_t remote_as = 0;
-      ipv4_address_t address = 0;
-      if ((strcmpi(argv[i + 1], "active") != 0 && strcmpi(argv[i + 1], "passive") != 0) || !cmd_app_parse_uint16(argv[i + 2], &interface_number) || interface_number == 0 || interface_number > context->interfaces.count || !ipv4_parse_address(argv[i + 3], &address) || !cmd_app_parse_uint16(argv[i + 4], &local_as) || !cmd_app_parse_uint16(argv[i + 5], &remote_as) || !local_as || !remote_as || local_as == remote_as || find_bgp_peer(context, interface_number - 1, address)) return false;
-      context->bgp_peers[context->bgp_peer_count++] = (router_bgp_peer_t) {
-          .address = address,
-          .local_as = local_as,
-          .remote_as = remote_as,
-          .interface_index = interface_number - 1,
-          .active = strcmpi(argv[i + 1], "active") == 0,
-      };
-      i += 6;
     } else if (strcmpi(argv[i], "-rarp") == 0) {
       if (i + 2 >= argc || context->rarp.count == ROUTER_RARP_CAPACITY) return false;
       mac_address_t mac = {0};
@@ -1896,14 +1312,13 @@ int main(int argc, char** argv) {
   route_table_init(&context.routes, context.route_entries, ROUTER_ROUTE_CAPACITY);
   arp_table_init(&context.arp, context.arp_entries, ROUTER_ARP_CAPACITY);
   rarp_table_init(&context.rarp, context.rarp_entries, ROUTER_RARP_CAPACITY);
-  prefix_list_init(&context.prefix_lists, context.prefix_list_entries, ROUTER_PREFIX_LIST_CAPACITY);
   nat_table_init(&context.nat, context.nat_entries, ROUTER_NAT_CAPACITY, context.nat_pool, ROUTER_NAT_POOL_CAPACITY, NAT_EPHEMERAL_PORT_MIN);
   for (size_t i = 0; i < ROUTER_INTERFACE_CAPACITY; ++i) {
     context.acl_defaults[i][ROUTER_ACL_DIRECTION_INGRESS] = ROUTER_ACL_ACTION_PERMIT;
     context.acl_defaults[i][ROUTER_ACL_DIRECTION_EGRESS] = ROUTER_ACL_ACTION_PERMIT;
   }
   if (!parse_options(&context, argc, argv)) {
-    fputs("Usage: router -i <file> <mac-address> <ip-address> <mask> [... ] [-subif <parent-interface> <vlan-id> <ip-address> <mask> ...] [-acl-default <interface> <in|out> <permit|deny> ...] [-acl <interface> <in|out> <sequence> <permit|deny> <src-network> <src-mask> <dst-network> <dst-mask> <protocol|any> <src-port|any> <dst-port|any> ...] [-r <network> <mask> <next-hop|direct> <interface> <metric> [...]] [-bgp <active|passive> <interface> <peer-ip> <local-as> <peer-as> [...]] [-rarp <client-mac> <ip-address> [...]] [-dynamic-routing <off|rip|ospf>] [-dhcp-relay <interface> <server-ip> ...] [-nat <inside-interface> <outside-interface>] [-dynamic-nat <outside-address> ...] [-dynamic-pat] [-static-nat <inside-address> <outside-address> ...] [-static-pat <tcp|udp> <inside-address> <inside-port> <outside-address> <outside-port> ...]\n", stderr);
+    fputs("Usage: router -i <file> <mac-address> <ip-address> <mask> [... ] [-subif <parent-interface> <vlan-id> <ip-address> <mask> ...] [-acl-default <interface> <in|out> <permit|deny> ...] [-acl <interface> <in|out> <sequence> <permit|deny> <src-network> <src-mask> <dst-network> <dst-mask> <protocol|any> <src-port|any> <dst-port|any> ...] [-r <network> <mask> <next-hop|direct> <interface> <metric> [...]] [-rarp <client-mac> <ip-address> [...]] [-dhcp-relay <interface> <server-ip> ...] [-nat <inside-interface> <outside-interface>] [-dynamic-nat <outside-address> ...] [-dynamic-pat] [-static-nat <inside-address> <outside-address> ...] [-static-pat <tcp|udp> <inside-address> <inside-port> <outside-address> <outside-port> ...]\n", stderr);
     return EXIT_FAILURE;
   }
   if (!mutex_init(&context.mutex)) {
@@ -1933,41 +1348,13 @@ int main(int argc, char** argv) {
       goto cleanup;
     }
   }
-  for (size_t i = 0; i < context.interfaces.count; ++i) {
-    context.socket_arguments[i] = (router_socket_emit_argument_t) {.context = &context, .interface_index = i};
-    if (!socket_context_init(&context.sockets[i], context.interfaces.entries[i].ip4, router_socket_emit, &context.socket_arguments[i])) {
-      fputs("Could not initialize router socket context.\n", stderr);
-      status = EXIT_FAILURE;
-      goto cleanup;
-    }
-  }
-  for (size_t i = 0; i < context.bgp_peer_count; ++i) {
-    const router_bgp_peer_t* peer = &context.bgp_peers[i];
-    socket_handle_t* listener = &context.bgp_listeners[peer->interface_index];
-    if (!peer->active && !*listener && (!socket_open(&context.sockets[peer->interface_index], SOCKET_PROTOCOL_TCP, listener) || !socket_bind(&context.sockets[peer->interface_index], *listener, BGP_TCP_PORT) || !socket_listen(&context.sockets[peer->interface_index], *listener))) {
-      fputs("Could not listen for BGP peers.\n", stderr);
-      status = EXIT_FAILURE;
-      goto cleanup;
-    }
-  }
   cmd_app_init(&context.commands);
-  if (!cmd_app_register(&context.commands, "info", "Show router state, including dynamic route sources.", command_info, &context) || !cmd_app_register(&context.commands, "arp", "Resolve an IPv4 neighbor on one interface.", command_arp, &context) || !cmd_app_register(&context.commands, "arp-delete", "Remove one learned ARP neighbor.", command_arp_delete, &context) || !cmd_app_register(&context.commands, "interface", "Administratively bring an interface up or down.", command_interface, &context) || !cmd_app_register(&context.commands, "acl", "Show or update per-interface ACL rules and defaults.", command_acl, &context) || !cmd_app_register(&context.commands, "dynamic-routing", "Select off, RIP v2, or OSPF dynamic routing.", command_dynamic_routing, &context) || !cmd_app_register(&context.commands, "dhcp-relay", "Assign or clear a DHCP relay server per ingress interface.", command_dhcp_relay, &context) || !cmd_app_register(&context.commands, "prefix-list", "Add or delete a named IPv4 prefix-list rule.", command_prefix_list, &context) || !cmd_app_register(&context.commands, "bgp-prefix-list", "Assign or clear a BGP peer prefix list.", command_bgp_prefix_list, &context) || !cmd_app_register(&context.commands, "rip-prefix-list", "Assign or clear a RIP interface prefix list.", command_rip_prefix_list, &context) || !cmd_app_register(&context.commands, "route", "Add or delete a route in the forwarding table.", command_route, &context) || !cmd_app_register(&context.commands, "rarp-table", "Set or delete a static RARP assignment.", command_rarp_table, &context) || !cmd_app_start(&context.commands)) {
+  if (!cmd_app_register(&context.commands, "info", "Show router state, interfaces, static routes, policies, and tables.", command_info, &context) || !cmd_app_register(&context.commands, "arp", "Resolve an IPv4 neighbor on one interface.", command_arp, &context) || !cmd_app_register(&context.commands, "arp-delete", "Remove one learned ARP neighbor.", command_arp_delete, &context) || !cmd_app_register(&context.commands, "interface", "Administratively bring an interface up or down.", command_interface, &context) || !cmd_app_register(&context.commands, "acl", "Show or update per-interface ACL rules and defaults.", command_acl, &context) || !cmd_app_register(&context.commands, "dhcp-relay", "Assign or clear a DHCP relay server per ingress interface.", command_dhcp_relay, &context) || !cmd_app_register(&context.commands, "route", "Add or delete a static route in the forwarding table.", command_route, &context) || !cmd_app_register(&context.commands, "rarp-table", "Set or delete a static RARP assignment.", command_rarp_table, &context) || !cmd_app_start(&context.commands)) {
     fputs("Could not start the command application.\n", stderr);
     status = EXIT_FAILURE;
     goto cleanup;
   }
   commands_started = true;
-  if (context.dynamic_routing != ROUTER_DYNAMIC_ROUTING_OFF) {
-    const uint32_t now = (uint32_t)time(NULL);
-    mutex_lock(&context.mutex);
-    const bool started = context.dynamic_routing == ROUTER_DYNAMIC_ROUTING_RIP ? (context.next_rip_update = now + RIP_UPDATE_INTERVAL_SECONDS, write_rip_requests(&context) && write_rip_updates(&context)) : (context.next_ospf_update = now + OSPF_UPDATE_INTERVAL_SECONDS, write_ospf_updates(&context));
-    mutex_unlock(&context.mutex);
-    if (!started) {
-      fputs("Could not start selected dynamic routing protocol.\n", stderr);
-      status = EXIT_FAILURE;
-      goto cleanup;
-    }
-  }
 
   while (cmd_app_is_running(&context.commands)) {
     long ends[ROUTER_INTERFACE_CAPACITY] = {0};
@@ -1980,31 +1367,6 @@ int main(int argc, char** argv) {
       }
     }
     mutex_lock(&context.mutex);
-    if (context.dynamic_routing == ROUTER_DYNAMIC_ROUTING_RIP) {
-      const uint32_t now = (uint32_t)time(NULL);
-      route_table_expire_rip(&context.routes, now);
-      if (now >= context.next_rip_update) {
-        if (!write_rip_updates(&context)) {
-          mutex_unlock(&context.mutex);
-          fputs("Could not send RIP routing update.\n", stderr);
-          status = EXIT_FAILURE;
-          goto cleanup;
-        }
-        context.next_rip_update = now + RIP_UPDATE_INTERVAL_SECONDS;
-      }
-    } else if (context.dynamic_routing == ROUTER_DYNAMIC_ROUTING_OSPF) {
-      const uint32_t now = (uint32_t)time(NULL);
-      route_table_expire_ospf(&context.routes, now);
-      if (now >= context.next_ospf_update) {
-        if (!write_ospf_updates(&context)) {
-          mutex_unlock(&context.mutex);
-          fputs("Could not send OSPF routing update.\n", stderr);
-          status = EXIT_FAILURE;
-          goto cleanup;
-        }
-        context.next_ospf_update = now + OSPF_UPDATE_INTERVAL_SECONDS;
-      }
-    }
     if (!service_pending(&context, (uint32_t)time(NULL))) {
       mutex_unlock(&context.mutex);
       fputs("Could not advance pending next-hop resolution.\n", stderr);
@@ -2034,12 +1396,6 @@ int main(int argc, char** argv) {
         goto cleanup;
       }
       clearerr(port->source);
-    }
-    if (!bgp_tick(&context, (uint32_t)time(NULL))) {
-      mutex_unlock(&context.mutex);
-      fputs("Could not advance BGP sessions.\n", stderr);
-      status = EXIT_FAILURE;
-      goto cleanup;
     }
     for (size_t i = 0; i < context.port_count; ++i) {
       router_port_t* port = &context.ports[i];

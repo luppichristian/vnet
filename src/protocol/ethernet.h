@@ -96,7 +96,6 @@ void ethernet_mac_print(FILE* destination, const mac_address_t mac);
 #define ETHERNET_ETHERTYPE_IPV4 0x0800
 #define ETHERNET_ETHERTYPE_ARP  0x0806
 #define ETHERNET_ETHERTYPE_RARP 0x8035
-#define ETHERNET_ETHERTYPE_IPV6 0x86DD
 
 /* IEEE 802.1Q inserts this tag protocol identifier before the encapsulated EtherType/length. */
 #define ETHERNET_ETHERTYPE_VLAN 0x8100

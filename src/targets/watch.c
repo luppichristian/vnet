@@ -197,8 +197,6 @@ static bool print_ethernet_frame(const uint8_t* bytes, size_t byte_count) {
       ether_type_name = "ARP";
     else if (frame.type_or_length == ETHERNET_ETHERTYPE_RARP)
       ether_type_name = "RARP";
-    else if (frame.type_or_length == ETHERNET_ETHERTYPE_IPV6)
-      ether_type_name = "IPv6";
     fprintf(stdout, "    EtherType:       0x%04X (%s)\n", frame.type_or_length, ether_type_name);
     fprintf(stdout, "    Data field:      %u bytes (may include padding)\n", frame.data_length);
   }

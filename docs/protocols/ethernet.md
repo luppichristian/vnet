@@ -15,11 +15,11 @@ Ethernet is VNet's Layer-2 envelope. It makes local delivery visible: an endpoin
 | 5 | Data/padding | client payload is padded to Ethernet's 46-octet minimum |
 | 6 | FCS | CRC validates the MAC frame |
 
-The implementation in `src/protocol/ethernet.{h,c}` serializes a complete frame and parses/validates it back into an `ethernet_frame_view_t`. It supports IPv4 (`0x0800`), ARP (`0x0806`), RARP (`0x8035`), IPv6 (`0x86DD`), and VLAN (`0x8100`).
+The implementation in `src/protocol/ethernet.{h,c}` serializes a complete frame and parses/validates it back into an `ethernet_frame_view_t`. It supports IPv4 (`0x0800`), ARP (`0x0806`), RARP (`0x8035`), and VLAN (`0x8100`).
 
 ## Why it is implemented
 
-IP addresses alone do not put packets on a LAN. Ethernet exposes the distinction between an IP end destination and an on-link next hop, enables ARP/NDP experiments, and gives the switch a concrete forwarding key.
+IP addresses alone do not put packets on a LAN. Ethernet exposes the distinction between an IP end destination and an on-link next hop, enables ARP experiments, and gives the switch a concrete forwarding key.
 
 ## Real world and model
 
