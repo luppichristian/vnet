@@ -74,6 +74,10 @@ bool socket_open(socket_context_t* context, socket_protocol_t protocol, socket_h
       entry->active = true;
       entry->protocol = protocol;
       entry->state = SOCKET_STATE_OPEN;
+      if (protocol == SOCKET_PROTOCOL_TCP) {
+        entry->congestion_window = SOCKET_TCP_INITIAL_CWND;
+        entry->slow_start_threshold = SOCKET_RECEIVE_CAPACITY;
+      }
       *handle = (socket_handle_t)(i + 1);
       return true;
     }
@@ -142,6 +146,7 @@ size_t socket_receive(socket_context_t* context, socket_handle_t handle, void* b
   memcpy(buffer, entry->receive_buffer, count);
   memmove(entry->receive_buffer, entry->receive_buffer + count, entry->receive_length - count);
   entry->receive_length -= (uint16_t)count;
+  if (entry->protocol == SOCKET_PROTOCOL_TCP) (void)socket_tcp_send_window_update(context, handle);
   if (source_address) *source_address = entry->received_address;
   if (source_port) *source_port = entry->received_port;
   return count;

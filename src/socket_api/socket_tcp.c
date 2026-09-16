@@ -43,6 +43,29 @@ static uint16_t tcp_receive_window(const socket_entry_t* entry) {
   return (uint16_t)(SOCKET_RECEIVE_CAPACITY - entry->receive_length);
 }
 
+static uint16_t tcp_send_allowance(const socket_entry_t* entry) {
+  return entry->send_window < entry->congestion_window ? entry->send_window : entry->congestion_window;
+}
+
+static void tcp_congestion_acknowledged(socket_entry_t* entry) {
+  if (entry->congestion_window < entry->slow_start_threshold) {
+    const uint32_t grown = (uint32_t)entry->congestion_window + SOCKET_TCP_INITIAL_CWND;
+    entry->congestion_window = grown < SOCKET_RECEIVE_CAPACITY ? (uint16_t)grown : SOCKET_RECEIVE_CAPACITY;
+    return;
+  }
+  if (entry->congestion_window < SOCKET_RECEIVE_CAPACITY) {
+    const uint16_t increase = (uint16_t)(SOCKET_TCP_INITIAL_CWND * SOCKET_TCP_INITIAL_CWND / entry->congestion_window);
+    const uint32_t grown = (uint32_t)entry->congestion_window + (increase ? increase : 1);
+    entry->congestion_window = grown < SOCKET_RECEIVE_CAPACITY ? (uint16_t)grown : SOCKET_RECEIVE_CAPACITY;
+  }
+}
+
+static void tcp_congestion_lost(socket_entry_t* entry) {
+  const uint16_t halved = (uint16_t)(entry->congestion_window / 2);
+  entry->slow_start_threshold = halved > SOCKET_TCP_INITIAL_CWND ? halved : SOCKET_TCP_INITIAL_CWND;
+  entry->congestion_window = SOCKET_TCP_INITIAL_CWND;
+}
+
 static uint16_t tcp_segment_span(uint16_t flags, uint16_t data_length) {
   return (uint16_t)(data_length + ((flags & TCP_FLAG_SYN) != 0) + ((flags & TCP_FLAG_FIN) != 0));
 }
@@ -104,6 +127,8 @@ static socket_entry_t* tcp_allocate(socket_context_t* context, socket_handle_t* 
       context->entries[i].active = true;
       context->entries[i].protocol = SOCKET_PROTOCOL_TCP;
       context->entries[i].send_window = SOCKET_RECEIVE_CAPACITY;
+      context->entries[i].congestion_window = SOCKET_TCP_INITIAL_CWND;
+      context->entries[i].slow_start_threshold = SOCKET_RECEIVE_CAPACITY;
       if (handle) *handle = (socket_handle_t)(i + 1);
       return &context->entries[i];
     }
@@ -148,8 +173,11 @@ static bool tcp_send_ack(socket_context_t* context, socket_entry_t* entry) {
 static bool tcp_acknowledge(socket_context_t* context, socket_entry_t* entry, uint32_t acknowledgement_number) {
   if (!entry->transmit_active) {
     if (acknowledgement_number > entry->send_sequence) return false;
+    if (acknowledgement_number < entry->send_unacknowledged) return false;
+    if (acknowledgement_number == entry->send_unacknowledged) return true;
     entry->send_unacknowledged = acknowledgement_number > entry->send_unacknowledged ? acknowledgement_number : entry->send_unacknowledged;
     entry->acknowledged_sequence = entry->send_unacknowledged;
+    tcp_congestion_acknowledged(entry);
     return true;
   }
 
@@ -160,7 +188,9 @@ static bool tcp_acknowledge(socket_context_t* context, socket_entry_t* entry, ui
   entry->send_unacknowledged = acknowledgement_number;
   entry->acknowledged_sequence = acknowledgement_number;
   const uint16_t flags = entry->transmit_flags;
+  const uint16_t data_length = entry->transmit_length;
   tcp_clear_pending(entry);
+  if (data_length) tcp_congestion_acknowledged(entry);
   if ((flags & TCP_FLAG_FIN) != 0) {
     if (entry->state == SOCKET_STATE_FIN_WAIT_1) entry->state = SOCKET_STATE_FIN_WAIT_2;
     else if (entry->state == SOCKET_STATE_LAST_ACK) {
@@ -187,6 +217,8 @@ bool socket_tcp_connect(socket_context_t* context, socket_handle_t handle, ipv4_
   entry->send_unacknowledged = 1;
   entry->acknowledged_sequence = 0;
   entry->send_window = SOCKET_RECEIVE_CAPACITY;
+  entry->congestion_window = SOCKET_TCP_INITIAL_CWND;
+  entry->slow_start_threshold = SOCKET_RECEIVE_CAPACITY;
   entry->state = SOCKET_STATE_SYN_SENT;
   if (tcp_queue_segment(context, entry, entry->send_sequence, TCP_FLAG_SYN, NULL, 0)) return true;
   entry->remote_address = 0;
@@ -206,8 +238,14 @@ bool socket_tcp_listen(socket_context_t* context, socket_handle_t handle) {
 
 bool socket_tcp_send(socket_context_t* context, socket_handle_t handle, const void* data, uint16_t length) {
   socket_entry_t* entry = tcp_entry(context, handle);
-  if (!entry || !entry->active || (entry->state != SOCKET_STATE_ESTABLISHED && entry->state != SOCKET_STATE_CLOSE_WAIT) || !data || !length || length > SOCKET_RECEIVE_CAPACITY || entry->transmit_active || length > entry->send_window) return false;
+  if (!entry || !entry->active || (entry->state != SOCKET_STATE_ESTABLISHED && entry->state != SOCKET_STATE_CLOSE_WAIT) || !data || !length || length > SOCKET_RECEIVE_CAPACITY || entry->transmit_active || length > tcp_send_allowance(entry)) return false;
   return tcp_queue_segment(context, entry, entry->send_sequence, TCP_FLAG_ACK | TCP_FLAG_PSH, data, length);
+}
+
+bool socket_tcp_send_window_update(socket_context_t* context, socket_handle_t handle) {
+  socket_entry_t* entry = tcp_entry(context, handle);
+  if (!entry || !entry->active || (entry->state != SOCKET_STATE_ESTABLISHED && entry->state != SOCKET_STATE_CLOSE_WAIT)) return false;
+  return tcp_send_ack(context, entry);
 }
 
 bool socket_tcp_receive_ipv4(socket_context_t* context, const ipv4_packet_view_t* packet) {
@@ -351,6 +389,7 @@ bool socket_tcp_tick(socket_context_t* context, uint32_t now) {
       continue;
     }
     if (now < entry->retransmit_at) continue;
+    tcp_congestion_lost(entry);
     if (entry->retransmit_count >= TCP_MAX_RETRANSMISSIONS || !tcp_emit(context, entry, entry->transmit_sequence, entry->transmit_flags, entry->transmit_length ? entry->transmit_buffer : NULL, entry->transmit_length)) {
       tcp_fail_entry(context, entry);
       continue;

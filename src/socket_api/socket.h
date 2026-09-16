@@ -44,6 +44,7 @@ Layer 2/3 responsibilities.
 #define SOCKET_CAPACITY          32
 #define SOCKET_RECEIVE_CAPACITY  1400
 #define SOCKET_EPHEMERAL_MIN     49152
+#define SOCKET_TCP_INITIAL_CWND  512
 
 typedef uint16_t socket_handle_t;
 #define SOCKET_INVALID_HANDLE ((socket_handle_t)0)
@@ -81,6 +82,8 @@ typedef struct socket_entry {
   uint32_t receive_sequence;
   uint32_t acknowledged_sequence;
   uint16_t send_window;
+  uint16_t congestion_window;
+  uint16_t slow_start_threshold;
   uint16_t transmit_length;
   uint16_t transmit_flags;
   uint32_t transmit_sequence;

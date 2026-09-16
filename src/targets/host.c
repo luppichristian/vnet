@@ -23,6 +23,8 @@
  */
 #include "host.h"
 
+#include <time.h>
+
 static void command_transport(host_context_t* context, host_pending_packet_t* pending);
 
 static bool ip4_is_local(const host_context_t* context, ipv4_address_t address) {
@@ -514,6 +516,14 @@ static void receiver_thread(void* argument) {
   uint8_t buffer[HOST_BUFFER_SIZE] = {0};
   size_t buffer_length = 0;
   while (cmd_app_is_running(&context->commands)) {
+    mutex_lock(&context->mutex);
+    const bool timers_ok = socket_tick(&context->sockets, (uint32_t)time(NULL));
+    mutex_unlock(&context->mutex);
+    if (!timers_ok) {
+      fputs("Could not advance socket timers.\n", stderr);
+      cmd_app_stop(&context->commands);
+      break;
+    }
     long end = 0;
     const long position = ftell(context->source);
     if (position < 0 || !get_file_end(context->source, &end)) {
@@ -870,7 +880,11 @@ static void command_socket(void* context_argument, char* argument) {
   if (strcmpi(action, "info") == 0 && !first) {
     for (size_t i = 0; i < SOCKET_CAPACITY; ++i) {
       const socket_entry_t* entry = socket_get(&context->sockets, (socket_handle_t)(i + 1));
-      if (entry) fprintf(stdout, "  %zu  %s  state=%d local=%u remote=%u\n", i + 1, entry->protocol == SOCKET_PROTOCOL_TCP ? "tcp" : "udp", entry->state, entry->local_port, entry->remote_port);
+      if (entry) {
+        fprintf(stdout, "  %zu  %s  state=%d local=%u remote=%u", i + 1, entry->protocol == SOCKET_PROTOCOL_TCP ? "tcp" : "udp", entry->state, entry->local_port, entry->remote_port);
+        if (entry->protocol == SOCKET_PROTOCOL_TCP) fprintf(stdout, " peer-window=%u cwnd=%u ssthresh=%u", entry->send_window, entry->congestion_window, entry->slow_start_threshold);
+        fputc('\n', stdout);
+      }
     }
   } else if (strcmpi(action, "udp-open") == 0 && first && !second) {
     uint16_t port = 0;

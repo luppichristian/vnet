@@ -46,11 +46,11 @@ acknowledgements, and congestion control are endpoint-specific.
 
 A TCP segment establishes a byte-stream connection with SYN/ACK exchange,
 sequence and acknowledgement numbers, retransmission, receive-window flow
-control, and checksum protection. This simulator serializes, validates, and
-inspects one base 20-octet TCP header plus optional data. It exposes the header
-flags, sequence/acknowledgement numbers, and window. Connection state and
-endpoint queues belong to the private VNet socket backend, not this wire-format
-module.
+control, congestion-window limiting, and checksum protection. This simulator
+serializes, validates, and inspects one base 20-octet TCP header plus optional
+data. It exposes the header flags, sequence/acknowledgement numbers, and
+window. Connection state and endpoint queues belong to the private VNet socket
+backend, not this wire-format module.
 
 The TCP checksum is mandatory. It covers an IPv4 pseudo-header and the complete
 TCP segment, including any options and data, but not the enclosing IPv4 header
